@@ -34,7 +34,7 @@ jobs:
         run: npm ci
 
       - name: Build and publish Tauri release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -43,7 +43,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: AI Interview v__VERSION__
-          releaseBody: Автоматически опубликованный релиз AI Interview.
+          releaseBody: Automatically published AI Interview release.
           releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
