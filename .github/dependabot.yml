@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - npm
+      - routine-update
+    commit-message:
+      prefix: deps(npm)
+    groups:
+      npm-routine:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:15"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+      - routine-update
+    commit-message:
+      prefix: deps(cargo)
+    groups:
+      cargo-routine:
+        patterns:
+          - "*"

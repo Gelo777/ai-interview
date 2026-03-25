@@ -1,0 +1,103 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg-primary: #09111b;
+  --color-bg-secondary: #101a28;
+  --color-bg-tertiary: #182434;
+  --color-bg-overlay: rgba(9, 17, 27, 0.82);
+  --color-bg-card: #132031;
+  --color-bg-input: #0e1826;
+
+  --color-accent: #ff875b;
+  --color-accent-hover: #ff9d79;
+  --color-accent-muted: rgba(255, 135, 91, 0.16);
+
+  --color-danger: #ef4444;
+  --color-danger-hover: #dc2626;
+  --color-danger-muted: rgba(239, 68, 68, 0.15);
+
+  --color-success: #39d098;
+  --color-success-muted: rgba(57, 208, 152, 0.15);
+
+  --color-warning: #f3b25f;
+  --color-warning-muted: rgba(243, 178, 95, 0.16);
+
+  --color-text-primary: #f6f2ea;
+  --color-text-secondary: #c8d3df;
+  --color-text-muted: #7d91a7;
+
+  --color-border: rgba(164, 185, 208, 0.12);
+  --color-border-active: rgba(198, 216, 236, 0.26);
+
+  --color-interviewer: #65b2ff;
+  --color-user-bubble: #4f8cff;
+  --color-ai-bubble: #ff875b;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-bg-primary text-text-primary antialiased;
+    font-family: "Space Grotesk", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    user-select: text;
+    -webkit-user-select: text;
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at top left, rgba(101, 178, 255, 0.18), transparent 28%),
+      radial-gradient(circle at top right, rgba(255, 135, 91, 0.16), transparent 30%),
+      linear-gradient(180deg, #0a1320 0%, #09111b 48%, #081019 100%);
+  }
+
+  body.overlay-window {
+    background: transparent;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+    background-size: 36px 36px;
+    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent 90%);
+    opacity: 0.45;
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: auto 0 0 0;
+    height: 32vh;
+    pointer-events: none;
+    background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.24));
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(198, 216, 236, 0.16);
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(198, 216, 236, 0.28);
+  }
+}
