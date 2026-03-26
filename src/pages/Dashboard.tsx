@@ -9,6 +9,7 @@ import {
   Download,
   RefreshCw,
   X,
+  Keyboard,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -19,6 +20,7 @@ import { useSessionStore } from "@/stores/session";
 import { useSettingsStore } from "@/stores/settings";
 import { refreshCloudReadinessNow, refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
 import type { SettingsFocusTarget, SettingsTab } from "@/lib/types";
+import { formatHotkey } from "@/lib/hotkeys";
 
 export function Dashboard() {
   const {
@@ -37,6 +39,7 @@ export function Dashboard() {
   const startSession = useSessionStore((s) => s.startSession);
   const primaryLanguage = useSettingsStore((s) => s.primaryLanguage);
   const primarySttVariant = useSettingsStore((s) => s.primarySttVariant);
+  const hotkeys = useSettingsStore((s) => s.hotkeys);
   const [starting, setStarting] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
 
@@ -112,6 +115,16 @@ export function Dashboard() {
     readiness.vosk !== "granted" ? "распознавание речи" : null,
     installBlocksInterview ? "идет обязательная установка компонентов распознавания" : null,
   ].filter((item): item is string => Boolean(item));
+
+  const sendHotkeyLabel = formatHotkey(
+    hotkeys.find((item) => item.action === "send_to_llm")?.keys ?? [],
+  );
+  const screenshotHotkeyLabel = formatHotkey(
+    hotkeys.find((item) => item.action === "send_with_screenshot")?.keys ?? [],
+  );
+  const endHotkeyLabel = formatHotkey(
+    hotkeys.find((item) => item.action === "end_interview")?.keys ?? [],
+  );
 
   const readinessItems = [
     {
@@ -355,6 +368,45 @@ export function Dashboard() {
         </div>
       </Card>
 
+      <Card className="p-6">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">Управление</div>
+            <h2 className="mt-1 text-xl font-semibold text-text-primary">Горячие клавиши</h2>
+          </div>
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.04]">
+            <Keyboard className="h-5 w-5 text-text-secondary" />
+          </div>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-3">
+          <ShortcutPanel
+            label="Отправить в помощник"
+            value={sendHotkeyLabel}
+            hint="Отправляет текущий контекст в сервис без скриншота."
+          />
+          <ShortcutPanel
+            label="Отправить со скриншотом"
+            value={screenshotHotkeyLabel}
+            hint="Добавляет к запросу текущий экран."
+          />
+          <ShortcutPanel
+            label="Завершить интервью"
+            value={endHotkeyLabel}
+            hint="Закрывает overlay и завершает текущую сессию."
+          />
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Button
+            variant="secondary"
+            onClick={() => openSettingsTab("hotkeys", "hotkeys-bindings")}
+          >
+            Настроить клавиши
+          </Button>
+        </div>
+      </Card>
+
       <div className="grid gap-6">
         <Card className="p-6">
           <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">Последняя сессия</div>
@@ -388,6 +440,26 @@ export function Dashboard() {
           )}
         </Card>
       </div>
+    </div>
+  );
+}
+
+function ShortcutPanel({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
+      <div className="text-[11px] uppercase tracking-[0.16em] text-text-muted">{label}</div>
+      <div className="mt-3 inline-flex rounded-xl border border-white/10 bg-black/15 px-3 py-2 font-mono text-sm text-text-primary">
+        {value}
+      </div>
+      <div className="mt-3 text-sm leading-6 text-text-secondary">{hint}</div>
     </div>
   );
 }

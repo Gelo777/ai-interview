@@ -1,6 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Key,
+  Keyboard,
   Languages,
   Volume2,
   Loader2,
@@ -61,6 +62,7 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Key }[] = [
   { id: "llm", label: "Ключ", icon: Key },
   { id: "audio", label: "Аудио", icon: Volume2 },
   { id: "language", label: "Язык", icon: Languages },
+  { id: "hotkeys", label: "Клавиши", icon: Keyboard },
 ];
 
 function getFocusSectionClass(isFocused: boolean): string {
@@ -147,6 +149,9 @@ export function SettingsPage() {
         )}
         {tab === "language" && (
           <LanguageSettings disabled={isInterviewActive} focusTarget={activeFocus} />
+        )}
+        {tab === "hotkeys" && (
+          <HotkeySettings disabled={isInterviewActive} focusTarget={activeFocus} />
         )}
       </div>
     </div>
@@ -2117,7 +2122,15 @@ function HotkeySettings({
         id="hotkeys-bindings"
         className={getFocusSectionClass(focusTarget === "hotkeys-bindings")}
       >
-        <Card title="Keyboard Shortcuts" description="Customize hotkeys for interview actions. Click a shortcut to re-bind.">
+        <Card
+          title="Горячие клавиши"
+          description="Эти сочетания работают во время интервью. Нажмите на кнопку справа, чтобы назначить свое сочетание."
+        >
+          <div className="mb-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs leading-relaxed text-text-muted">
+            Для Windows лучше использовать сочетания с <span className="font-medium text-text-secondary">Ctrl</span> или{" "}
+            <span className="font-medium text-text-secondary">Shift</span>. Системные комбинации вроде{" "}
+            <span className="font-medium text-text-secondary">Alt + Space</span> могут перехватываться браузером или самой Windows.
+          </div>
           <div className="space-y-2">
             {hotkeys.map((hk) => (
               <div
@@ -2129,7 +2142,7 @@ function HotkeySettings({
                   <input
                     autoFocus
                     readOnly
-                    placeholder={`Press up to ${HOTKEY_MAX_KEYS} keys...`}
+                    placeholder={`Нажмите до ${HOTKEY_MAX_KEYS} клавиш...`}
                     value={formatHotkey(recordingPreview)}
                     className="px-3 py-1.5 bg-accent/10 border border-accent rounded-md text-xs font-mono text-accent w-52 text-center focus:outline-none"
                     onKeyDown={(e) => handleKeyDown(hk.action, e)}
@@ -2158,7 +2171,7 @@ function HotkeySettings({
             ))}
           </div>
           <p className="mt-3 text-xs text-text-muted">
-            Use up to {HOTKEY_MAX_KEYS} keys in one shortcut.
+            Можно использовать до {HOTKEY_MAX_KEYS} клавиш в одном сочетании.
           </p>
           <div className="mt-4">
             <Button
@@ -2171,7 +2184,7 @@ function HotkeySettings({
               disabled={disabled}
               icon={<RotateCcw className="w-3.5 h-3.5" />}
             >
-              Reset to Defaults
+              Сбросить по умолчанию
             </Button>
           </div>
         </Card>

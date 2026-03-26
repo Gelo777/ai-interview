@@ -27,6 +27,32 @@ const SETTINGS_STORAGE_KEY = "ai-interview-settings";
 const DEFAULT_PROXY_BASE_URL = "http://85.198.82.221:8080";
 let apiKeyPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
+function areHotkeyBindingsEqual(a: string[] | undefined, b: string[]): boolean {
+  if (!Array.isArray(a)) {
+    return false;
+  }
+
+  const normalizedA = normalizeHotkeyKeys(a);
+  const normalizedB = normalizeHotkeyKeys(b);
+  if (normalizedA.length !== normalizedB.length) {
+    return false;
+  }
+
+  return normalizedA.every((token, index) => token === normalizedB[index]);
+}
+
+function cloneHotkeyBinding(binding: HotkeyBinding): HotkeyBinding {
+  return {
+    ...binding,
+    keys: [...binding.keys],
+    default: [...binding.default],
+  };
+}
+
+function cloneDefaultHotkeys(): HotkeyBinding[] {
+  return DEFAULT_HOTKEYS.map(cloneHotkeyBinding);
+}
+
 type PersistedSettings = {
   state?: {
     apiKey?: unknown;
@@ -111,29 +137,34 @@ function normalizeModelCacheSupport(model: ModelInfo | null): ModelInfo | null {
 const DEFAULT_HOTKEYS: HotkeyBinding[] = [
   {
     action: "send_to_llm",
-    label: "Send to LLM",
-    keys: ["Alt", "Space"],
-    default: ["Alt", "Space"],
+    label: "Отправить в помощник",
+    keys: ["Ctrl", "Alt", "Space"],
+    default: ["Ctrl", "Alt", "Space"],
   },
   {
     action: "send_with_screenshot",
-    label: "Send + Screenshot",
-    keys: ["Alt", "Shift", "Space"],
-    default: ["Alt", "Shift", "Space"],
+    label: "Отправить со скриншотом",
+    keys: ["Ctrl", "Alt", "Shift", "Space"],
+    default: ["Ctrl", "Alt", "Shift", "Space"],
   },
   {
     action: "end_interview",
-    label: "End Interview",
+    label: "Завершить интервью",
     keys: ["Alt", "E"],
     default: ["Alt", "E"],
   },
   {
     action: "switch_stt_language",
-    label: "Switch STT Language",
+    label: "Сменить язык распознавания",
     keys: ["Alt", "L"],
     default: ["Alt", "L"],
   },
 ];
+
+const LEGACY_DEFAULT_HOTKEYS: Partial<Record<HotkeyAction, string[]>> = {
+  send_to_llm: ["Alt", "Space"],
+  send_with_screenshot: ["Alt", "Shift", "Space"],
+};
 
 interface SettingsState extends AppSettings {
   setProvider: (p: Provider) => void;
@@ -182,7 +213,7 @@ export const useSettingsStore = create<SettingsState>()(
       protectOverlay: true,
       chatMemoryLimitMb: 16,
       historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
-      hotkeys: DEFAULT_HOTKEYS,
+      hotkeys: cloneDefaultHotkeys(),
 
       setProvider: (provider) =>
         set({
@@ -246,7 +277,7 @@ export const useSettingsStore = create<SettingsState>()(
           ),
         }))
       },
-      resetHotkeys: () => set({ hotkeys: DEFAULT_HOTKEYS }),
+      resetHotkeys: () => set({ hotkeys: cloneDefaultHotkeys() }),
     }),
     {
       name: "ai-interview-settings",
@@ -345,11 +376,18 @@ export const useSettingsStore = create<SettingsState>()(
         state.hotkeys = DEFAULT_HOTKEYS.map((fallback) => {
           const fromState = state.hotkeys?.find((hk) => hk.action === fallback.action);
           if (!fromState || !Array.isArray(fromState.keys) || fromState.keys.length === 0) {
-            return fallback;
+            return cloneHotkeyBinding(fallback);
           }
+
+          const legacyDefault = LEGACY_DEFAULT_HOTKEYS[fallback.action];
+          const keys =
+            legacyDefault && areHotkeyBindingsEqual(fromState.keys, legacyDefault)
+              ? fallback.default
+              : fromState.keys;
+
           return {
             ...fallback,
-            keys: normalizeHotkeyKeys(fromState.keys),
+            keys: normalizeHotkeyKeys(keys),
           };
         });
       },
