@@ -172,6 +172,8 @@ function LlmSettings({
     setCustomBaseUrl,
     apiKey,
     setApiKey,
+    interviewContext,
+    setInterviewContext,
   } = useSettingsStore();
 
   const [showKey, setShowKey] = useState(false);
@@ -251,6 +253,40 @@ function LlmSettings({
             >
               {showAdvanced ? "Скрыть служебные настройки" : "Показать служебные настройки"}
             </Button>
+          </div>
+        </Card>
+      </div>
+
+      <div
+        id="llm-interview-context"
+        className={getFocusSectionClass(focusTarget === "llm-interview-context")}
+      >
+        <Card
+          title="Технический контекст интервью"
+          description="Помогает сервису лучше понимать тему собеседования и исправлять типичные ошибки распознавания речи."
+        >
+          <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
+            Полезно заранее указать стек или тему. Например:{" "}
+            <span className="text-text-primary">
+              Go backend, goroutines, channels, mutex, PostgreSQL, Docker
+            </span>
+            . Тогда сервис будет понимать, что речь идет о разработке, и осторожнее интерпретировать спорные STT-слова вроде{" "}
+            <span className="text-text-primary">Go / goroutine / routine</span>.
+          </div>
+
+          <div className="mt-4 space-y-2">
+            <label className="block text-xs text-text-muted">Контекст</label>
+            <textarea
+              value={interviewContext}
+              onChange={(e) => setInterviewContext(e.target.value)}
+              disabled={disabled}
+              rows={4}
+              placeholder="Например: Собеседование на Go backend. Темы: goroutine, channels, context, REST API, PostgreSQL, Redis."
+              className="w-full resize-y bg-bg-input border border-border rounded-lg px-3 py-2.5
+              text-sm text-text-primary placeholder:text-text-muted
+              focus:border-accent focus:outline-none transition-colors
+              disabled:opacity-50"
+            />
           </div>
         </Card>
       </div>

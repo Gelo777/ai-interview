@@ -723,7 +723,10 @@ export function InterviewOverlay() {
         .map((m) => `[${m.source === "interviewer" ? "Интервьюер" : "Вы"}]: ${m.text}`)
         .join("\n");
 
-      let userPrompt = `Транскрипт интервью:\n${transcript}\n\nДай краткую и полезную подсказку по текущему контексту.`;
+      let userPrompt = buildInterviewPrompt({
+        transcript,
+        interviewContext: settings.interviewContext,
+      });
       let imageBase64Png: string | undefined;
 
       if (withScreenshot) {
@@ -1248,6 +1251,21 @@ function formatElapsed(ms: number): string {
   const h = Math.floor(m / 60);
   const pad = (n: number) => n.toString().padStart(2, "0");
   return h > 0 ? `${pad(h)}:${pad(m % 60)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
+}
+
+function buildInterviewPrompt({
+  transcript,
+  interviewContext,
+}: {
+  transcript: string;
+  interviewContext: string;
+}): string {
+  const normalizedContext = interviewContext.trim();
+  const contextBlock = normalizedContext
+    ? `Контекст интервью:\n${normalizedContext}\n\n`
+    : "Контекст интервью:\nТехническое собеседование по разработке программного обеспечения.\n\n";
+
+  return `${contextBlock}Важно:\n- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;\n- если по контексту очевидно, что слово распознано неточно, интерпретируй его в пользу технического смысла;\n- отвечай кратко, по делу и с учетом текущего вопроса собеседования.\n\nТранскрипт интервью:\n${transcript}\n\nДай краткую и полезную подсказку по текущему контексту.`;
 }
 
 async function captureScreenshotAsBase64Png(): Promise<string> {

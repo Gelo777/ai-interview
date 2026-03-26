@@ -177,6 +177,7 @@ interface SettingsState extends AppSettings {
   setMicrophoneDeviceId: (deviceId: string) => void;
   setSystemAudioDeviceId: (deviceId: string) => void;
   setApiKey: (key: string) => void;
+  setInterviewContext: (value: string) => void;
   hydrateApiKey: (key: string) => void;
   setSelectedModel: (m: ModelInfo | null) => void;
   setSendSummary: (v: boolean) => void;
@@ -205,6 +206,7 @@ export const useSettingsStore = create<SettingsState>()(
       microphoneDeviceId: "",
       systemAudioDeviceId: "",
       apiKey: "",
+      interviewContext: "",
       selectedModel: null,
       sendSummary: true,
       finalReport: true,
@@ -242,6 +244,7 @@ export const useSettingsStore = create<SettingsState>()(
         set({ apiKey });
         scheduleApiKeyPersistence(apiKey);
       },
+      setInterviewContext: (interviewContext) => set({ interviewContext }),
       hydrateApiKey: (apiKey) => set({ apiKey }),
       setSelectedModel: (selectedModel) => {
         const normalizedModel = normalizeModelCacheSupport(selectedModel);
@@ -293,6 +296,7 @@ export const useSettingsStore = create<SettingsState>()(
         microphoneDeviceId: state.microphoneDeviceId,
         systemAudioDeviceId: state.systemAudioDeviceId,
         apiKey: state.apiKey,
+        interviewContext: state.interviewContext,
         selectedModel: state.selectedModel,
         sendSummary: state.sendSummary,
         finalReport: state.finalReport,
@@ -361,6 +365,10 @@ export const useSettingsStore = create<SettingsState>()(
           .systemAudioDeviceId;
         state.systemAudioDeviceId =
           typeof rawSystemAudioDeviceId === "string" ? rawSystemAudioDeviceId : "";
+        const rawInterviewContext = (state as unknown as { interviewContext?: unknown })
+          .interviewContext;
+        state.interviewContext =
+          typeof rawInterviewContext === "string" ? rawInterviewContext : "";
         const rawHistoryRetentionDays = (state as unknown as { historyRetentionDays?: unknown })
           .historyRetentionDays;
         state.historyRetentionDays =

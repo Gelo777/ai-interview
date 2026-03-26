@@ -41,6 +41,7 @@ export type SettingsTab =
 
 export type SettingsFocusTarget =
   | "llm-api-key"
+  | "llm-interview-context"
   | "audio-devices"
   | "llm-model"
   | "language-runtime"
@@ -76,6 +77,7 @@ export interface AppSettings {
   microphoneDeviceId: string;
   systemAudioDeviceId: string;
   apiKey: string;
+  interviewContext: string;
   selectedModel: ModelInfo | null;
   sendSummary: boolean;
   finalReport: boolean;
