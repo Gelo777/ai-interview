@@ -1,1 +1,1 @@
-vosk-model-ru-0.42
+vosk-model-small-ru-0.22

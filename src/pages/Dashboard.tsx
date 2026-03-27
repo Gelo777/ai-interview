@@ -44,9 +44,12 @@ export function Dashboard() {
   const [installingUpdate, setInstallingUpdate] = useState(false);
 
   const lastSession = sessions[0] ?? null;
+  const backgroundModelInstall =
+    sttInstall.active && sttInstall.phase === "background-model";
 
   const installBlocksInterview =
     sttInstall.active &&
+    sttInstall.phase !== "background-model" &&
     (sttInstall.phase !== "model" ||
       (sttInstall.language === primaryLanguage &&
         sttInstall.variant === primarySttVariant));
@@ -337,6 +340,26 @@ export function Dashboard() {
               <div className="text-sm font-semibold text-warning">Пока нельзя начать</div>
               <div className="mt-1 text-sm leading-relaxed text-warning/90">
                 Не хватает: {missingItems.join(", ")}.
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {backgroundModelInstall && (
+        <Card className="border-success/20 bg-[linear-gradient(180deg,rgba(56,178,120,0.10),rgba(20,31,47,0.94))]">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-success-muted">
+              <Download className="w-5 h-5 text-success" />
+            </div>
+            <div>
+              <div className="text-sm font-semibold text-success">Улучшаем распознавание в фоне</div>
+              <div className="mt-1 text-sm leading-relaxed text-success/90">
+                {sttInstall.detail}
+                {sttInstall.percent !== null ? ` ${sttInstall.percent}%` : ""}
+              </div>
+              <div className="mt-2 text-xs text-text-muted">
+                Интервью можно запускать уже сейчас. Пока скачивается большая модель, приложение работает на базовой.
               </div>
             </div>
           </div>

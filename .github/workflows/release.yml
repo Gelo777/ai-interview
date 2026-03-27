@@ -33,18 +33,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Download bundled Russian large Vosk model
-        shell: pwsh
-        run: |
-          $modelsRoot = "src-tauri/resources/models/vosk"
-          $modelDir = Join-Path $modelsRoot "vosk-model-ru-0.42"
-          if (-not (Test-Path $modelDir)) {
-            $zipPath = Join-Path $env:RUNNER_TEMP "vosk-model-ru-0.42.zip"
-            Invoke-WebRequest -Uri "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip" -OutFile $zipPath
-            tar -xf $zipPath -C $modelsRoot
-          }
-          Set-Content -Path (Join-Path $modelsRoot "active_model.txt") -Value "vosk-model-ru-0.42"
-
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -59,4 +47,4 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
-          updaterJsonPreferNsis: false
+          updaterJsonPreferNsis: true

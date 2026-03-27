@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AI Interview",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "identifier": "com.ai-interview",
   "build": {
     "frontendDist": "../dist",
@@ -43,9 +43,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "msi"
-    ],
+    "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": [
       "resources/**"

@@ -14,7 +14,7 @@ import { isTauri } from "@/lib/tauri";
 import { useReadinessMonitor } from "@/hooks/useReadinessMonitor";
 import type { PrimaryLanguage, SttModelVariant } from "@/lib/types";
 import { resolveLatestStableRuntimeVersion } from "@/lib/runtimeVersion";
-import type { AppUpdateProgressEvent } from "@/lib/tauri";
+import type { AppUpdateProgressEvent, VoskModelOption } from "@/lib/tauri";
 
 function resolveInstalledModelId(model: {
   id: string;
@@ -29,6 +29,15 @@ function resolveInstalledModelId(model: {
   }
   const sorted = [...model.installed_versions].sort();
   return sorted[sorted.length - 1] ?? null;
+}
+
+function needsModelInstall(model: {
+  installed: boolean;
+  update_available: boolean;
+  installed_versions: string[];
+}): boolean {
+  const hasInstalledVersion = model.installed || model.installed_versions.length > 0;
+  return !hasInstalledVersion || model.update_available || model.installed_versions.length > 1;
 }
 
 export default function App() {
@@ -130,7 +139,7 @@ export default function App() {
       return;
     }
 
-    const baselineKey = `${primaryLanguage}|${secondaryLanguage}`;
+    const baselineKey = `${primaryLanguage}|${primarySttVariant}|${secondaryLanguage}|${secondarySttVariant}`;
     if (autoBaselineKeyRef.current === baselineKey) {
       return;
     }
@@ -138,15 +147,15 @@ export default function App() {
 
     let cancelled = false;
     async function ensureBaselineSttAssets() {
-        const {
-          getSttStatus,
-          listVoskRuntimeVersions,
-          installVoskRuntime,
-          listVoskModels,
-          downloadVoskModel,
-          removeVoskModel,
-          setActiveVoskModel,
-        } = await import("@/lib/tauri");
+      const {
+        getSttStatus,
+        listVoskRuntimeVersions,
+        installVoskRuntime,
+        listVoskModels,
+        downloadVoskModel,
+        removeVoskModel,
+        setActiveVoskModel,
+      } = await import("@/lib/tauri");
 
       try {
         const sttStatus = await getSttStatus();
@@ -179,7 +188,7 @@ export default function App() {
             active: true,
             phase: "runtime",
             percent: 0,
-            detail: "Installing latest stable Vosk runtime...",
+            detail: "Устанавливаем Vosk runtime...",
             language: null,
             variant: null,
           });
@@ -193,12 +202,12 @@ export default function App() {
               percent: Math.round(progress.percent),
               detail:
                 progress.phase === "downloading"
-                  ? "Downloading latest stable Vosk runtime..."
-                  : "Extracting latest stable Vosk runtime...",
+                  ? "Скачиваем Vosk runtime..."
+                  : "Распаковываем Vosk runtime...",
               language: null,
               variant: null,
             });
-            });
+          });
           if (cancelled) {
             return;
           }
@@ -242,10 +251,7 @@ export default function App() {
             models.find((model) => model.language === language && model.variant === "small"),
           )
           .filter((small): small is NonNullable<typeof small> => Boolean(small))
-          .filter((small) => {
-            const hasSmall = small.installed || small.installed_versions.length > 0;
-            return !hasSmall || small.update_available || small.installed_versions.length > 1;
-          });
+          .filter((small) => needsModelInstall(small));
 
         for (let index = 0; index < smallInstallPlan.length; index += 1) {
           if (cancelled) {
@@ -259,7 +265,7 @@ export default function App() {
             active: true,
             phase: "model",
             percent: Math.round((index / total) * 100),
-            detail: `Installing ${small.name} (${step}/${total})...`,
+            detail: `Подготавливаем базовую модель ${small.name} (${step}/${total})...`,
             language: small.language as PrimaryLanguage,
             variant: "small",
           });
@@ -292,8 +298,8 @@ export default function App() {
                 percent: overallPercent,
                 detail:
                   progress.phase === "downloading"
-                    ? `Downloading ${small.name} (${step}/${total})...`
-                    : `Extracting ${small.name} (${step}/${total})...`,
+                    ? `Скачиваем базовую модель ${small.name} (${step}/${total})...`
+                    : `Распаковываем базовую модель ${small.name} (${step}/${total})...`,
                 language: small.language as PrimaryLanguage,
                 variant: "small",
               });
@@ -320,6 +326,101 @@ export default function App() {
           return "small";
         };
 
+        const backgroundLargePlan = targetLanguages
+          .map((language) => {
+            const preferredVariant = pickVariantForLanguage(language);
+            if (preferredVariant !== "large") {
+              return null;
+            }
+
+            const preferredModel = models.find(
+              (model) => model.language === language && model.variant === preferredVariant,
+            );
+            if (!preferredModel || !needsModelInstall(preferredModel)) {
+              return null;
+            }
+
+            return {
+              language,
+              model: preferredModel,
+            };
+          })
+          .filter(
+            (
+              entry,
+            ): entry is {
+              language: PrimaryLanguage;
+              model: VoskModelOption;
+            } => Boolean(entry),
+          );
+
+        for (let index = 0; index < backgroundLargePlan.length; index += 1) {
+          if (cancelled) {
+            return;
+          }
+
+          const { language, model } = backgroundLargePlan[index];
+          const step = index + 1;
+          const total = backgroundLargePlan.length;
+
+          setSttInstall({
+            active: true,
+            phase: "background-model",
+            percent: Math.round((index / total) * 100),
+            detail: `Улучшаем распознавание: подготавливаем ${model.name} (${step}/${total})...`,
+            language,
+            variant: "large",
+          });
+
+          await downloadVoskModel(
+            model.download_url,
+            model.id,
+            (progress) => {
+              if (cancelled) {
+                return;
+              }
+
+              let itemPercent = progress.percent;
+              if (
+                itemPercent <= 0 &&
+                progress.content_length === null &&
+                progress.bytes_downloaded > 0 &&
+                model.size_mb > 0
+              ) {
+                itemPercent = Math.min(
+                  99,
+                  (progress.bytes_downloaded / (model.size_mb * 1024 * 1024)) * 100,
+                );
+              }
+
+              const overallPercent = Math.round(
+                ((index + Math.max(0, Math.min(100, itemPercent)) / 100) / total) * 100,
+              );
+
+              setSttInstall({
+                active: true,
+                phase: "background-model",
+                percent: overallPercent,
+                detail:
+                  progress.phase === "downloading"
+                    ? `Улучшаем распознавание: скачиваем ${model.name} (${step}/${total})...`
+                    : `Улучшаем распознавание: распаковываем ${model.name} (${step}/${total})...`,
+                language,
+                variant: "large",
+              });
+            },
+            model.installed_versions.filter((id) => id !== model.id),
+          );
+          if (cancelled) {
+            return;
+          }
+
+          models = await listVoskModels();
+          if (cancelled) {
+            return;
+          }
+        }
+
         const preferredVariant = pickVariantForLanguage(primaryLanguage);
         const preferredModel = models.find(
           (model) =>
@@ -337,7 +438,7 @@ export default function App() {
           await setActiveVoskModel(activeModelId);
         }
       } catch (error) {
-        console.warn("Automatic STT baseline setup failed:", error);
+        console.warn("Automatic STT setup failed:", error);
       } finally {
         clearSttInstall();
       }
