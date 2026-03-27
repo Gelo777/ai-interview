@@ -1351,28 +1351,6 @@ fn seed_bundled_models_if_needed(app: &tauri::AppHandle, models_dir: &Path) -> R
         return Ok(());
     };
 
-    let has_installed_models = std::fs::read_dir(models_dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.flatten())
-        .map(|entry| entry.path())
-        .any(|path| path.is_dir());
-
-    if has_installed_models {
-        if read_active_model_id(models_dir).is_none() {
-            let bundled_active = bundled_dir.join(ACTIVE_MODEL_FILE);
-            if bundled_active.is_file() {
-                let active_model = std::fs::read_to_string(&bundled_active)
-                    .map_err(|e| format!("Failed to read bundled active model marker: {}", e))?;
-                let trimmed = active_model.trim();
-                if !trimmed.is_empty() {
-                    let _ = write_active_model_id(models_dir, trimmed);
-                }
-            }
-        }
-        return Ok(());
-    }
-
     copy_dir_contents(&bundled_dir, models_dir)?;
 
     if read_active_model_id(models_dir).is_none() {

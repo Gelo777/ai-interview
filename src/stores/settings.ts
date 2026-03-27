@@ -201,7 +201,7 @@ export const useSettingsStore = create<SettingsState>()(
       customBaseUrl: DEFAULT_PROXY_BASE_URL,
       primaryLanguage: defaultPrimaryLanguage,
       secondaryLanguage: "none",
-      primarySttVariant: "small",
+      primarySttVariant: "large",
       secondarySttVariant: "small",
       microphoneDeviceId: "",
       systemAudioDeviceId: "",
@@ -353,7 +353,7 @@ export const useSettingsStore = create<SettingsState>()(
 
         const rawPrimaryVariant = (state as unknown as { primarySttVariant?: unknown })
           .primarySttVariant;
-        state.primarySttVariant = rawPrimaryVariant === "large" ? "large" : "small";
+        state.primarySttVariant = rawPrimaryVariant === "small" ? "small" : "large";
         const rawSecondaryVariant = (state as unknown as { secondarySttVariant?: unknown })
           .secondarySttVariant;
         state.secondarySttVariant = rawSecondaryVariant === "large" ? "large" : "small";

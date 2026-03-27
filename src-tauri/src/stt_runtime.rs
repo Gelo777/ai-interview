@@ -22,6 +22,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 const AUDIO_QUEUE_CAPACITY: usize = 12;
+const MICROPHONE_TARGET_SAMPLE_RATE: u32 = 16000;
 const MODEL_SWITCH_MANAGER_TIMEOUT: Duration = Duration::from_secs(50);
 const MODEL_SWITCH_WORKER_TIMEOUT: Duration = Duration::from_secs(45);
 const MODEL_PRELOAD_MANAGER_TIMEOUT: Duration = Duration::from_secs(75);
@@ -245,19 +246,19 @@ impl SttSession {
                     let mic_supported = mic_device
                         .default_input_config()
                         .map_err(|e| format!("Failed to get microphone config: {}", e))?;
-                    let mic_sample_rate = mic_supported.sample_rate();
                     let (mic_audio_tx, mic_control_tx, mic_worker) = spawn_recognition_worker(
                         app.clone(),
                         running.clone(),
                         runtime_library_path.clone(),
                         model_path.clone(),
-                        mic_sample_rate,
+                        MICROPHONE_TARGET_SAMPLE_RATE,
                         "mic",
                     )?;
                     let mic_stream = build_capture_stream(
                         &mic_device,
                         mic_supported,
                         mic_audio_tx,
+                        MICROPHONE_TARGET_SAMPLE_RATE,
                         "microphone",
                     )?;
                     mic_stream
@@ -490,11 +491,13 @@ fn build_capture_stream(
     device: &cpal::Device,
     supported_config: SupportedStreamConfig,
     tx: SyncSender<Vec<i16>>,
+    target_sample_rate: u32,
     label: &str,
 ) -> Result<Stream, String> {
     let sample_format = supported_config.sample_format();
     let config: StreamConfig = supported_config.config();
     let channels = config.channels as usize;
+    let source_sample_rate = supported_config.sample_rate();
 
     match sample_format {
         SampleFormat::F32 => {
@@ -504,7 +507,9 @@ fn build_capture_stream(
                 .build_input_stream(
                     &config,
                     move |data: &[f32], _| {
-                        let samples = downmix_f32_to_i16(data, channels);
+                        let mono = downmix_f32_to_i16(data, channels);
+                        let samples =
+                            resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
                         enqueue_audio_chunk(&tx, samples);
                     },
                     move |err| {
@@ -521,7 +526,9 @@ fn build_capture_stream(
                 .build_input_stream(
                     &config,
                     move |data: &[i16], _| {
-                        let samples = downmix_i16(data, channels);
+                        let mono = downmix_i16(data, channels);
+                        let samples =
+                            resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
                         enqueue_audio_chunk(&tx, samples);
                     },
                     move |err| {
@@ -538,7 +545,9 @@ fn build_capture_stream(
                 .build_input_stream(
                     &config,
                     move |data: &[u16], _| {
-                        let samples = downmix_u16_to_i16(data, channels);
+                        let mono = downmix_u16_to_i16(data, channels);
+                        let samples =
+                            resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
                         enqueue_audio_chunk(&tx, samples);
                     },
                     move |err| {
@@ -1279,7 +1288,6 @@ fn downmix_u16_to_i16(data: &[u16], channels: usize) -> Vec<i16> {
         .collect()
 }
 
-#[cfg(target_os = "windows")]
 fn resample_mono_i16(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16> {
     if samples.is_empty() || input_rate == 0 || output_rate == 0 || input_rate == output_rate {
         return samples.to_vec();
