@@ -1,6 +1,6 @@
 [package]
 name = "ai-interview"
-version = "0.1.6"
+version = "0.1.7"
 description = "AI Interview Desktop Assistant"
 authors = ["AI Interview Team"]
 license = "MIT"
