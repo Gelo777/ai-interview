@@ -122,9 +122,14 @@ export function Sidebar() {
                 }}
               />
             </div>
+            {sttInstall.percent !== null && sttInstall.percent <= 0 && (
+              <div className="text-[10px] text-warning/90">
+                Загрузка может несколько минут показывать 0% — это нормально для крупных моделей.
+              </div>
+            )}
             {sttInstallQueue.length > 0 && (
               <div className="text-[10px] text-warning/90">
-                Queue: {sttInstallQueue.length}
+                В очереди: {sttInstallQueue.length}
                 
               </div>
             )}

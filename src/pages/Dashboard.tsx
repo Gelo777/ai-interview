@@ -295,6 +295,14 @@ export function Dashboard() {
     }
   }, [setAppUpdate]);
 
+  const openManualUpdatePage = useCallback(() => {
+    window.open(
+      "https://github.com/Gelo777/ai-interview/releases/latest",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  }, []);
+
   return (
     <div className="mx-auto max-w-6xl space-y-6 p-6">
       {shouldShowUpdateCard && (
@@ -346,6 +354,11 @@ export function Dashboard() {
               >
                 Позже
               </Button>
+              {appUpdate.error && (
+                <Button variant="secondary" onClick={openManualUpdatePage}>
+                  Скачать вручную
+                </Button>
+              )}
             </div>
           </div>
         </Card>

@@ -10,6 +10,9 @@ import {
   ChevronDown,
   Bot,
   Loader2,
+  Copy,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { useSessionStore } from "@/stores/session";
@@ -170,6 +173,8 @@ export function InterviewOverlay() {
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [aiPanelAtBottom, setAiPanelAtBottom] = useState(true);
   const [lastLlmError, setLastLlmError] = useState<string | null>(null);
+  const [responseExpanded, setResponseExpanded] = useState(false);
+  const [copiedResponse, setCopiedResponse] = useState(false);
   const [activeSttLanguage, setActiveSttLanguage] = useState<PrimaryLanguage>(
     settings.primaryLanguage,
   );
@@ -179,6 +184,7 @@ export function InterviewOverlay() {
   const aiPanelRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const endingRef = useRef(false);
+  const persistSessionToHistoryRef = useRef<(endedAt: number) => boolean>(() => false);
   const pendingMessageIdsRef = useRef<{ mic: string | null; system: string | null }>({
     mic: null,
     system: null,
@@ -690,6 +696,21 @@ export function InterviewOverlay() {
     setNewMsgCount(0);
   }, []);
 
+  const copyLastResponse = useCallback(async () => {
+    const text = lastLlmResponse?.text?.trim();
+    if (!text) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedResponse(true);
+      window.setTimeout(() => setCopiedResponse(false), 1200);
+    } catch (error) {
+      console.warn("Failed to copy AI response:", error);
+    }
+  }, [lastLlmResponse?.text]);
+
   const sendToLlm = useCallback(
     async (withScreenshot = false) => {
       if (isLlmLoading) {
@@ -857,6 +878,69 @@ export function InterviewOverlay() {
     ],
   );
 
+  const persistSessionToHistory = useCallback(
+    (endedAt: number): boolean => {
+      const snapshot = useSessionStore.getState();
+      if (!snapshot.startedAt) {
+        return false;
+      }
+
+      const startedAtSnapshot = snapshot.startedAt;
+      const durationMs = Math.max(0, endedAt - startedAtSnapshot);
+      const hasConversation = snapshot.messages.some(
+        (message) =>
+          message.source === "user" || message.source === "interviewer",
+      );
+      const hasMeaningfulActivity =
+        hasConversation ||
+        snapshot.llmRequestCount > 0 ||
+        snapshot.interviewerChars > 0 ||
+        snapshot.userChars > 0;
+
+      // Ignore accidental instant opens/closes without actual interview activity.
+      if (!hasMeaningfulActivity && durationMs < 15_000) {
+        return false;
+      }
+
+      const totalChars = snapshot.interviewerChars + snapshot.userChars;
+      const metricsSnapshot = {
+        durationMs,
+        interviewerSpeechRatio:
+          snapshot.interviewerChars / Math.max(totalChars, 1),
+        userSpeechRatio: snapshot.userChars / Math.max(totalChars, 1),
+        llmRequestCount: snapshot.llmRequestCount,
+        avgFirstTokenLatencyMs:
+          snapshot.llmLatencies.length > 0
+            ? snapshot.llmLatencies.reduce((a, latency) => a + latency.firstToken, 0) /
+              snapshot.llmLatencies.length
+            : 0,
+        avgTotalLatencyMs:
+          snapshot.llmLatencies.length > 0
+            ? snapshot.llmLatencies.reduce((a, latency) => a + latency.total, 0) /
+              snapshot.llmLatencies.length
+            : 0,
+      };
+
+      const record: SessionRecord = {
+        id: crypto.randomUUID(),
+        startedAt: startedAtSnapshot,
+        endedAt,
+        model: settings.selectedModel?.id ?? "proxy",
+        provider: "custom",
+        metrics: metricsSnapshot,
+        finalReport: undefined,
+      };
+
+      addSessionToHistory(record);
+      return true;
+    },
+    [addSessionToHistory, settings.selectedModel?.id],
+  );
+
+  useEffect(() => {
+    persistSessionToHistoryRef.current = persistSessionToHistory;
+  }, [persistSessionToHistory]);
+
   const closeOverlayWindow = useCallback(async (): Promise<boolean> => {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
       return false;
@@ -902,39 +986,9 @@ export function InterviewOverlay() {
           // STT may already be stopped by effect cleanup.
         });
       }
-
-      const startedAtSnapshot = startedAt ?? endedAt;
-      const metricsSnapshot = {
-        durationMs: Math.max(0, endedAt - startedAtSnapshot),
-        interviewerSpeechRatio: interviewerChars / Math.max(interviewerChars + userChars, 1),
-        userSpeechRatio: userChars / Math.max(interviewerChars + userChars, 1),
-        llmRequestCount,
-        avgFirstTokenLatencyMs:
-          llmLatencies.length > 0
-            ? llmLatencies.reduce((a, l) => a + l.firstToken, 0) / llmLatencies.length
-            : 0,
-        avgTotalLatencyMs:
-          llmLatencies.length > 0
-            ? llmLatencies.reduce((a, l) => a + l.total, 0) / llmLatencies.length
-            : 0,
-      };
-      const modelSnapshot = settings.selectedModel?.id ?? "proxy";
-      const providerSnapshot = "custom";
-
+      persistSessionToHistory(endedAt);
       setInterviewActive(false);
       endSession();
-
-      const record: SessionRecord = {
-        id: crypto.randomUUID(),
-        startedAt: startedAtSnapshot,
-        endedAt,
-        model: modelSnapshot,
-        provider: providerSnapshot,
-        metrics: metricsSnapshot,
-        finalReport: undefined,
-      };
-
-      addSessionToHistory(record);
 
       const closedOverlay = await closeOverlayWindow().catch((error: unknown) => {
         console.error("Failed to close overlay window:", error);
@@ -952,19 +1006,25 @@ export function InterviewOverlay() {
       endingRef.current = false;
     }
   }, [
-    addSessionToHistory,
     closeOverlayWindow,
-    elapsedMs,
     endSession,
-    interviewerChars,
-    llmLatencies,
-    llmRequestCount,
-    settings,
+    persistSessionToHistory,
     setInterviewActive,
     setView,
-    startedAt,
-    userChars,
   ]);
+
+  useEffect(() => {
+    return () => {
+      if (endingRef.current) {
+        return;
+      }
+      const endedAt = Date.now();
+      const saved = persistSessionToHistoryRef.current(endedAt);
+      if (saved) {
+        useSessionStore.getState().endSession();
+      }
+    };
+  }, []);
 
   // Global hotkeys (work outside app focus via Tauri plugin)
   const handleGlobalAction = useCallback(
@@ -1131,7 +1191,7 @@ export function InterviewOverlay() {
             icon={<Languages className="w-3 h-3" />}
             className="min-w-[120px]"
           >
-            Lang ({switchLanguageHkLabel})
+            Язык ({switchLanguageHkLabel})
           </Button>
           <Button
             variant="danger"
@@ -1140,7 +1200,7 @@ export function InterviewOverlay() {
             icon={<Square className="w-3 h-3" />}
             className="min-w-[105px]"
           >
-            End ({endHkLabel})
+            Завершить ({endHkLabel})
           </Button>
         </div>
       </div>
@@ -1185,12 +1245,38 @@ export function InterviewOverlay() {
         <div className="mx-3 mb-2 bg-black/50 border border-zinc-700/80 rounded-lg overflow-hidden shrink-0">
           <div className="flex items-center gap-2 px-3 py-1.5 border-b border-zinc-700/70 bg-zinc-900/55">
             <Bot className="w-3.5 h-3.5 text-zinc-200" />
-            <span className="text-xs font-medium text-zinc-300">AI Response</span>
+            <span className="text-xs font-medium text-zinc-300">Подсказка AI</span>
+            <button
+              type="button"
+              onClick={() => {
+                setResponseExpanded((current) => !current);
+              }}
+              className="ml-auto inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[10px] text-zinc-300 hover:bg-zinc-800/70"
+              title={responseExpanded ? "Свернуть" : "Развернуть"}
+            >
+              {responseExpanded ? (
+                <Minimize2 className="h-3 w-3" />
+              ) : (
+                <Maximize2 className="h-3 w-3" />
+              )}
+              {responseExpanded ? "Свернуть" : "Развернуть"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void copyLastResponse();
+              }}
+              className="inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[10px] text-zinc-300 hover:bg-zinc-800/70"
+              title="Копировать"
+            >
+              <Copy className="h-3 w-3" />
+              {copiedResponse ? "Скопировано" : "Копировать"}
+            </button>
             {lastLlmResponse.isStreaming && (
-              <Loader2 className="w-3 h-3 text-zinc-300 animate-spin ml-auto" />
+              <Loader2 className="w-3 h-3 text-zinc-300 animate-spin" />
             )}
             {!lastLlmResponse.isStreaming && lastLlmResponse.totalLatencyMs && (
-              <span className="text-[10px] text-zinc-500 ml-auto">
+              <span className="text-[10px] text-zinc-500">
                 {(lastLlmResponse.totalLatencyMs / 1000).toFixed(1)}s
               </span>
             )}
@@ -1198,11 +1284,11 @@ export function InterviewOverlay() {
           <div
             ref={aiPanelRef}
             onScroll={handleAiPanelScroll}
-            className="px-3 py-2 max-h-40 overflow-y-auto bg-black/20"
+            className={`px-3 py-2 overflow-y-auto bg-black/20 ${responseExpanded ? "max-h-[55vh]" : "max-h-40"}`}
           >
             <p className="text-xs text-zinc-100 whitespace-pre-wrap leading-relaxed select-text">
               {lastLlmResponse.text || (
-                <span className="text-zinc-500">Waiting for response...</span>
+                <span className="text-zinc-500">Ждем ответ...</span>
               )}
             </p>
           </div>
@@ -1212,7 +1298,7 @@ export function InterviewOverlay() {
       {lastLlmError && (
         <div className="mx-3 mb-2 rounded-lg border border-red-900/70 bg-black/55 px-3 py-2 shrink-0">
           <p className="text-[11px] text-red-200 leading-relaxed">
-            LLM error: {lastLlmError}
+            Ошибка AI: {lastLlmError}
           </p>
         </div>
       )}
@@ -1227,7 +1313,7 @@ export function InterviewOverlay() {
           icon={isLlmLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           className="flex-1"
         >
-          Send ({sendHkLabel})
+          Отправить ({sendHkLabel})
         </Button>
         <Button
           variant="secondary"
@@ -1237,7 +1323,7 @@ export function InterviewOverlay() {
           icon={isLlmLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
           className="flex-1"
         >
-          Send + Screenshot ({sendScreenHkLabel})
+          Отправить + Скрин ({sendScreenHkLabel})
         </Button>
       </div>
     </div>
@@ -1307,7 +1393,7 @@ function buildInterviewPrompt({
     ? `Контекст интервью:\n${normalizedContext}\n\n`
     : "Контекст интервью:\nТехническое собеседование по разработке программного обеспечения.\n\n";
 
-  return `${contextBlock}Важно:\n- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;\n- если по контексту очевидно, что слово распознано неточно, интерпретируй его в пользу технического смысла;\n- отвечай кратко, по делу и с учетом текущего вопроса собеседования.\n\nТранскрипт интервью:\n${transcript}\n\nДай краткую и полезную подсказку по текущему контексту.`;
+  return `${contextBlock}Важно:\n- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;\n- если слово распознано неточно, интерпретируй его в пользу технического смысла;\n- не пиши академические определения и длинные теоретические абзацы;\n- ответ должен быть прикладным и пригодным для устного ответа на собеседовании.\n\nФормат ответа строго:\n1) Суть (1-2 короткие фразы).\n2) Что сказать вслух (готовая формулировка до 2 предложений).\n3) Если нужен код — только минимальный фрагмент по делу, без лишнего.\n\nТранскрипт интервью:\n${transcript}\n\nДай короткую и практичную подсказку по текущему вопросу.`;
 }
 
 async function captureScreenshotAsBase64Png(): Promise<string> {

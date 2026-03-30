@@ -42,11 +42,11 @@ export function HistoryPage() {
     <div className="p-6 max-w-5xl h-full flex flex-col">
       <div className="mb-4 flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-text-primary">History</h1>
+          <h1 className="text-2xl font-bold text-text-primary">История</h1>
           <p className="text-sm text-text-muted mt-1">
             {historyRetentionDays === null
-              ? "Interview history is kept forever."
-              : `Interview history is kept for ${formatHistoryRetentionLabel(historyRetentionDays)} and then deleted automatically.`}
+              ? "История собеседований хранится бессрочно."
+              : `История хранится ${formatHistoryRetentionLabel(historyRetentionDays)}, затем старые сессии удаляются автоматически.`}
           </p>
         </div>
         <Button
@@ -55,7 +55,7 @@ export function HistoryPage() {
           onClick={openRetentionSettings}
           className="shrink-0"
         >
-          Configure
+          Настроить
         </Button>
       </div>
 
@@ -63,9 +63,9 @@ export function HistoryPage() {
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center space-y-3">
             <FileText className="w-12 h-12 text-text-muted mx-auto" />
-            <p className="text-sm text-text-muted">No sessions recorded yet.</p>
+            <p className="text-sm text-text-muted">Пока нет сохраненных сессий.</p>
             <p className="text-xs text-text-muted">
-              Complete an interview to see it here.
+              Завершите интервью, и оно появится здесь.
             </p>
           </div>
         </div>
@@ -94,7 +94,7 @@ export function HistoryPage() {
             ) : (
               <div className="h-full flex items-center justify-center">
                 <p className="text-sm text-text-muted">
-                  Select a session to view details.
+                  Выберите сессию, чтобы посмотреть детали.
                 </p>
               </div>
             )}
@@ -129,14 +129,14 @@ function SessionCard({
       <div className="flex items-start justify-between">
         <div>
           <div className="text-sm font-medium text-text-primary">
-            {date.toLocaleDateString("en-US", {
+            {date.toLocaleDateString("ru-RU", {
               month: "short",
               day: "numeric",
               year: "numeric",
             })}
           </div>
           <div className="text-xs text-text-muted mt-0.5">
-            {date.toLocaleTimeString("en-US", {
+            {date.toLocaleTimeString("ru-RU", {
               hour: "2-digit",
               minute: "2-digit",
             })}
@@ -164,7 +164,7 @@ function SessionCard({
       </div>
       <div className="flex items-center gap-3 mt-2 text-[10px] text-text-muted">
         <span>{session.model}</span>
-        <span>{session.metrics.llmRequestCount} requests</span>
+        <span>{session.metrics.llmRequestCount} запросов</span>
       </div>
     </div>
   );
@@ -179,17 +179,17 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-bold text-text-primary">
-            Interview Session
+            Сессия интервью
           </h2>
           <p className="text-xs text-text-muted">
-            {date.toLocaleDateString("en-US", {
+            {date.toLocaleDateString("ru-RU", {
               weekday: "long",
               month: "long",
               day: "numeric",
               year: "numeric",
             })}
-            {" at "}
-            {date.toLocaleTimeString("en-US", {
+            {" в "}
+            {date.toLocaleTimeString("ru-RU", {
               hour: "2-digit",
               minute: "2-digit",
             })}
@@ -200,36 +200,36 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
         </button>
       </div>
 
-      <Card title="Metrics">
+      <Card title="Метрики">
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
           <MetricItem
             icon={<Clock className="w-4 h-4" />}
-            label="Duration"
+            label="Длительность"
             value={formatDuration(metrics.durationMs)}
           />
           <MetricItem
             icon={<Brain className="w-4 h-4" />}
-            label="LLM Requests"
+            label="Запросы к AI"
             value={metrics.llmRequestCount.toString()}
           />
           <MetricItem
             icon={<Activity className="w-4 h-4" />}
-            label="Avg First Token"
+            label="До 1-го токена"
             value={`${Math.round(metrics.avgFirstTokenLatencyMs)}ms`}
           />
           <MetricItem
             icon={<Activity className="w-4 h-4" />}
-            label="Avg Total Latency"
+            label="Полная задержка"
             value={`${Math.round(metrics.avgTotalLatencyMs)}ms`}
           />
           <MetricItem
             icon={<TrendingUp className="w-4 h-4" />}
-            label="Your Speech"
+            label="Вы говорили"
             value={`${Math.round(metrics.userSpeechRatio * 100)}%`}
           />
           <MetricItem
             icon={<TrendingUp className="w-4 h-4" />}
-            label="Interviewer"
+            label="Собеседник"
             value={`${Math.round(metrics.interviewerSpeechRatio * 100)}%`}
           />
         </div>
@@ -237,9 +237,9 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
 
       <Card>
         <div className="flex items-center gap-2 text-xs text-text-muted">
-          <span>Model: <span className="text-text-secondary">{session.model}</span></span>
+          <span>Модель: <span className="text-text-secondary">{session.model}</span></span>
           <span>·</span>
-          <span>Provider: <span className="text-text-secondary">{providerLabel(session.provider)}</span></span>
+          <span>Провайдер: <span className="text-text-secondary">{providerLabel(session.provider)}</span></span>
         </div>
       </Card>
 
@@ -249,8 +249,8 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
         <div className="flex items-start gap-2.5 p-3 bg-bg-secondary border border-border rounded-lg">
           <AlertCircle className="w-4 h-4 text-text-muted mt-0.5 shrink-0" />
           <p className="text-xs text-text-muted">
-            No final report was generated for this session. Enable Final Report in
-            Settings before starting the interview.
+            Для этой сессии финальный отчёт не был сгенерирован.
+            Включите «Финальный отчёт» в настройках перед началом интервью.
           </p>
         </div>
       )}
@@ -260,29 +260,29 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
 
 function ReportCard({ report }: { report: FinalReport }) {
   return (
-    <Card title="Final Report">
+    <Card title="Финальный отчёт">
       <div className="space-y-4">
         <div className="flex items-center gap-4">
           <div className="text-center">
             <div className="text-3xl font-bold text-accent">
               {report.overallScore}
             </div>
-            <div className="text-[10px] text-text-muted">Overall</div>
+            <div className="text-[10px] text-text-muted">Итог</div>
           </div>
           <div className="text-center">
             <div className="text-3xl font-bold text-text-secondary">
               {report.interviewerScore}
             </div>
-            <div className="text-[10px] text-text-muted">Interviewer</div>
+            <div className="text-[10px] text-text-muted">Оценка собеседника</div>
           </div>
           <p className="text-xs text-text-muted flex-1">
             {report.interviewerComment}
           </p>
         </div>
 
-        <ReportSection title="Strengths" items={report.strengths} variant="success" />
-        <ReportSection title="Weaknesses" items={report.weaknesses} variant="danger" />
-        <ReportSection title="Improvements" items={report.improvements} variant="warning" />
+        <ReportSection title="Сильные стороны" items={report.strengths} variant="success" />
+        <ReportSection title="Слабые стороны" items={report.weaknesses} variant="danger" />
+        <ReportSection title="Что улучшить" items={report.improvements} variant="warning" />
       </div>
     </Card>
   );
@@ -344,8 +344,8 @@ function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
   const h = Math.floor(m / 60);
-  if (h > 0) return `${h}h ${m % 60}m`;
-  if (m > 0) return `${m}m ${s % 60}s`;
-  return `${s}s`;
+  if (h > 0) return `${h}ч ${m % 60}м`;
+  if (m > 0) return `${m}м ${s % 60}с`;
+  return `${s}с`;
 }
 

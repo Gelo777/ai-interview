@@ -25,6 +25,12 @@ export interface LicenseValidationResult {
   status: ProxyLicenseStatus | null;
 }
 
+const MAX_OUTPUT_CHARS = 1600;
+const MAX_LIST_ITEMS = 2;
+const MAX_LIST_ITEM_CHARS = 260;
+const MAX_CODE_LINES = 48;
+const MAX_CODE_CHARS = 2800;
+
 function joinBaseUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
@@ -157,9 +163,12 @@ export async function requestProxyHint(params: {
 }
 
 export function formatProxyHintResponse(response: ProxyHintResponse): string {
+  const compactOutput = truncateText(response.output?.trim() ?? "", MAX_OUTPUT_CHARS);
+  const compactCode = truncateCode(response.code ?? "");
+
   const sections = [
-    response.output?.trim() ?? "",
-    formatNamedList("Код", response.code ? [response.code] : []),
+    compactOutput,
+    formatNamedList("Код", compactCode ? [compactCode] : []),
     formatNamedList("Чек-лист", response.checklist ?? []),
     formatNamedList("Уточняющие вопросы", response.questions ?? []),
     formatNamedList("Следующие шаги", response.nextSteps ?? []),
@@ -169,7 +178,10 @@ export function formatProxyHintResponse(response: ProxyHintResponse): string {
 }
 
 function formatNamedList(title: string, items: string[]): string {
-  const normalized = items.map((item) => item.trim()).filter(Boolean);
+  const normalized = items
+    .map((item) => truncateText(item.trim(), MAX_LIST_ITEM_CHARS))
+    .filter(Boolean)
+    .slice(0, MAX_LIST_ITEMS);
   if (normalized.length === 0) {
     return "";
   }
@@ -179,6 +191,29 @@ function formatNamedList(title: string, items: string[]): string {
   }
 
   return `${title}:\n${normalized.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, maxChars).trimEnd()}…`;
+}
+
+function truncateCode(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const limitedLines = lines.slice(0, MAX_CODE_LINES).join("\n");
+  const limitedText = truncateText(limitedLines, MAX_CODE_CHARS);
+
+  if (lines.length > MAX_CODE_LINES || trimmed.length > MAX_CODE_CHARS) {
+    return `${limitedText}\n...сокращено для удобства чтения`;
+  }
+  return limitedText;
 }
 
 function toProxyLanguage(language: PrimaryLanguage): string {

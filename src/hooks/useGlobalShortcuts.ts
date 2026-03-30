@@ -90,37 +90,47 @@ export function useGlobalShortcuts(
         const registeredShortcuts: string[] = [];
 
         for (const hk of hotkeys) {
-          const candidates = keysToAccelerators(hk.keys);
-          let registeredForAction = false;
-          let lastError: unknown = null;
-
-          for (const candidate of candidates) {
-            const accelerator = candidate.trim();
-            if (!accelerator) {
-              continue;
+          const customCandidates = keysToAccelerators(hk.keys);
+          const fallbackCandidates = keysToAccelerators(hk.default);
+          const tryRegister = async (
+            candidates: string[],
+          ): Promise<{ ok: boolean; used: string | null; error: unknown }> => {
+            const unique = [...new Set(candidates.map((value) => value.trim()).filter(Boolean))];
+            let lastError: unknown = null;
+            for (const accelerator of unique) {
+              try {
+                await register(accelerator, (event) => {
+                  if (event.state !== "Pressed") {
+                    return;
+                  }
+                  onActionRef.current(hk.action);
+                });
+                registeredShortcuts.push(accelerator);
+                return { ok: true, used: accelerator, error: null };
+              } catch (err) {
+                lastError = err;
+              }
             }
+            return { ok: false, used: null, error: lastError };
+          };
 
-            try {
-              await register(accelerator, (event) => {
-                if (event.state !== "Pressed") {
-                  return;
-                }
-                onActionRef.current(hk.action);
-              });
-              registeredShortcuts.push(accelerator);
-              registeredForAction = true;
-              break;
-            } catch (err) {
-              lastError = err;
-            }
+          const customResult = await tryRegister(customCandidates);
+          if (customResult.ok) {
+            continue;
           }
 
-          if (!registeredForAction) {
+          const fallbackResult = await tryRegister(fallbackCandidates);
+          if (!fallbackResult.ok) {
             console.warn(
-              `Failed to register global shortcut for action '${hk.action}'. Candidates: ${candidates.join(", ")}`,
-              lastError,
+              `Failed to register global shortcut for action '${hk.action}'. Candidates: ${customCandidates.join(", ")}`,
+              customResult.error ?? fallbackResult.error,
             );
+            continue;
           }
+
+          console.warn(
+            `Custom shortcut for action '${hk.action}' could not be registered. Fallback to default '${fallbackResult.used}'.`,
+          );
         }
 
         if (registeredShortcuts.length === 0) {
