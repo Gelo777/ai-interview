@@ -3,6 +3,7 @@ import {
   Key,
   Keyboard,
   Languages,
+  Brain,
   Volume2,
   Loader2,
   RotateCcw,
@@ -62,7 +63,18 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Key }[] = [
   { id: "llm", label: "Ключ", icon: Key },
   { id: "audio", label: "Аудио", icon: Volume2 },
   { id: "language", label: "Язык", icon: Languages },
+  { id: "speech", label: "Распознавание", icon: Brain },
   { id: "hotkeys", label: "Клавиши", icon: Keyboard },
+];
+
+const SIMPLE_HOTKEY_PRESET: ReadonlyArray<{
+  action: HotkeyAction;
+  keys: string[];
+}> = [
+  { action: "send_to_llm", keys: ["F8"] },
+  { action: "send_with_screenshot", keys: ["F9"] },
+  { action: "end_interview", keys: ["F10"] },
+  { action: "switch_stt_language", keys: ["F11"] },
 ];
 
 function getFocusSectionClass(isFocused: boolean): string {
@@ -148,7 +160,18 @@ export function SettingsPage() {
           <AudioSettings disabled={isInterviewActive} focusTarget={activeFocus} />
         )}
         {tab === "language" && (
-          <LanguageSettings disabled={isInterviewActive} focusTarget={activeFocus} />
+          <LanguageSettings
+            disabled={isInterviewActive}
+            focusTarget={activeFocus}
+            section="language"
+          />
+        )}
+        {tab === "speech" && (
+          <LanguageSettings
+            disabled={isInterviewActive}
+            focusTarget={activeFocus}
+            section="speech"
+          />
         )}
         {tab === "hotkeys" && (
           <HotkeySettings disabled={isInterviewActive} focusTarget={activeFocus} />
@@ -613,9 +636,11 @@ function AudioSettings({
 function LanguageSettings({
   disabled,
   focusTarget,
+  section,
 }: {
   disabled: boolean;
   focusTarget: SettingsFocusTarget | null;
+  section: "language" | "speech";
 }) {
   const {
     primaryLanguage,
@@ -1275,157 +1300,165 @@ function LanguageSettings({
 
   const languageOpsDisabled = disabled || runtimeInstalling;
   const languageSelectorsDisabled = disabled || loading || runtimeInstalling || sttInstall.active;
+  const isLanguageSection = section === "language";
+  const isSpeechSection = section === "speech";
 
   return (
     <div className="space-y-5">
-      <Card
-        title="Язык собеседования"
-        description="Основной язык распознавания речи для обычного пользовательского сценария."
-      >
-        <div className="space-y-1.5">
-          <div className="text-xs text-text-muted uppercase tracking-wider">Основной язык</div>
-          <Select
-            value={primaryLanguage}
-            onChange={(value) => {
-              void handlePrimaryLanguageChange(value);
-            }}
-            options={primaryLanguageOptions}
-            disabled={languageSelectorsDisabled}
-          />
-        </div>
-
-        <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
-          Собеседование начнется с языка <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>.
-          Дополнительные языковые режимы и ручное переключение можно включить ниже в служебных настройках.
-        </div>
-
-        <div className="mt-4">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => setShowAdvancedLanguage((value) => !value)}
-          >
-            {showAdvancedLanguage ? "Скрыть служебные языковые настройки" : "Показать служебные языковые настройки"}
-          </Button>
-        </div>
-      </Card>
-
-      <div
-        id="language-runtime"
-        className={getFocusSectionClass(focusTarget === "language-runtime")}
-      >
-        <Card
-          title="Голосовой движок"
-          description="Локальный Vosk runtime и языковые модели проверяются при запуске приложения и при открытии этой вкладки."
-        >
-          <StatusIndicator
-            status={readiness.vosk}
-            label="Статус движка"
-            description={readiness.voskDetail}
-          />
-
-          <div className="mt-3 space-y-1 text-xs text-text-muted">
-            <p>Текущий runtime: {runtimeCurrentVersion ?? "не установлен"}</p>
-            {showLatestRuntimeVersion && <p>Последняя стабильная версия: {runtimeLatestVersion}</p>}
-            {runtimeNetworkHint && <p className="text-warning">{runtimeNetworkHint}</p>}
-          </div>
-
-          <div className="mt-4 flex items-center gap-2">
-            {runtimeNeedsInstall || runtimeNeedsUpdate ? (
-              <Button
-                size="sm"
-                onClick={() => {
-                  void installLatestRuntime();
-                }}
-                disabled={disabled || runtimeInstalling || sttInstall.active}
-                icon={runtimeInstalling ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
-              >
-                {runtimeInstalling
-                  ? `Устанавливаем${runtimeInstallProgress !== null ? ` ${runtimeInstallProgress}%` : "..."}` 
-                  : runtimeNeedsInstall
-                    ? "Установить Vosk"
-                    : "Обновить до стабильной версии"}
-              </Button>
-            ) : (
-              <Badge variant={showLatestRuntimeVersion ? "success" : "muted"}>
-                {showLatestRuntimeVersion && runtimeFullyReady
-                  ? "Уже обновлен"
-                  : "Runtime установлен"}
-              </Badge>
-            )}
-            {defaultModelMissing && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => {
-                  void installModelVariant(primaryLanguage, "small");
-                }}
-                disabled={disabled || runtimeInstalling || sttInstall.active}
-              >
-                Установить базовую модель ({getLanguageLabel(primaryLanguage)})
-              </Button>
-            )}
-          </div>
-
-          {defaultModelMissing && (
-            <div className="mt-3 rounded-lg border border-warning/30 bg-warning-muted p-3 text-xs leading-relaxed text-warning">
-              Runtime уже установлен, но базовая языковая модель для{" "}
-              <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>{" "}
-              еще не скачана. Без нее распознавание речи не запустится.
-            </div>
-          )}
-
-          {runtimeInstalling && (
-            <div className="mt-3 space-y-2">
-              <ProgressBar
-                label="Устанавливаем последнюю стабильную версию Vosk runtime..."
-                percent={runtimeInstallProgress}
-              />
-              <div className="flex justify-end">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    void handleCancelInstall();
-                  }}
-                  disabled={cancelingInstall}
-                >
-                  {cancelingInstall ? "Отменяем..." : "Отмена"}
-                </Button>
-              </div>
-            </div>
-          )}
-        </Card>
-      </div>
-
-      {showAdvancedLanguage && (
+      {isLanguageSection && (
         <>
           <Card
-            title="Дополнительные языки"
-            description="Служебный режим: второй язык и ручное переключение во время собеседования."
+            title="Язык собеседования"
+            description="Основной язык распознавания речи для обычного пользовательского сценария."
           >
             <div className="space-y-1.5">
-              <div className="text-xs text-text-muted uppercase tracking-wider">Второй язык</div>
+              <div className="text-xs text-text-muted uppercase tracking-wider">Основной язык</div>
               <Select
-                value={secondaryLanguage}
+                value={primaryLanguage}
                 onChange={(value) => {
-                  void handleSecondaryLanguageChange(value);
+                  void handlePrimaryLanguageChange(value);
                 }}
-                options={secondaryLanguageOptions.map((option) => ({
-                  value: option.value,
-                  label: option.label,
-                }))}
+                options={primaryLanguageOptions}
                 disabled={languageSelectorsDisabled}
               />
             </div>
 
             <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
-              Горячая клавиша переключения языка:{" "}
-              <kbd className="mx-1 px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-[10px] font-mono text-text-primary">
-                {switchHotkeyLabel}
-              </kbd>
+              Собеседование начнется с языка <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>.
+              Дополнительные языковые режимы и ручное переключение можно включить ниже.
+            </div>
+
+            <div className="mt-4">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setShowAdvancedLanguage((value) => !value)}
+              >
+                {showAdvancedLanguage ? "Скрыть дополнительные языки" : "Показать дополнительные языки"}
+              </Button>
             </div>
           </Card>
+
+          {showAdvancedLanguage && (
+            <Card
+              title="Дополнительные языки"
+              description="Второй язык и ручное переключение во время собеседования."
+            >
+              <div className="space-y-1.5">
+                <div className="text-xs text-text-muted uppercase tracking-wider">Второй язык</div>
+                <Select
+                  value={secondaryLanguage}
+                  onChange={(value) => {
+                    void handleSecondaryLanguageChange(value);
+                  }}
+                  options={secondaryLanguageOptions.map((option) => ({
+                    value: option.value,
+                    label: option.label,
+                  }))}
+                  disabled={languageSelectorsDisabled}
+                />
+              </div>
+
+              <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
+                Горячая клавиша переключения языка:{" "}
+                <kbd className="mx-1 px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-[10px] font-mono text-text-primary">
+                  {switchHotkeyLabel}
+                </kbd>
+              </div>
+            </Card>
+          )}
+        </>
+      )}
+
+      {isSpeechSection && (
+        <>
+          <div
+            id="language-runtime"
+            className={getFocusSectionClass(focusTarget === "language-runtime")}
+          >
+            <Card
+              title="Голосовой движок"
+              description="Локальный Vosk runtime и состояние распознавания речи."
+            >
+              <StatusIndicator
+                status={readiness.vosk}
+                label="Статус движка"
+                description={readiness.voskDetail}
+              />
+
+              <div className="mt-3 space-y-1 text-xs text-text-muted">
+                <p>Текущий runtime: {runtimeCurrentVersion ?? "не установлен"}</p>
+                {showLatestRuntimeVersion && <p>Последняя стабильная версия: {runtimeLatestVersion}</p>}
+                {runtimeNetworkHint && <p className="text-warning">{runtimeNetworkHint}</p>}
+              </div>
+
+              <div className="mt-4 flex items-center gap-2">
+                {runtimeNeedsInstall || runtimeNeedsUpdate ? (
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      void installLatestRuntime();
+                    }}
+                    disabled={disabled || runtimeInstalling || sttInstall.active}
+                    icon={runtimeInstalling ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
+                  >
+                    {runtimeInstalling
+                      ? `Устанавливаем${runtimeInstallProgress !== null ? ` ${runtimeInstallProgress}%` : "..."}` 
+                      : runtimeNeedsInstall
+                        ? "Установить Vosk"
+                        : "Обновить до стабильной версии"}
+                  </Button>
+                ) : (
+                  <Badge variant={showLatestRuntimeVersion ? "success" : "muted"}>
+                    {showLatestRuntimeVersion && runtimeFullyReady
+                      ? "Уже обновлен"
+                      : "Runtime установлен"}
+                  </Badge>
+                )}
+                {defaultModelMissing && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      void installModelVariant(primaryLanguage, "small");
+                    }}
+                    disabled={disabled || runtimeInstalling || sttInstall.active}
+                  >
+                    Установить базовую модель ({getLanguageLabel(primaryLanguage)})
+                  </Button>
+                )}
+              </div>
+
+              {defaultModelMissing && (
+                <div className="mt-3 rounded-lg border border-warning/30 bg-warning-muted p-3 text-xs leading-relaxed text-warning">
+                  Runtime уже установлен, но базовая языковая модель для{" "}
+                  <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>{" "}
+                  еще не скачана. Без нее распознавание речи не запустится.
+                </div>
+              )}
+
+              {runtimeInstalling && (
+                <div className="mt-3 space-y-2">
+                  <ProgressBar
+                    label="Устанавливаем последнюю стабильную версию Vosk runtime..."
+                    percent={runtimeInstallProgress}
+                  />
+                  <div className="flex justify-end">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        void handleCancelInstall();
+                      }}
+                      disabled={cancelingInstall}
+                    >
+                      {cancelingInstall ? "Отменяем..." : "Отмена"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </Card>
+          </div>
 
           <div
             id="language-models"
@@ -1433,7 +1466,7 @@ function LanguageSettings({
           >
             <Card
               title="Модели распознавания"
-              description="Служебный режим: ручная установка и выбор моделей Vosk."
+              description="Выбор быстрой или точной модели для каждого языка."
             >
               {!voskReady && !sttInstall.active && (
                 <div className="mb-4 p-3 rounded-lg border border-warning/30 bg-warning-muted flex items-center justify-between gap-3">
@@ -1451,6 +1484,12 @@ function LanguageSettings({
                   </Button>
                 </div>
               )}
+
+              <div className="mb-4 rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
+                Язык интервью выбирается во вкладке <span className="text-text-primary">Язык</span>, а здесь настраивается качество распознавания:
+                <span className="text-text-primary"> Small</span> запускается быстрее,{" "}
+                <span className="text-text-primary">Large</span> распознает точнее, но скачивается дольше.
+              </div>
 
               <div className="space-y-3">
                 <LanguageModelRow
@@ -2103,6 +2142,13 @@ function HotkeySettings({
     setRecordingPreview([]);
   }
 
+  function applySimplePreset() {
+    resetRecordingState();
+    for (const binding of SIMPLE_HOTKEY_PRESET) {
+      setHotkey(binding.action, binding.keys);
+    }
+  }
+
   function updateRecordingPreview(event: React.KeyboardEvent<HTMLInputElement>): string[] {
     const pressedKeys = pressedKeysRef.current;
     const normalized = normalizeHotkeyToken(event.key);
@@ -2163,9 +2209,10 @@ function HotkeySettings({
           description="Эти сочетания работают во время интервью. Нажмите на кнопку справа, чтобы назначить свое сочетание."
         >
           <div className="mb-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs leading-relaxed text-text-muted">
-            Для Windows лучше использовать сочетания с <span className="font-medium text-text-secondary">Ctrl</span> или{" "}
-            <span className="font-medium text-text-secondary">Shift</span>. Системные комбинации вроде{" "}
-            <span className="font-medium text-text-secondary">Alt + Space</span> могут перехватываться браузером или самой Windows.
+            Для простого старта рекомендуем одиночные клавиши{" "}
+            <span className="font-medium text-text-secondary">F8, F9, F10 и F11</span>.{" "}
+            Они стабильнее работают в Windows, чем системные комбинации вроде{" "}
+            <span className="font-medium text-text-secondary">Alt + Space</span>.
           </div>
           <div className="space-y-2">
             {hotkeys.map((hk) => (
@@ -2210,6 +2257,15 @@ function HotkeySettings({
             Можно использовать до {HOTKEY_MAX_KEYS} клавиш в одном сочетании.
           </p>
           <div className="mt-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={applySimplePreset}
+              disabled={disabled}
+              className="mr-2"
+            >
+              Простой набор (F8-F11)
+            </Button>
             <Button
               variant="ghost"
               size="sm"

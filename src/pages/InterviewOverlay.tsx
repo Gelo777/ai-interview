@@ -42,6 +42,8 @@ type VoskModelEntry = {
 
 const VOSK_MODEL_LOOKUP_TIMEOUT_MS = 6000;
 const STT_STARTUP_TIMEOUT_MS = 12000;
+const SCREENSHOT_PICKER_TIMEOUT_MS = 12000;
+const SCREENSHOT_STREAM_READY_TIMEOUT_MS = 4000;
 
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -101,6 +103,33 @@ function toFriendlySttStartupError(error: unknown): string {
   }
   if (normalized.includes("stt session is already running")) {
     return "Сессия распознавания уже запущена.";
+  }
+
+  return detail;
+}
+
+function toFriendlyScreenshotError(error: unknown): string {
+  const detail =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Неизвестная ошибка захвата экрана";
+  const normalized = detail.toLowerCase();
+
+  if (
+    normalized.includes("notallowederror") ||
+    normalized.includes("permission denied") ||
+    normalized.includes("permission dismissed")
+  ) {
+    return "Доступ к захвату экрана не выдан или окно выбора было закрыто.";
+  }
+  if (
+    normalized.includes("истекло время") ||
+    normalized.includes("timeout") ||
+    normalized.includes("timed out")
+  ) {
+    return "Время выбора окна для скриншота истекло. Отправляем запрос без скриншота.";
   }
 
   return detail;
@@ -730,6 +759,13 @@ export function InterviewOverlay() {
       let imageBase64Png: string | undefined;
 
       if (withScreenshot) {
+        addMessage({
+          id: crypto.randomUUID(),
+          timestamp: Date.now(),
+          source: "ai_marker",
+          text: "Выбери окно или экран для скриншота. Если диалог не подтвердить, отправим запрос без скриншота.",
+          isFinal: true,
+        });
         try {
           const screenshotBase64 = await captureScreenshotAsBase64Png();
           if (settings.imageHandlingMode === "send_image") {
@@ -744,8 +780,14 @@ export function InterviewOverlay() {
             }
           }
         } catch (err: unknown) {
-          const detail =
-            err instanceof Error ? err.message : "Неизвестная ошибка скриншота";
+          const detail = toFriendlyScreenshotError(err);
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text: `Скриншот не добавлен: ${detail}`,
+            isFinal: true,
+          });
           userPrompt += `\n\nНе удалось приложить скриншот: ${detail}`;
         }
       }
@@ -1273,10 +1315,14 @@ async function captureScreenshotAsBase64Png(): Promise<string> {
     throw new Error("Screen capture API is not available.");
   }
 
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { frameRate: 1 },
-    audio: false,
-  });
+  const stream = await withTimeout(
+    navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 1 },
+      audio: false,
+    }),
+    SCREENSHOT_PICKER_TIMEOUT_MS,
+    "Истекло время ожидания выбора окна для скриншота.",
+  );
 
   try {
     const video = document.createElement("video");
@@ -1284,15 +1330,19 @@ async function captureScreenshotAsBase64Png(): Promise<string> {
     video.muted = true;
     video.playsInline = true;
 
-    await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => {
-        video
-          .play()
-          .then(() => resolve())
-          .catch((err) => reject(err));
-      };
-      video.onerror = () => reject(new Error("Failed to load captured video stream."));
-    });
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        video.onloadedmetadata = () => {
+          video
+            .play()
+            .then(() => resolve())
+            .catch((err) => reject(err));
+        };
+        video.onerror = () => reject(new Error("Failed to load captured video stream."));
+      }),
+      SCREENSHOT_STREAM_READY_TIMEOUT_MS,
+      "Не удалось получить кадр с выбранного экрана.",
+    );
 
     const width = video.videoWidth;
     const height = video.videoHeight;

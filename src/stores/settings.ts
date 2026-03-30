@@ -138,32 +138,40 @@ const DEFAULT_HOTKEYS: HotkeyBinding[] = [
   {
     action: "send_to_llm",
     label: "Отправить в помощник",
-    keys: ["Ctrl", "Alt", "Space"],
-    default: ["Ctrl", "Alt", "Space"],
+    keys: ["F8"],
+    default: ["F8"],
   },
   {
     action: "send_with_screenshot",
     label: "Отправить со скриншотом",
-    keys: ["Ctrl", "Alt", "Shift", "Space"],
-    default: ["Ctrl", "Alt", "Shift", "Space"],
+    keys: ["F9"],
+    default: ["F9"],
   },
   {
     action: "end_interview",
     label: "Завершить интервью",
-    keys: ["Alt", "E"],
-    default: ["Alt", "E"],
+    keys: ["F10"],
+    default: ["F10"],
   },
   {
     action: "switch_stt_language",
     label: "Сменить язык распознавания",
-    keys: ["Alt", "L"],
-    default: ["Alt", "L"],
+    keys: ["F11"],
+    default: ["F11"],
   },
 ];
 
-const LEGACY_DEFAULT_HOTKEYS: Partial<Record<HotkeyAction, string[]>> = {
-  send_to_llm: ["Alt", "Space"],
-  send_with_screenshot: ["Alt", "Shift", "Space"],
+const LEGACY_DEFAULT_HOTKEYS: Partial<Record<HotkeyAction, string[][]>> = {
+  send_to_llm: [
+    ["Alt", "Space"],
+    ["Ctrl", "Alt", "Space"],
+  ],
+  send_with_screenshot: [
+    ["Alt", "Shift", "Space"],
+    ["Ctrl", "Alt", "Shift", "Space"],
+  ],
+  end_interview: [["Alt", "E"]],
+  switch_stt_language: [["Alt", "L"]],
 };
 
 interface SettingsState extends AppSettings {
@@ -388,10 +396,12 @@ export const useSettingsStore = create<SettingsState>()(
           }
 
           const legacyDefault = LEGACY_DEFAULT_HOTKEYS[fallback.action];
-          const keys =
-            legacyDefault && areHotkeyBindingsEqual(fromState.keys, legacyDefault)
-              ? fallback.default
-              : fromState.keys;
+          const shouldReplaceLegacyDefault =
+            Array.isArray(legacyDefault) &&
+            legacyDefault.some((legacyKeys) =>
+              areHotkeyBindingsEqual(fromState.keys, legacyKeys),
+            );
+          const keys = shouldReplaceLegacyDefault ? fallback.default : fromState.keys;
 
           return {
             ...fallback,

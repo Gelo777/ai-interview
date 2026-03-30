@@ -34,6 +34,7 @@ export type SettingsTab =
   | "llm"
   | "audio"
   | "language"
+  | "speech"
   | "images"
   | "privacy"
   | "storage"

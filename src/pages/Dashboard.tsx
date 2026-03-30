@@ -186,7 +186,7 @@ export function Dashboard() {
       onAction:
         readiness.vosk === "granted"
           ? undefined
-          : () => openSettingsTab("language", "language-runtime"),
+          : () => openSettingsTab("speech", "language-runtime"),
     },
   ] as const;
 
