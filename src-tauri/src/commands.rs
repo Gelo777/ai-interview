@@ -416,9 +416,8 @@ pub async fn create_overlay_window(
     app: tauri::AppHandle,
     lock: tauri::State<'_, InterviewWindowLock>,
 ) -> Result<(), String> {
-    lock.set_active(true);
-
     if let Some(existing_overlay) = app.get_webview_window("overlay") {
+        lock.set_active(true);
         let _ = existing_overlay.unminimize();
         let _ = existing_overlay.show();
         let _ = existing_overlay.set_focus();
@@ -447,6 +446,7 @@ pub async fn create_overlay_window(
     let _ = overlay_window.show();
     let _ = overlay_window.unminimize();
     let _ = overlay_window.set_focus();
+    lock.set_active(true);
 
     if let Some(main_window) = app.get_webview_window("main") {
         let _ = main_window.set_skip_taskbar(true);

@@ -104,11 +104,18 @@ pub fn run() {
                 return;
             }
 
-            if let Some(overlay_window) = window.app_handle().get_webview_window("overlay") {
-                let _ = overlay_window.show();
-                let _ = overlay_window.unminimize();
-                let _ = overlay_window.set_focus();
-            }
+            let Some(overlay_window) = window.app_handle().get_webview_window("overlay") else {
+                // Recover from stale lock state if overlay window is missing.
+                lock.set_active(false);
+                let _ = window.set_skip_taskbar(false);
+                let _ = window.show();
+                let _ = window.unminimize();
+                return;
+            };
+
+            let _ = overlay_window.show();
+            let _ = overlay_window.unminimize();
+            let _ = overlay_window.set_focus();
 
             let _ = window.set_skip_taskbar(true);
             let _ = window.hide();

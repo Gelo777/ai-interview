@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ai-interview"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "base64 0.22.1",
  "bytes",

@@ -165,6 +165,15 @@ export function Dashboard() {
       }
     } catch (e) {
       console.error("Failed to start interview", e);
+      setInterviewActive(false);
+      try {
+        const { isTauri, restoreMainWindow } = await import("@/lib/tauri");
+        if (isTauri()) {
+          await restoreMainWindow();
+        }
+      } catch (restoreError) {
+        console.warn("Failed to restore main window after start error", restoreError);
+      }
       setStartError(toFriendlyStartError(e));
     } finally {
       setStarting(false);
