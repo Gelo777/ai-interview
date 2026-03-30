@@ -22,6 +22,51 @@ import { refreshCloudReadinessNow, refreshLocalReadinessNow } from "@/hooks/useR
 import type { SettingsFocusTarget, SettingsTab } from "@/lib/types";
 import { formatHotkey } from "@/lib/hotkeys";
 
+const START_READINESS_TIMEOUT_MS = 8000;
+const START_OVERLAY_TIMEOUT_MS = 7000;
+const START_CAPTURE_PROTECTION_TIMEOUT_MS = 2500;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeoutId: number | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+  }
+}
+
+function toFriendlyStartError(error: unknown): string {
+  const detail =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Не удалось запустить интервью";
+  const normalized = detail.toLowerCase();
+
+  if (normalized.includes("истекло время") || normalized.includes("timeout")) {
+    return "Запуск занял слишком много времени. Проверь сеть и устройства, затем попробуй еще раз.";
+  }
+  if (normalized.includes("overlay")) {
+    return "Не удалось открыть окно интервью. Попробуй запустить снова.";
+  }
+
+  return detail;
+}
+
 export function Dashboard() {
   const {
     permissions,
@@ -42,6 +87,7 @@ export function Dashboard() {
   const hotkeys = useSettingsStore((s) => s.hotkeys);
   const [starting, setStarting] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const lastSession = sessions[0] ?? null;
   const backgroundModelInstall =
@@ -73,19 +119,23 @@ export function Dashboard() {
 
   const handleStartInterview = useCallback(async () => {
     setStarting(true);
+    setStartError(null);
     try {
-      const [local, cloud] = await Promise.all([
-        refreshLocalReadinessNow(),
-        refreshCloudReadinessNow(),
-      ]);
-
-      const readyToStart =
-        cloud.apiReady &&
-        cloud.modelReady &&
-        local.microphone === "granted" &&
-        local.systemAudio === "granted" &&
-        local.voskReady &&
-        !installBlocksInterview;
+      let readyToStart = allReady;
+      if (!readyToStart) {
+        const [local, cloud] = await withTimeout(
+          Promise.all([refreshLocalReadinessNow(), refreshCloudReadinessNow()]),
+          START_READINESS_TIMEOUT_MS,
+          "Истекло время ожидания проверки готовности.",
+        );
+        readyToStart =
+          cloud.apiReady &&
+          cloud.modelReady &&
+          local.microphone === "granted" &&
+          local.systemAudio === "granted" &&
+          local.voskReady &&
+          !installBlocksInterview;
+      }
 
       if (!readyToStart) {
         return;
@@ -94,9 +144,19 @@ export function Dashboard() {
       const { createOverlayWindow, setCaptureProtectionForWindow, isTauri } =
         await import("@/lib/tauri");
       if (isTauri()) {
-        await createOverlayWindow();
+        await withTimeout(
+          createOverlayWindow(),
+          START_OVERLAY_TIMEOUT_MS,
+          "Истекло время ожидания открытия окна интервью.",
+        );
         const protectOverlay = useSettingsStore.getState().protectOverlay;
-        await setCaptureProtectionForWindow("overlay", protectOverlay);
+        await withTimeout(
+          setCaptureProtectionForWindow("overlay", protectOverlay),
+          START_CAPTURE_PROTECTION_TIMEOUT_MS,
+          "Capture protection timeout",
+        ).catch((error) => {
+          console.warn("Failed to apply capture protection during start:", error);
+        });
         setInterviewActive(true);
       } else {
         useAppStore.getState().setView("interview");
@@ -105,10 +165,11 @@ export function Dashboard() {
       }
     } catch (e) {
       console.error("Failed to start interview", e);
+      setStartError(toFriendlyStartError(e));
     } finally {
       setStarting(false);
     }
-  }, [installBlocksInterview, setInterviewActive, startSession]);
+  }, [allReady, installBlocksInterview, setInterviewActive, startSession]);
 
   const missingItems = [
     readiness.apiKey !== "granted" ? "лицензионный ключ" : null,
@@ -314,6 +375,11 @@ export function Dashboard() {
                 Ввести ключ
               </Button>
             </div>
+            {startError && (
+              <div className="mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
+                {startError}
+              </div>
+            )}
           </div>
         </Card>
 

@@ -432,7 +432,7 @@ pub async fn create_overlay_window(
 
     let url = app_window_url(&app);
 
-    let _window = tauri::WebviewWindowBuilder::new(&app, "overlay", url)
+    let overlay_window = tauri::WebviewWindowBuilder::new(&app, "overlay", url)
         .title("AI Interview — Overlay")
         .inner_size(800.0, 600.0)
         .min_inner_size(400.0, 300.0)
@@ -443,6 +443,10 @@ pub async fn create_overlay_window(
         .center()
         .build()
         .map_err(|e: tauri::Error| e.to_string())?;
+
+    let _ = overlay_window.show();
+    let _ = overlay_window.unminimize();
+    let _ = overlay_window.set_focus();
 
     if let Some(main_window) = app.get_webview_window("main") {
         let _ = main_window.set_skip_taskbar(true);
