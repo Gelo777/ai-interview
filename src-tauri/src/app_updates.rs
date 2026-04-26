@@ -11,11 +11,14 @@ const PUBLIC_KEY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/updater/publickey.pem"
 ));
+const DEFAULT_UPDATER_ENDPOINT: &str =
+    "https://github.com/Gelo777/ai-interview/releases/latest/download/latest.json";
 
 fn updater_endpoint() -> Option<&'static str> {
     option_env!("TAURI_UPDATER_ENDPOINT")
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or(Some(DEFAULT_UPDATER_ENDPOINT))
 }
 
 pub struct PendingUpdate(pub Mutex<Option<Update>>);
