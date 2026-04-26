@@ -11,6 +11,7 @@ mod stt_runtime;
 mod system_audio;
 mod vosk_installer;
 mod vosk_runtime;
+mod whisper_stt_runtime;
 
 use tauri::{Emitter, Manager};
 
@@ -64,17 +65,18 @@ pub fn run() {
         .manage(commands::InterviewWindowLock::default())
         .manage(app_updates::PendingUpdate::default())
         .setup(|app| {
+            // Redirect whisper.cpp / ggml native logs away from raw stdout traces.
+            // Without log backend features this effectively silences low-level decode spam.
+            whisper_rs::install_logging_hooks();
+
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
-            #[cfg(debug_assertions)]
-            {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .build(),
+            )?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -83,10 +85,25 @@ pub fn run() {
             if window.label() == "overlay" {
                 if matches!(event, tauri::WindowEvent::Destroyed) {
                     let app = window.app_handle();
-                    let _ = stt_runtime::stop_global_session();
-                    let _ = app.emit("interview_ended", ());
                     let should_restore_main = lock.is_active();
                     lock.set_active(false);
+                    let _ = app.emit("interview_ended", ());
+                    log::info!(
+                        "Overlay window destroyed; restore_main={}, scheduling STT cleanup",
+                        should_restore_main
+                    );
+
+                    tauri::async_runtime::spawn_blocking(move || {
+                        if let Err(err) = stt_runtime::stop_global_session() {
+                            log::warn!(
+                                "Overlay destroy STT cleanup did not finish immediately: {}",
+                                err
+                            );
+                        } else {
+                            log::info!("Overlay destroy STT cleanup finished");
+                        }
+                    });
+
                     if should_restore_main {
                         ensure_main_window_visible(&app);
                     }
@@ -123,23 +140,30 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_platform_info,
+            commands::get_hardware_profile,
             commands::check_permissions,
             commands::list_audio_devices,
+            commands::get_audio_debug_snapshot,
+            commands::capture_audio_sample,
+            commands::transcribe_captured_audio,
             commands::get_capture_protection,
             commands::get_system_audio_status,
             commands::set_capture_protection_for_window,
             commands::ocr_image,
+            commands::capture_screen_png_base64,
             commands::get_secure_api_key,
             commands::set_secure_api_key,
             commands::get_license_status,
             commands::activate_license,
             commands::clear_license,
+            commands::get_proxy_license_status,
             app_updates::check_app_update,
             app_updates::install_app_update,
             commands::read_app_state,
             commands::write_app_state,
             commands::remove_app_state,
             commands::get_stt_status,
+            commands::get_vosk_stt_status,
             commands::create_overlay_window,
             commands::close_main_window,
             commands::restore_main_window,
@@ -148,6 +172,10 @@ pub fn run() {
             commands::set_active_vosk_model,
             commands::switch_stt_model,
             commands::preload_stt_model,
+            commands::list_whisper_models,
+            commands::set_active_whisper_model,
+            commands::remove_whisper_model,
+            commands::download_whisper_model,
             commands::remove_vosk_model,
             commands::ensure_default_stt_assets,
             commands::list_vosk_runtime_versions,
@@ -156,6 +184,9 @@ pub fn run() {
             commands::start_stt_session,
             commands::stop_stt_session,
             commands::is_stt_session_running,
+            commands::start_vosk_stt_session,
+            commands::stop_vosk_stt_session,
+            commands::is_vosk_stt_session_running,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

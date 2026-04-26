@@ -9,10 +9,10 @@ interface Props {
 }
 
 const styles: Record<Variant, string> = {
-  success: "bg-success-muted text-success",
-  warning: "bg-warning-muted text-warning",
-  danger: "bg-danger-muted text-danger",
-  muted: "bg-bg-tertiary text-text-muted",
+  success: "border border-success/30 bg-success-muted text-success",
+  warning: "border border-warning/30 bg-warning-muted text-warning",
+  danger: "border border-danger/35 bg-danger-muted text-danger",
+  muted: "border border-white/10 bg-bg-tertiary text-text-muted",
 };
 
 export function Badge({ variant, children, className = "" }: Props) {

@@ -24,16 +24,16 @@ export function Toggle({
         disabled={disabled}
         onClick={() => !disabled && onChange(!checked)}
         className={`
-          relative mt-0.5 w-11 h-6 rounded-full transition-colors duration-200
-          ${checked ? "bg-accent" : "bg-bg-tertiary border border-border"}
+          relative mt-0.5 w-12 h-6 rounded-full transition-colors duration-200
+          ${checked ? "bg-accent shadow-[0_0_0_3px_rgba(87,208,255,0.2)]" : "bg-bg-tertiary border border-border"}
           ${disabled ? "cursor-not-allowed" : "cursor-pointer"}
         `}
       >
         <span
           className={`
-            absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-md
+            absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-md
             transition-transform duration-200
-            ${checked ? "translate-x-5" : "translate-x-0"}
+            ${checked ? "translate-x-6" : "translate-x-0"}
           `}
         />
       </button>

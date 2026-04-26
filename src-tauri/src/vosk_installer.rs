@@ -2,6 +2,7 @@ use crate::install_control;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -154,18 +155,28 @@ pub async fn install_runtime(
         .error_for_status()
         .map_err(|e| format!("Vosk runtime download failed: {}", e))?;
 
+    let temp_archive_path = runtime_base_dir.join(format!(".{}.runtime.zip", selected.version));
+    if temp_archive_path.exists() {
+        fs::remove_file(&temp_archive_path)
+            .map_err(|e| format!("Failed to cleanup temp runtime archive: {}", e))?;
+    }
+
     let total_size = response.content_length();
     let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
     let mut downloaded = 0_u64;
+    let mut archive_file = fs::File::create(&temp_archive_path)
+        .map_err(|e| format!("Failed to create temp runtime archive: {}", e))?;
 
     while let Some(chunk) = stream.next().await {
         if install_control::is_cancelled() {
+            let _ = fs::remove_file(&temp_archive_path);
             return Err("Vosk installation cancelled by user.".to_string());
         }
         let chunk = chunk.map_err(|e| format!("Failed to read Vosk runtime chunk: {}", e))?;
         downloaded += chunk.len() as u64;
-        bytes.extend_from_slice(&chunk);
+        archive_file
+            .write_all(&chunk)
+            .map_err(|e| format!("Failed to write Vosk runtime archive: {}", e))?;
 
         let percent = total_size
             .map(|size| (downloaded as f32 / size as f32) * 90.0)
@@ -180,6 +191,10 @@ pub async fn install_runtime(
             },
         );
     }
+    archive_file
+        .flush()
+        .map_err(|e| format!("Failed to flush Vosk runtime archive: {}", e))?;
+    drop(archive_file);
 
     if install_dir.exists() {
         fs::remove_dir_all(&install_dir)
@@ -198,8 +213,10 @@ pub async fn install_runtime(
         },
     );
 
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| format!("Invalid zip archive: {}", e))?;
+    let archive_file = fs::File::open(&temp_archive_path)
+        .map_err(|e| format!("Failed to open runtime archive: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).map_err(|e| format!("Invalid zip archive: {}", e))?;
     let mut extracted_files: Vec<String> = Vec::new();
 
     for index in 0..archive.len() {
@@ -241,6 +258,7 @@ pub async fn install_runtime(
     .map_err(|e| format!("Failed to store current runtime version: {}", e))?;
 
     cleanup_old_runtime_versions(&runtime_base_dir, &selected.version)?;
+    let _ = fs::remove_file(&temp_archive_path);
 
     let _ = app.emit(
         "vosk_runtime_install_progress",

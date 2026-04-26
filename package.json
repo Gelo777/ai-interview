@@ -11,7 +11,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri-run.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.1",

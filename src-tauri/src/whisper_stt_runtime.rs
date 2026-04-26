@@ -4,57 +4,68 @@ use crate::stt::{SttDiagnostic, SttResult};
 use crate::system_audio;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
-use libloading::Library;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
-use std::os::raw::{c_char, c_float, c_int, c_short, c_void};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use whisper_rs::{
+    convert_integer_to_float_audio, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters, WhisperState,
+};
 
-const AUDIO_QUEUE_CAPACITY: usize = 12;
+const AUDIO_QUEUE_CAPACITY: usize = 32;
 const MICROPHONE_TARGET_SAMPLE_RATE: u32 = 16000;
-const PARTIAL_RESULT_MIN_INTERVAL_MS: u64 = 180;
 const MODEL_SWITCH_MANAGER_TIMEOUT: Duration = Duration::from_secs(50);
 const MODEL_SWITCH_WORKER_TIMEOUT: Duration = Duration::from_secs(45);
+const LANGUAGE_SWITCH_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
+const LANGUAGE_SWITCH_WORKER_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_PRELOAD_MANAGER_TIMEOUT: Duration = Duration::from_secs(75);
 const MODEL_PRELOAD_WORKER_TIMEOUT: Duration = Duration::from_secs(70);
 const STOP_JOIN_GRACE_PERIOD: Duration = Duration::from_secs(4);
-const STOP_COMPLETION_WAIT_ON_START_TIMEOUT: Duration = Duration::from_secs(12);
-const WORKER_JOIN_GRACE_PERIOD: Duration = Duration::from_millis(1200);
-const WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const STOP_COMPLETION_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const HEAVY_MODEL_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(210);
 const SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(70);
 const HEAVY_MODEL_SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
-const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(8);
 
-fn is_heavy_vosk_model_path(model_path: &Path) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WhisperModelTier {
+    Small,
+    Medium,
+    Large,
+}
+
+fn detect_whisper_model_tier(model_path: &Path) -> WhisperModelTier {
     let lower = model_path.to_string_lossy().to_lowercase();
-    !lower.contains("small")
+    if lower.contains("large-v3") || lower.contains("large") {
+        WhisperModelTier::Large
+    } else if lower.contains("medium") {
+        WhisperModelTier::Medium
+    } else {
+        WhisperModelTier::Small
+    }
 }
 
 fn worker_startup_timeout_for_model(model_path: &Path) -> Duration {
-    if is_heavy_vosk_model_path(model_path) {
-        HEAVY_MODEL_WORKER_STARTUP_TIMEOUT
-    } else {
-        WORKER_STARTUP_TIMEOUT
+    match detect_whisper_model_tier(model_path) {
+        WhisperModelTier::Large | WhisperModelTier::Medium => HEAVY_MODEL_WORKER_STARTUP_TIMEOUT,
+        WhisperModelTier::Small => WORKER_STARTUP_TIMEOUT,
     }
 }
 
 fn session_startup_timeout_for_model(model_path: &Path) -> Duration {
-    if is_heavy_vosk_model_path(model_path) {
-        HEAVY_MODEL_SESSION_STARTUP_TIMEOUT
-    } else {
-        SESSION_STARTUP_TIMEOUT
+    match detect_whisper_model_tier(model_path) {
+        WhisperModelTier::Large | WhisperModelTier::Medium => HEAVY_MODEL_SESSION_STARTUP_TIMEOUT,
+        WhisperModelTier::Small => SESSION_STARTUP_TIMEOUT,
     }
 }
 
@@ -89,7 +100,7 @@ fn resolve_output_selector_with_fallback(
 #[derive(Debug, Clone)]
 pub struct SttRuntimeConfig {
     pub model_path: PathBuf,
-    pub runtime_library_path: PathBuf,
+    pub language: String,
     pub microphone_device_id: Option<String>,
     pub system_audio_device_id: Option<String>,
 }
@@ -99,9 +110,9 @@ pub fn start_global_session(app: AppHandle, config: SttRuntimeConfig) -> Result<
     if session_stopping_flag().load(Ordering::Relaxed) {
         log::info!(
             "STT start requested while previous stop is still running; waiting up to {:?}",
-            STOP_COMPLETION_WAIT_ON_START_TIMEOUT
+            STOP_COMPLETION_WAIT_TIMEOUT
         );
-        wait_for_stop_completion(STOP_COMPLETION_WAIT_ON_START_TIMEOUT)?;
+        wait_for_stop_completion(STOP_COMPLETION_WAIT_TIMEOUT)?;
     }
 
     {
@@ -152,6 +163,9 @@ pub fn start_global_session(app: AppHandle, config: SttRuntimeConfig) -> Result<
                             reply_tx,
                         } => {
                             let _ = reply_tx.send(session.preload_model(&model_path));
+                        }
+                        ControlMessage::SwitchLanguage { language, reply_tx } => {
+                            let _ = reply_tx.send(session.switch_language(&language));
                         }
                     }
                 }
@@ -211,22 +225,24 @@ pub fn stop_global_session() -> Result<(), String> {
     cleanup_finished_session_locked(&mut guard);
 
     let Some(controller) = guard.take() else {
-        drop(guard);
         if session_stopping_flag().load(Ordering::Relaxed) {
-            log::info!("STT stop requested while previous stop is still completing");
-            return Err(
-                "STT stop is still in progress. Please retry in a few seconds.".to_string(),
+            log::info!(
+                "STT stop requested while previous stop is still completing; waiting up to {:?}",
+                STOP_COMPLETION_WAIT_TIMEOUT
             );
+            drop(guard);
+            wait_for_stop_completion(STOP_COMPLETION_WAIT_TIMEOUT)?;
+            return Ok(());
         }
 
         log::info!("STT stop requested, but there is no active session");
         return Ok(());
     };
-    drop(guard);
 
     let SessionController { tx, handle } = controller;
     let manager_thread_name = handle.thread().name().unwrap_or("stt-session-manager");
     log::info!("Stopping global STT session via '{}'", manager_thread_name);
+    session_stopping_flag().store(true, Ordering::Relaxed);
     let _ = tx.send(ControlMessage::Stop);
 
     let deadline = Instant::now() + STOP_JOIN_GRACE_PERIOD;
@@ -325,9 +341,36 @@ pub fn preload_global_model(model_path: PathBuf) -> Result<(), String> {
     }
 }
 
-pub fn warm_model_cache(runtime_library_path: PathBuf, model_path: PathBuf) -> Result<(), String> {
+pub fn switch_global_language(language: String) -> Result<(), String> {
+    let mut guard = controller_slot()
+        .lock()
+        .map_err(|_| "Failed to lock STT controller state".to_string())?;
+    cleanup_finished_session_locked(&mut guard);
+
+    let controller = guard
+        .as_ref()
+        .ok_or_else(|| "STT session is not running".to_string())?;
+
+    let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
+    controller
+        .tx
+        .send(ControlMessage::SwitchLanguage { language, reply_tx })
+        .map_err(|_| "Failed to request STT language switch".to_string())?;
+
+    match reply_rx.recv_timeout(LANGUAGE_SWITCH_MANAGER_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("Timed out while switching STT language".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("STT language switch channel disconnected".to_string())
+        }
+    }
+}
+
+pub fn warm_model_cache(model_path: PathBuf) -> Result<(), String> {
     let started_at = Instant::now();
-    let cached_model = get_or_load_cached_model(&runtime_library_path, &model_path)?;
+    let cached_model = get_or_load_cached_model(&model_path)?;
     log::info!(
         "Warm STT model cache ready for '{}' in {:?}",
         cached_model.model_path.display(),
@@ -382,38 +425,6 @@ fn wait_for_stop_completion(timeout: Duration) -> Result<(), String> {
     Ok(())
 }
 
-fn join_worker_with_grace_period(
-    worker: JoinHandle<()>,
-    worker_name: String,
-    grace_period: Duration,
-) -> bool {
-    let deadline = Instant::now() + grace_period;
-    let mut worker = Some(worker);
-
-    while let Some(handle) = worker.as_ref() {
-        if handle.is_finished() {
-            if let Some(done) = worker.take() {
-                let _ = done.join();
-            }
-            return true;
-        }
-
-        if Instant::now() >= deadline {
-            if let Some(detached) = worker.take() {
-                thread::spawn(move || {
-                    let _ = detached.join();
-                    log::info!("Detached STT worker '{}' join finished", worker_name);
-                });
-            }
-            return false;
-        }
-
-        thread::sleep(WORKER_JOIN_POLL_INTERVAL);
-    }
-
-    true
-}
-
 enum ControlMessage {
     Stop,
     SwitchModel {
@@ -422,6 +433,10 @@ enum ControlMessage {
     },
     PreloadModel {
         model_path: PathBuf,
+        reply_tx: Sender<Result<(), String>>,
+    },
+    SwitchLanguage {
+        language: String,
         reply_tx: Sender<Result<(), String>>,
     },
 }
@@ -439,6 +454,7 @@ fn cleanup_finished_session_locked(guard: &mut Option<SessionController>) {
         if let Some(controller) = guard.take() {
             let _ = controller.handle.join();
         }
+        session_stopping_flag().store(false, Ordering::Relaxed);
     }
 }
 
@@ -454,9 +470,9 @@ struct SttSession {
 impl SttSession {
     fn start(app: AppHandle, config: SttRuntimeConfig) -> Result<Self, String> {
         let running = std::sync::Arc::new(AtomicBool::new(true));
-        let runtime_library_path = config.runtime_library_path.clone();
         let model_path = config.model_path.clone();
-        let heavy_model = is_heavy_vosk_model_path(&model_path);
+        let language = config.language.clone();
+        let heavy_model = detect_whisper_model_tier(&model_path) != WhisperModelTier::Small;
         let microphone_device_id = config.microphone_device_id.clone();
         #[cfg(target_os = "windows")]
         let system_audio_device_id = config.system_audio_device_id.clone();
@@ -469,10 +485,10 @@ impl SttSession {
 
         if heavy_model {
             log::info!(
-                "Preloading heavy STT model '{}' before starting capture workers",
+                "Preloading Whisper model '{}' before starting capture workers",
                 model_path.display()
             );
-            warm_model_cache(runtime_library_path.clone(), model_path.clone())?;
+            warm_model_cache(model_path.clone())?;
         }
 
         match resolve_input_device_with_fallback(microphone_device_id.as_deref()) {
@@ -487,8 +503,8 @@ impl SttSession {
                     let (mic_audio_tx, mic_control_tx, mic_worker) = spawn_recognition_worker(
                         app.clone(),
                         running.clone(),
-                        runtime_library_path.clone(),
                         model_path.clone(),
+                        language.clone(),
                         MICROPHONE_TARGET_SAMPLE_RATE,
                         "mic",
                     )?;
@@ -559,8 +575,8 @@ impl SttSession {
                             spawn_recognition_worker(
                                 app.clone(),
                                 running.clone(),
-                                runtime_library_path.clone(),
                                 model_path.clone(),
+                                language.clone(),
                                 WINDOWS_SYSTEM_AUDIO_TARGET_SAMPLE_RATE,
                                 "system",
                             )?;
@@ -614,8 +630,8 @@ impl SttSession {
                 match spawn_recognition_worker(
                     app,
                     running.clone(),
-                    runtime_library_path.clone(),
                     model_path.clone(),
+                    language.clone(),
                     MACOS_SYSTEM_AUDIO_SAMPLE_RATE,
                     "system",
                 ) {
@@ -739,6 +755,35 @@ impl SttSession {
         Ok(())
     }
 
+    fn switch_language(&self, language: &str) -> Result<(), String> {
+        let mut waiters: Vec<Receiver<Result<(), String>>> = Vec::new();
+
+        for tx in &self.worker_controls {
+            let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
+            tx.send(WorkerControlMessage::SwitchLanguage {
+                language: language.to_string(),
+                reply_tx,
+            })
+            .map_err(|_| "Failed to send language switch request to STT worker".to_string())?;
+            waiters.push(reply_rx);
+        }
+
+        for rx in waiters {
+            match rx.recv_timeout(LANGUAGE_SWITCH_WORKER_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("Timed out waiting for STT worker language switch".to_string())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("STT worker language switch reply channel disconnected".to_string())
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn stop(&mut self) {
         log::info!(
             "Stopping STT session resources (streams={}, workers={})",
@@ -768,24 +813,12 @@ impl SttSession {
                 .to_string();
             let join_started_at = Instant::now();
             log::info!("Waiting for STT worker '{}' to stop", worker_name);
-            let joined_in_time = join_worker_with_grace_period(
-                worker,
-                worker_name.clone(),
-                WORKER_JOIN_GRACE_PERIOD,
+            let _ = worker.join();
+            log::info!(
+                "STT worker '{}' stopped after {:?}",
+                worker_name,
+                join_started_at.elapsed()
             );
-            if joined_in_time {
-                log::info!(
-                    "STT worker '{}' stopped after {:?}",
-                    worker_name,
-                    join_started_at.elapsed()
-                );
-            } else {
-                log::warn!(
-                    "STT worker '{}' did not stop within {:?}; detached join in background",
-                    worker_name,
-                    WORKER_JOIN_GRACE_PERIOD
-                );
-            }
         }
     }
 }
@@ -911,30 +944,19 @@ fn run_windows_system_loopback_capture(
     selected_output_device_id: Option<String>,
 ) {
     let mut backoff = Duration::from_millis(250);
-    let mut active_output_selector = selected_output_device_id;
 
     while running.load(Ordering::Relaxed) {
         let result = run_windows_system_loopback_stream_once(
             &running,
             &tx,
             target_sample_rate,
-            active_output_selector.as_deref(),
+            selected_output_device_id.as_deref(),
         );
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
         if let Err(err) = result {
-            let normalized = err.to_ascii_lowercase();
-            if active_output_selector.is_some()
-                && (normalized.contains("selected output device is not available")
-                    || normalized.contains("selected output device is no longer available"))
-            {
-                log::warn!(
-                    "Selected loopback output device became unavailable; falling back to current default output"
-                );
-                active_output_selector = None;
-            }
             log::warn!("Windows system loopback stream restart: {}", err);
             thread::sleep(backoff);
             let doubled = backoff + backoff;
@@ -1114,8 +1136,8 @@ fn build_windows_loopback_stream(
 fn spawn_recognition_worker(
     app: AppHandle,
     running: std::sync::Arc<AtomicBool>,
-    runtime_library_path: PathBuf,
     model_path: PathBuf,
+    language: String,
     sample_rate: u32,
     source: &'static str,
 ) -> Result<
@@ -1141,8 +1163,8 @@ fn spawn_recognition_worker(
                 running,
                 audio_rx,
                 control_rx,
-                &runtime_library_path,
                 &model_path,
+                &language,
                 sample_rate,
                 &source_name,
                 &mut startup_signal,
@@ -1311,18 +1333,17 @@ fn run_worker(
     running: std::sync::Arc<AtomicBool>,
     audio_rx: Receiver<Vec<i16>>,
     control_rx: Receiver<WorkerControlMessage>,
-    runtime_library_path: &Path,
     model_path: &Path,
+    language: &str,
     sample_rate: u32,
     source: &str,
     startup_signal: &mut Option<Sender<Result<(), String>>>,
 ) -> Result<(), String> {
     let load_started_at = Instant::now();
-    let mut active_slot =
-        load_recognition_slot(runtime_library_path, sample_rate, model_path.to_path_buf())?;
-    let mut standby_slot: Option<LoadedRecognitionSlot> = None;
+    let mut active_slot = load_recognition_slot(sample_rate, model_path.to_path_buf())?;
+    let mut active_language = normalize_whisper_language(language);
     log::info!(
-        "STT worker '{}' loaded model '{}' in {:?}",
+        "STT worker '{}' loaded Whisper model '{}' in {:?}",
         source,
         active_slot.model_path.display(),
         load_started_at.elapsed()
@@ -1339,22 +1360,27 @@ fn run_worker(
         let _ = tx.send(Ok(()));
     }
 
-    let mut last_partial = String::new();
-    let mut last_partial_emit_at = Instant::now()
-        .checked_sub(Duration::from_millis(PARTIAL_RESULT_MIN_INTERVAL_MS))
-        .unwrap_or_else(Instant::now);
     let mut saw_audio = false;
-    let mut last_audio_at: Option<Instant> = None;
-    let mut stall_reported = false;
+    let mut audio_stalled = false;
+    let mut last_audio_chunk_at = Instant::now();
+    let mut audio_window = Vec::<i16>::new();
+    let mut total_samples_seen = 0usize;
+    let mut samples_since_decode = 0usize;
+    let mut last_emitted_final_end_ms = 0_i64;
+    let mut last_emitted_text = String::new();
+    let mut last_progress_emit_audio_ms = 0_i64;
 
     while running.load(Ordering::Relaxed) {
         while let Ok(control) = control_rx.try_recv() {
             handle_worker_control(
-                runtime_library_path,
                 sample_rate,
                 &mut active_slot,
-                &mut standby_slot,
-                &mut last_partial,
+                &mut active_language,
+                &mut audio_window,
+                &mut samples_since_decode,
+                &mut last_emitted_final_end_ms,
+                &mut last_emitted_text,
+                &mut last_progress_emit_audio_ms,
                 control,
             );
         }
@@ -1362,21 +1388,18 @@ fn run_worker(
         let chunk = match audio_rx.recv_timeout(Duration::from_millis(40)) {
             Ok(chunk) => chunk,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
                 if saw_audio
-                    && !stall_reported
-                    && last_audio_at.is_some_and(|at| at.elapsed() >= AUDIO_STALL_TIMEOUT)
+                    && !audio_stalled
+                    && last_audio_chunk_at.elapsed() >= AUDIO_STALL_TIMEOUT
                 {
-                    stall_reported = true;
+                    audio_stalled = true;
                     emit_stt_diagnostic(
                         &app,
                         "audio_stalled",
                         "warn",
                         format!(
-                            "Audio stream '{}' is not delivering frames for {:?}.",
-                            source, AUDIO_STALL_TIMEOUT
+                            "Поток звука из источника '{}' прервался. Попробуйте перезапуск аудио.",
+                            source
                         ),
                         Some(source.to_string()),
                     );
@@ -1389,16 +1412,14 @@ fn run_worker(
         if chunk.is_empty() {
             continue;
         }
-
-        let now = Instant::now();
-        last_audio_at = Some(now);
-        if stall_reported {
-            stall_reported = false;
+        last_audio_chunk_at = Instant::now();
+        if audio_stalled {
+            audio_stalled = false;
             emit_stt_diagnostic(
                 &app,
                 "audio_resumed",
                 "info",
-                format!("Audio stream '{}' resumed.", source),
+                format!("Поток звука из источника '{}' восстановлен.", source),
                 Some(source.to_string()),
             );
         }
@@ -1414,42 +1435,38 @@ fn run_worker(
             );
         }
 
-        let accepted = active_slot
-            .api()
-            .accept_waveform(active_slot.recognizer, &chunk)?;
-        if accepted {
-            let (text, confidence) = active_slot
-                .api()
-                .result_text_and_confidence(active_slot.recognizer)?;
-            if !text.is_empty() {
-                emit_stt_result(&app, source, text, true, confidence);
-            }
-            last_partial.clear();
-        } else {
-            let partial = active_slot.api().partial_text(active_slot.recognizer)?;
-            if !partial.is_empty() && partial != last_partial {
-                let now = Instant::now();
-                let should_emit_partial = now.duration_since(last_partial_emit_at)
-                    >= Duration::from_millis(PARTIAL_RESULT_MIN_INTERVAL_MS);
-                if should_emit_partial {
-                    emit_stt_result(&app, source, partial.clone(), false, 0.0);
-                    last_partial_emit_at = now;
-                }
-                last_partial = partial;
-            }
+        total_samples_seen = total_samples_seen.saturating_add(chunk.len());
+        samples_since_decode = samples_since_decode.saturating_add(chunk.len());
+        audio_window.extend_from_slice(&chunk);
+
+        let max_window_samples = max_window_samples_for_model(&active_slot.model_path);
+        if audio_window.len() > max_window_samples {
+            let overflow = audio_window.len() - max_window_samples;
+            audio_window.drain(..overflow);
         }
-    }
 
-    let (final_text, confidence) = active_slot
-        .api()
-        .final_text_and_confidence(active_slot.recognizer)?;
-    if !final_text.is_empty() {
-        emit_stt_result(&app, source, final_text, true, confidence);
-    }
+        if audio_window.len() < min_decode_samples_for_model(&active_slot.model_path) {
+            continue;
+        }
 
-    free_recognition_slot(&mut active_slot);
-    if let Some(mut standby) = standby_slot.take() {
-        free_recognition_slot(&mut standby);
+        if samples_since_decode < decode_step_samples_for_model(&active_slot.model_path) {
+            continue;
+        }
+
+        samples_since_decode = 0;
+        decode_audio_window(
+            &app,
+            &running,
+            source,
+            &mut active_slot,
+            &active_language,
+            &audio_window,
+            total_samples_seen,
+            &mut last_emitted_final_end_ms,
+            &mut last_emitted_text,
+            &mut last_progress_emit_audio_ms,
+            false,
+        )?;
     }
 
     log::info!("STT worker '{}' finished cleanly", source);
@@ -1466,47 +1483,66 @@ enum WorkerControlMessage {
         model_path: PathBuf,
         reply_tx: Sender<Result<(), String>>,
     },
+    SwitchLanguage {
+        language: String,
+        reply_tx: Sender<Result<(), String>>,
+    },
 }
 
 struct LoadedRecognitionSlot {
     model_path: PathBuf,
-    cached_model: Arc<CachedVoskModel>,
-    recognizer: RecognizerPtr,
+    cached_model: Arc<CachedWhisperModel>,
+    state: WhisperState,
 }
 
 impl LoadedRecognitionSlot {
-    fn api(&self) -> &VoskApi {
-        self.cached_model.api.as_ref()
+    fn tier(&self) -> WhisperModelTier {
+        self.cached_model.tier
     }
 }
 
 fn load_recognition_slot(
-    runtime_library_path: &Path,
-    sample_rate: u32,
+    _sample_rate: u32,
     model_path: PathBuf,
 ) -> Result<LoadedRecognitionSlot, String> {
-    let cached_model = get_or_load_cached_model(runtime_library_path, &model_path)?;
-    let recognizer = cached_model
-        .api
-        .create_recognizer(cached_model.model, sample_rate as c_float)?;
+    let cached_model = get_or_load_cached_model(&model_path)?;
+    let state = cached_model
+        .context
+        .create_state()
+        .map_err(|error| format!("Failed to create Whisper state: {}", error))?;
     Ok(LoadedRecognitionSlot {
         model_path,
         cached_model,
-        recognizer,
+        state,
     })
 }
 
-fn free_recognition_slot(slot: &mut LoadedRecognitionSlot) {
-    slot.api().free_recognizer(slot.recognizer);
-    slot.recognizer = std::ptr::null_mut();
+fn normalize_whisper_language(language: &str) -> String {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "en" | "en-us" => "en".to_string(),
+        "ru" | "ru-ru" => "ru".to_string(),
+        "es" | "es-es" => "es".to_string(),
+        "de" | "de-de" => "de".to_string(),
+        "fr" | "fr-fr" => "fr".to_string(),
+        "it" | "it-it" => "it".to_string(),
+        "pt" | "pt-br" => "pt".to_string(),
+        "zh" | "zh-cn" => "zh".to_string(),
+        "ja" | "ja-jp" => "ja".to_string(),
+        "ko" | "ko-kr" => "ko".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "en".to_string(),
+    }
 }
 
 fn handle_worker_control(
-    runtime_library_path: &Path,
     sample_rate: u32,
     active_slot: &mut LoadedRecognitionSlot,
-    standby_slot: &mut Option<LoadedRecognitionSlot>,
-    last_partial: &mut String,
+    active_language: &mut String,
+    audio_window: &mut Vec<i16>,
+    samples_since_decode: &mut usize,
+    last_emitted_final_end_ms: &mut i64,
+    last_emitted_text: &mut String,
+    last_progress_emit_audio_ms: &mut i64,
     control: WorkerControlMessage,
 ) {
     match control {
@@ -1519,29 +1555,14 @@ fn handle_worker_control(
                 return;
             }
 
-            if standby_slot
-                .as_ref()
-                .is_some_and(|slot| slot.model_path == model_path)
-            {
-                if let Some(next_active) = standby_slot.take() {
-                    let previous_active = std::mem::replace(active_slot, next_active);
-                    if let Some(mut old_standby) = standby_slot.replace(previous_active) {
-                        free_recognition_slot(&mut old_standby);
-                    }
-                    last_partial.clear();
-                    let _ = reply_tx.send(Ok(()));
-                    return;
-                }
-            }
-
             let result = (|| -> Result<(), String> {
-                let next_active =
-                    load_recognition_slot(runtime_library_path, sample_rate, model_path)?;
-                let previous_active = std::mem::replace(active_slot, next_active);
-                if let Some(mut old_standby) = standby_slot.replace(previous_active) {
-                    free_recognition_slot(&mut old_standby);
-                }
-                last_partial.clear();
+                let next_active = load_recognition_slot(sample_rate, model_path)?;
+                *active_slot = next_active;
+                audio_window.clear();
+                *samples_since_decode = 0;
+                *last_emitted_final_end_ms = 0;
+                last_emitted_text.clear();
+                *last_progress_emit_audio_ms = 0;
                 Ok(())
             })();
 
@@ -1551,26 +1572,371 @@ fn handle_worker_control(
             model_path,
             reply_tx,
         } => {
-            if model_path == active_slot.model_path
-                || standby_slot
-                    .as_ref()
-                    .is_some_and(|slot| slot.model_path == model_path)
-            {
-                let _ = reply_tx.send(Ok(()));
-                return;
-            }
-
-            let result = (|| -> Result<(), String> {
-                let next_standby =
-                    load_recognition_slot(runtime_library_path, sample_rate, model_path)?;
-                if let Some(mut existing_standby) = standby_slot.replace(next_standby) {
-                    free_recognition_slot(&mut existing_standby);
-                }
-                Ok(())
-            })();
-
+            let result = warm_model_cache(model_path);
             let _ = reply_tx.send(result);
         }
+        WorkerControlMessage::SwitchLanguage { language, reply_tx } => {
+            *active_language = normalize_whisper_language(&language);
+            audio_window.clear();
+            *samples_since_decode = 0;
+            *last_emitted_final_end_ms = 0;
+            last_emitted_text.clear();
+            *last_progress_emit_audio_ms = 0;
+            let _ = reply_tx.send(Ok(()));
+        }
+    }
+}
+
+fn max_window_samples_for_model(model_path: &Path) -> usize {
+    match detect_whisper_model_tier(model_path) {
+        // Keep short windows for live dual-source decoding.
+        WhisperModelTier::Small => (3 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+        WhisperModelTier::Medium => (5 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+        WhisperModelTier::Large => (6 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+    }
+}
+
+fn min_decode_samples_for_model(model_path: &Path) -> usize {
+    match detect_whisper_model_tier(model_path) {
+        // Keep the first decode quick enough for live UX (mic + loopback).
+        WhisperModelTier::Small => (400 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+        WhisperModelTier::Medium => (1200 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+        WhisperModelTier::Large => (2500 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+    }
+}
+
+fn decode_step_samples_for_model(model_path: &Path) -> usize {
+    match detect_whisper_model_tier(model_path) {
+        // Use short decode steps so text lands on screen while user is speaking.
+        WhisperModelTier::Small => (350 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+        WhisperModelTier::Medium => (800 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+        WhisperModelTier::Large => (1500 * MICROPHONE_TARGET_SAMPLE_RATE as usize) / 1000,
+    }
+}
+
+fn flush_tail_samples_for_model(model_path: &Path) -> usize {
+    match detect_whisper_model_tier(model_path) {
+        WhisperModelTier::Small => (3 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+        WhisperModelTier::Medium => (3 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+        WhisperModelTier::Large => (2 * MICROPHONE_TARGET_SAMPLE_RATE) as usize,
+    }
+}
+
+fn whisper_no_speech_threshold_for_model(model_path: &Path) -> f32 {
+    match detect_whisper_model_tier(model_path) {
+        WhisperModelTier::Small => 0.5,
+        WhisperModelTier::Medium => 0.55,
+        WhisperModelTier::Large => 0.6,
+    }
+}
+
+fn whisper_decode_lock() -> &'static Mutex<()> {
+    static DECODE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    DECODE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn whisper_threads_for_model(model_path: &Path) -> i32 {
+    let available = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4);
+    // Two STT workers (mic + system) run in parallel, so keep per-worker thread
+    // budget conservative to avoid oversubscription and queue drops.
+    let per_worker_budget = (available / 2).max(2);
+    let target = match detect_whisper_model_tier(model_path) {
+        // Small is used for realtime dual-stream: fewer threads reduce contention spikes.
+        WhisperModelTier::Small => per_worker_budget.min(3).max(2),
+        WhisperModelTier::Medium => per_worker_budget.min(4).max(2),
+        WhisperModelTier::Large => per_worker_budget.min(6).max(3),
+    };
+    target as i32
+}
+
+fn whisper_best_of_for_model(model_path: &Path) -> i32 {
+    match detect_whisper_model_tier(model_path) {
+        WhisperModelTier::Small => 1,
+        WhisperModelTier::Medium => 3,
+        WhisperModelTier::Large => 2,
+    }
+}
+
+fn looks_like_subtitle_credit_hallucination(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("редактор субтитр")
+        || (lower.contains("субтитр") && lower.contains("корректор"))
+        || (lower.contains("subtitles") && lower.contains("editor"))
+}
+
+fn decode_audio_window(
+    app: &AppHandle,
+    running: &AtomicBool,
+    source: &str,
+    active_slot: &mut LoadedRecognitionSlot,
+    active_language: &str,
+    audio_window: &[i16],
+    total_samples_seen: usize,
+    last_emitted_final_end_ms: &mut i64,
+    last_emitted_text: &mut String,
+    last_progress_emit_audio_ms: &mut i64,
+    flush_tail: bool,
+) -> Result<(), String> {
+    if !running.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if audio_window.is_empty() {
+        return Ok(());
+    }
+
+    let mut audio_f32 = vec![0.0_f32; audio_window.len()];
+    convert_integer_to_float_audio(audio_window, &mut audio_f32)
+        .map_err(|error| format!("Failed to convert audio for Whisper: {}", error))?;
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy {
+        best_of: whisper_best_of_for_model(&active_slot.model_path),
+    });
+    params.set_language(Some(active_language));
+    params.set_translate(false);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    // In live mode we prefer stable text over fragile timestamp edges.
+    params.set_no_timestamps(true);
+    params.set_single_segment(true);
+    // Avoid prompt/context growth that can cause repeated phantom text.
+    params.set_no_context(true);
+    // Suppress non-speech tokens to reduce subtitle-credit hallucinations on noise.
+    params.set_suppress_nst(true);
+    params.set_logprob_thold(-2.0);
+    params.set_no_speech_thold(whisper_no_speech_threshold_for_model(
+        &active_slot.model_path,
+    ));
+    params.set_n_threads(whisper_threads_for_model(&active_slot.model_path));
+
+    let peak = audio_f32
+        .iter()
+        .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+    // Skip decoding near-silence chunks in streaming mode; otherwise we waste
+    // CPU and can starve real speech updates.
+    if !flush_tail && peak < 0.001 {
+        return Ok(());
+    }
+    // Boost low-level signals before decoding so Whisper does not classify
+    // quiet speech as "no speech" too aggressively.
+    if peak > 0.0001 && peak < 0.12 {
+        let gain = (0.22 / peak).min(6.0);
+        for sample in &mut audio_f32 {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
+        }
+    }
+
+    let decode_started_at = Instant::now();
+    let model_tier = detect_whisper_model_tier(&active_slot.model_path);
+    // Small model is the realtime path; allow parallel decode for mic/system.
+    // Medium/Large still decode under a global lock to avoid CPU thrashing.
+    let decode_guard = if model_tier == WhisperModelTier::Small {
+        None
+    } else {
+        let guard = loop {
+            if !running.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match whisper_decode_lock().try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(Duration::from_millis(8));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err("Whisper decode lock is poisoned".to_string());
+                }
+            }
+        };
+        Some(guard)
+    };
+    active_slot
+        .state
+        .full(params, &audio_f32)
+        .map_err(|error| format!("Whisper transcription failed: {}", error))?;
+    drop(decode_guard);
+    if !running.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let decode_elapsed = decode_started_at.elapsed();
+
+    let window_duration_ms =
+        ((audio_window.len() as f64 / MICROPHONE_TARGET_SAMPLE_RATE as f64) * 1000.0) as i64;
+    if decode_elapsed > Duration::from_millis(2500) {
+        log::warn!(
+            "Slow STT decode (source='{}', tier='{:?}', window_ms={}, decode_ms={})",
+            source,
+            detect_whisper_model_tier(&active_slot.model_path),
+            window_duration_ms,
+            decode_elapsed.as_millis()
+        );
+    }
+    let total_audio_ms =
+        ((total_samples_seen as f64 / MICROPHONE_TARGET_SAMPLE_RATE as f64) * 1000.0) as i64;
+    let window_start_ms = total_audio_ms.saturating_sub(window_duration_ms);
+    let stable_cutoff_ms = if flush_tail {
+        total_audio_ms
+    } else {
+        total_audio_ms.saturating_sub(350)
+    };
+    let mut pending_partial: Option<(String, f32)> = None;
+    let mut latest_segment: Option<(String, i64, i64)> = None;
+    let mut segment_count = 0_usize;
+    let mut emitted_any = false;
+
+    for segment in active_slot.state.as_iter() {
+        segment_count = segment_count.saturating_add(1);
+        let text = segment.to_string();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let segment_start_ts = i64::from(segment.start_timestamp());
+        let segment_end_ts = i64::from(segment.end_timestamp());
+        let mut start_ms = window_start_ms + segment_start_ts * 10;
+        let mut end_ms = window_start_ms + segment_end_ts * 10;
+
+        // Some streaming outputs can provide a single segment with zero timestamps.
+        // In that case derive a monotonic pseudo-range from the current audio window
+        // so dedupe/progress logic can keep emitting live updates.
+        if segment_start_ts == 0 && segment_end_ts == 0 {
+            start_ms = total_audio_ms.saturating_sub(window_duration_ms.max(250));
+            end_ms = total_audio_ms;
+        } else if end_ms <= start_ms {
+            end_ms = (start_ms + 200).min(total_audio_ms);
+        }
+        latest_segment = Some((trimmed.to_string(), start_ms, end_ms));
+        if end_ms <= *last_emitted_final_end_ms && trimmed == last_emitted_text.as_str() {
+            // Keep a low-frequency partial heartbeat even for repeated text so UI
+            // still shows that online recognition is alive.
+            pending_partial = Some((trimmed.to_string(), 0.45));
+            continue;
+        }
+        if end_ms > stable_cutoff_ms {
+            let partial_confidence =
+                (estimate_segment_confidence(trimmed, start_ms, end_ms) - 0.12).max(0.35);
+            pending_partial = Some((trimmed.to_string(), partial_confidence));
+            continue;
+        }
+
+        let confidence = estimate_segment_confidence(trimmed, start_ms, end_ms);
+        emit_stt_result(app, source, trimmed.to_string(), true, confidence);
+        *last_emitted_final_end_ms = end_ms.max(*last_emitted_final_end_ms);
+        *last_emitted_text = trimmed.to_string();
+        *last_progress_emit_audio_ms = total_audio_ms;
+        emitted_any = true;
+    }
+
+    if let Some((partial_text, partial_confidence)) = pending_partial {
+        let should_refresh_partial =
+            total_audio_ms.saturating_sub(*last_progress_emit_audio_ms) >= 700;
+        if partial_text != *last_emitted_text || should_refresh_partial {
+            emit_stt_result(app, source, partial_text.clone(), false, partial_confidence);
+            *last_emitted_text = partial_text;
+            *last_progress_emit_audio_ms = total_audio_ms;
+            emitted_any = true;
+        }
+    }
+
+    if !emitted_any {
+        let fallback_candidate: Option<(String, f32, Option<i64>)> = if flush_tail {
+            latest_segment.as_ref().map(|(text, start_ms, end_ms)| {
+                (
+                    text.clone(),
+                    estimate_segment_confidence(text, *start_ms, *end_ms).max(0.5),
+                    Some(*end_ms),
+                )
+            })
+        } else {
+            latest_segment.as_ref().map(|(text, start_ms, end_ms)| {
+                (
+                    text.clone(),
+                    estimate_segment_confidence(text, *start_ms, *end_ms).max(0.5),
+                    Some(*end_ms),
+                )
+            })
+        };
+
+        if let Some((fallback_text, fallback_confidence, fallback_end_ms)) = fallback_candidate {
+            let should_emit = fallback_text.as_str() != last_emitted_text.as_str()
+                || flush_tail
+                || total_audio_ms.saturating_sub(*last_progress_emit_audio_ms) >= 1000;
+            if should_emit {
+                let emit_as_final = flush_tail && fallback_end_ms.is_some();
+                emit_stt_result(
+                    app,
+                    source,
+                    fallback_text.clone(),
+                    emit_as_final,
+                    fallback_confidence,
+                );
+                if emit_as_final {
+                    if let Some(end_ms) = fallback_end_ms {
+                        *last_emitted_final_end_ms = end_ms.max(*last_emitted_final_end_ms);
+                    }
+                }
+                *last_emitted_text = fallback_text;
+                *last_progress_emit_audio_ms = total_audio_ms;
+                emitted_any = true;
+            }
+        }
+    }
+
+    if !emitted_any {
+        if let Some((fallback_text, start_ms, end_ms)) = latest_segment.as_ref() {
+            let fallback_confidence =
+                estimate_segment_confidence(fallback_text, *start_ms, *end_ms).max(0.4);
+            emit_stt_result(
+                app,
+                source,
+                fallback_text.clone(),
+                false,
+                fallback_confidence,
+            );
+            *last_emitted_text = fallback_text.clone();
+            *last_progress_emit_audio_ms = total_audio_ms;
+            emitted_any = true;
+        }
+    }
+
+    if !emitted_any {
+        let latest_preview = latest_segment
+            .as_ref()
+            .map(|(text, _, _)| text.chars().take(80).collect::<String>())
+            .unwrap_or_else(|| "<none>".to_string());
+        log::info!(
+            "STT decode produced no transcript (source='{}', segments={}, peak={:.4}, latest='{}', flush_tail={})",
+            source,
+            segment_count,
+            peak,
+            latest_preview,
+            flush_tail
+        );
+    }
+
+    Ok(())
+}
+
+fn estimate_segment_confidence(text: &str, start_ms: i64, end_ms: i64) -> f32 {
+    let duration_ms = (end_ms - start_ms).max(0) as f32;
+    let char_count = text.chars().count() as f32;
+    if duration_ms <= 0.0 || char_count <= 0.0 {
+        return 0.0;
+    }
+
+    let chars_per_second = char_count / (duration_ms / 1000.0).max(0.25);
+    if chars_per_second <= 0.0 {
+        return 0.0;
+    }
+    if chars_per_second <= 18.0 {
+        0.82
+    } else if chars_per_second <= 24.0 {
+        0.74
+    } else {
+        0.62
     }
 }
 
@@ -1579,6 +1945,14 @@ fn emit_stt_result(app: &AppHandle, source: &str, text: String, is_final: bool, 
     if normalized_text.is_empty() {
         return;
     }
+    let chars = normalized_text.chars().count();
+    log::info!(
+        "Emitting stt_result (source='{}', final={}, conf={:.2}, chars={})",
+        source,
+        is_final,
+        confidence,
+        chars
+    );
 
     let payload = SttResult {
         text: normalized_text,
@@ -1609,6 +1983,9 @@ fn normalize_transcript_text(text: &str, is_final: bool) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
+        return String::new();
+    }
+    if looks_like_subtitle_credit_hallucination(trimmed) {
         return String::new();
     }
 
@@ -1846,180 +2223,21 @@ Task {
 dispatchMain()
 "#;
 
-type ModelPtr = *mut c_void;
-type RecognizerPtr = *mut c_void;
-
-type FnModelNew = unsafe extern "C" fn(*const c_char) -> ModelPtr;
-type FnModelFree = unsafe extern "C" fn(ModelPtr);
-type FnRecognizerNew = unsafe extern "C" fn(ModelPtr, c_float) -> RecognizerPtr;
-type FnRecognizerFree = unsafe extern "C" fn(RecognizerPtr);
-type FnAcceptWaveformS = unsafe extern "C" fn(RecognizerPtr, *const c_short, c_int) -> c_int;
-type FnResult = unsafe extern "C" fn(RecognizerPtr) -> *const c_char;
-type FnPartialResult = unsafe extern "C" fn(RecognizerPtr) -> *const c_char;
-type FnFinalResult = unsafe extern "C" fn(RecognizerPtr) -> *const c_char;
-
-struct VoskApi {
-    _lib: Library,
-    model_new: FnModelNew,
-    model_free: FnModelFree,
-    recognizer_new: FnRecognizerNew,
-    recognizer_free: FnRecognizerFree,
-    accept_waveform_s: FnAcceptWaveformS,
-    result: FnResult,
-    partial_result: FnPartialResult,
-    final_result: FnFinalResult,
-}
-
-// Safety: Vosk function pointers are immutable after load, and the library handle
-// remains alive for the lifetime of the shared API object.
-unsafe impl Send for VoskApi {}
-unsafe impl Sync for VoskApi {}
-
-impl VoskApi {
-    fn load(runtime_library_path: &Path) -> Result<Self, String> {
-        // Safety: function pointers are loaded once from trusted runtime library.
-        unsafe {
-            crate::vosk_runtime::ensure_runtime_dir_on_path(runtime_library_path);
-            let lib = Library::new(runtime_library_path).map_err(|e| {
-                format!(
-                    "Failed to load Vosk runtime '{}': {}",
-                    runtime_library_path.display(),
-                    e
-                )
-            })?;
-
-            let model_new = *lib
-                .get::<FnModelNew>(b"vosk_model_new\0")
-                .map_err(|e| format!("Missing symbol vosk_model_new: {}", e))?;
-            let model_free = *lib
-                .get::<FnModelFree>(b"vosk_model_free\0")
-                .map_err(|e| format!("Missing symbol vosk_model_free: {}", e))?;
-            let recognizer_new = *lib
-                .get::<FnRecognizerNew>(b"vosk_recognizer_new\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_new: {}", e))?;
-            let recognizer_free = *lib
-                .get::<FnRecognizerFree>(b"vosk_recognizer_free\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_free: {}", e))?;
-            let accept_waveform_s = *lib
-                .get::<FnAcceptWaveformS>(b"vosk_recognizer_accept_waveform_s\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_accept_waveform_s: {}", e))?;
-            let result = *lib
-                .get::<FnResult>(b"vosk_recognizer_result\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_result: {}", e))?;
-            let partial_result = *lib
-                .get::<FnPartialResult>(b"vosk_recognizer_partial_result\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_partial_result: {}", e))?;
-            let final_result = *lib
-                .get::<FnFinalResult>(b"vosk_recognizer_final_result\0")
-                .map_err(|e| format!("Missing symbol vosk_recognizer_final_result: {}", e))?;
-
-            Ok(Self {
-                _lib: lib,
-                model_new,
-                model_free,
-                recognizer_new,
-                recognizer_free,
-                accept_waveform_s,
-                result,
-                partial_result,
-                final_result,
-            })
-        }
-    }
-
-    fn create_model(&self, model_path: &Path) -> Result<ModelPtr, String> {
-        let path = model_path
-            .to_str()
-            .ok_or_else(|| "Model path contains invalid UTF-8".to_string())?;
-        let c_path = CString::new(path).map_err(|e| format!("Invalid model path: {}", e))?;
-        let model = unsafe { (self.model_new)(c_path.as_ptr()) };
-        if model.is_null() {
-            return Err(format!(
-                "Vosk failed to load model from '{}'",
-                model_path.display()
-            ));
-        }
-        Ok(model)
-    }
-
-    fn free_model(&self, model: ModelPtr) {
-        if !model.is_null() {
-            unsafe { (self.model_free)(model) };
-        }
-    }
-
-    fn create_recognizer(
-        &self,
-        model: ModelPtr,
-        sample_rate: c_float,
-    ) -> Result<RecognizerPtr, String> {
-        let recognizer = unsafe { (self.recognizer_new)(model, sample_rate) };
-        if recognizer.is_null() {
-            return Err("Vosk failed to create recognizer".to_string());
-        }
-        Ok(recognizer)
-    }
-
-    fn free_recognizer(&self, recognizer: RecognizerPtr) {
-        if !recognizer.is_null() {
-            unsafe { (self.recognizer_free)(recognizer) };
-        }
-    }
-
-    fn accept_waveform(&self, recognizer: RecognizerPtr, chunk: &[i16]) -> Result<bool, String> {
-        let rc =
-            unsafe { (self.accept_waveform_s)(recognizer, chunk.as_ptr(), chunk.len() as c_int) };
-        if rc < 0 {
-            return Err("Vosk recognizer returned an error on accept_waveform".to_string());
-        }
-        Ok(rc == 1)
-    }
-
-    fn partial_text(&self, recognizer: RecognizerPtr) -> Result<String, String> {
-        let json = unsafe { cstr_to_string((self.partial_result)(recognizer))? };
-        extract_partial_text(&json)
-    }
-
-    fn result_text_and_confidence(
-        &self,
-        recognizer: RecognizerPtr,
-    ) -> Result<(String, f32), String> {
-        let json = unsafe { cstr_to_string((self.result)(recognizer))? };
-        extract_final_text_and_confidence(&json)
-    }
-
-    fn final_text_and_confidence(
-        &self,
-        recognizer: RecognizerPtr,
-    ) -> Result<(String, f32), String> {
-        let json = unsafe { cstr_to_string((self.final_result)(recognizer))? };
-        extract_final_text_and_confidence(&json)
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CachedModelKey {
-    runtime_library_path: PathBuf,
     model_path: PathBuf,
 }
 
-struct CachedVoskModel {
-    api: Arc<VoskApi>,
-    model: ModelPtr,
+struct CachedWhisperModel {
+    context: WhisperContext,
     model_path: PathBuf,
+    tier: WhisperModelTier,
 }
 
-// Safety: Vosk models are reused as read-only state across recognizers. The raw
-// pointer is owned by this struct and freed only once in Drop.
-unsafe impl Send for CachedVoskModel {}
-unsafe impl Sync for CachedVoskModel {}
-
-impl Drop for CachedVoskModel {
-    fn drop(&mut self) {
-        self.api.free_model(self.model);
-        self.model = std::ptr::null_mut();
-    }
-}
+// Safety: whisper.cpp model contexts are immutable after load and are only used
+// to create per-worker states. The owned context is dropped exactly once.
+unsafe impl Send for CachedWhisperModel {}
+unsafe impl Sync for CachedWhisperModel {}
 
 fn normalize_cache_path(path: &Path) -> PathBuf {
     let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -2048,13 +2266,9 @@ fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn runtime_api_cache() -> &'static Mutex<HashMap<PathBuf, Arc<VoskApi>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<VoskApi>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn model_cache() -> &'static Mutex<HashMap<CachedModelKey, Arc<CachedVoskModel>>> {
-    static CACHE: OnceLock<Mutex<HashMap<CachedModelKey, Arc<CachedVoskModel>>>> = OnceLock::new();
+fn model_cache() -> &'static Mutex<HashMap<CachedModelKey, Arc<CachedWhisperModel>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CachedModelKey, Arc<CachedWhisperModel>>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2063,42 +2277,20 @@ fn model_load_lock_cache() -> &'static Mutex<HashMap<CachedModelKey, Arc<Mutex<(
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_or_load_vosk_api(runtime_library_path: &Path) -> Result<Arc<VoskApi>, String> {
-    let runtime_library_path = normalize_cache_path(runtime_library_path);
-    {
-        let guard = runtime_api_cache()
-            .lock()
-            .map_err(|_| "Failed to lock Vosk runtime cache".to_string())?;
-        if let Some(api) = guard.get(&runtime_library_path) {
-            return Ok(api.clone());
-        }
-    }
-
-    let api = Arc::new(VoskApi::load(&runtime_library_path)?);
-    let mut guard = runtime_api_cache()
-        .lock()
-        .map_err(|_| "Failed to lock Vosk runtime cache".to_string())?;
-    let entry = guard
-        .entry(runtime_library_path)
-        .or_insert_with(|| api.clone());
-    Ok(entry.clone())
-}
-
-fn get_or_load_cached_model(
-    runtime_library_path: &Path,
-    model_path: &Path,
-) -> Result<Arc<CachedVoskModel>, String> {
+fn get_or_load_cached_model(model_path: &Path) -> Result<Arc<CachedWhisperModel>, String> {
     let cache_key = CachedModelKey {
-        runtime_library_path: normalize_cache_path(runtime_library_path),
         model_path: normalize_cache_path(model_path),
     };
 
     {
         let guard = model_cache()
             .lock()
-            .map_err(|_| "Failed to lock STT model cache".to_string())?;
+            .map_err(|_| "Failed to lock Whisper model cache".to_string())?;
         if let Some(model) = guard.get(&cache_key) {
-            log::debug!("Reusing cached STT model '{}'", model.model_path.display());
+            log::debug!(
+                "Reusing cached Whisper model '{}'",
+                model.model_path.display()
+            );
             return Ok(model.clone());
         }
     }
@@ -2106,7 +2298,7 @@ fn get_or_load_cached_model(
     let load_lock = {
         let mut guard = model_load_lock_cache()
             .lock()
-            .map_err(|_| "Failed to lock STT model load state".to_string())?;
+            .map_err(|_| "Failed to lock Whisper model load state".to_string())?;
         guard
             .entry(cache_key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -2114,99 +2306,53 @@ fn get_or_load_cached_model(
     };
     let _load_guard = load_lock
         .lock()
-        .map_err(|_| "Failed to lock STT model load gate".to_string())?;
+        .map_err(|_| "Failed to lock Whisper model load gate".to_string())?;
 
     {
         let guard = model_cache()
             .lock()
-            .map_err(|_| "Failed to lock STT model cache".to_string())?;
+            .map_err(|_| "Failed to lock Whisper model cache".to_string())?;
         if let Some(model) = guard.get(&cache_key) {
-            log::debug!(
-                "Reusing cached STT model '{}' after waiting for active loader",
-                model.model_path.display()
-            );
             return Ok(model.clone());
         }
     }
 
     let load_started_at = Instant::now();
-    let api = get_or_load_vosk_api(&cache_key.runtime_library_path)?;
-    let model = api.create_model(&cache_key.model_path)?;
-    let loaded_model = Arc::new(CachedVoskModel {
-        api,
-        model,
+    let context = WhisperContext::new_with_params(
+        cache_key
+            .model_path
+            .to_str()
+            .ok_or_else(|| "Model path contains invalid UTF-8".to_string())?,
+        WhisperContextParameters::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "Whisper failed to load model from '{}': {}",
+            cache_key.model_path.display(),
+            error
+        )
+    })?;
+
+    let loaded_model = Arc::new(CachedWhisperModel {
+        context,
         model_path: cache_key.model_path.clone(),
+        tier: detect_whisper_model_tier(&cache_key.model_path),
     });
 
     let mut guard = model_cache()
         .lock()
-        .map_err(|_| "Failed to lock STT model cache".to_string())?;
+        .map_err(|_| "Failed to lock Whisper model cache".to_string())?;
     if let Some(existing) = guard.get(&cache_key) {
         return Ok(existing.clone());
     }
 
     log::info!(
-        "Loaded STT model '{}' into process cache in {:?}",
+        "Loaded Whisper model '{}' into process cache in {:?}",
         cache_key.model_path.display(),
         load_started_at.elapsed()
     );
     guard.insert(cache_key, loaded_model.clone());
     Ok(loaded_model)
-}
-
-unsafe fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
-    if ptr.is_null() {
-        return Ok(String::new());
-    }
-    CStr::from_ptr(ptr)
-        .to_str()
-        .map(|s| s.to_string())
-        .map_err(|e| format!("Invalid UTF-8 from Vosk: {}", e))
-}
-
-fn extract_partial_text(json: &str) -> Result<String, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("Invalid partial JSON from Vosk: {}", e))?;
-    Ok(value
-        .get("partial")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_string())
-}
-
-fn extract_final_text_and_confidence(json: &str) -> Result<(String, f32), String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("Invalid final JSON from Vosk: {}", e))?;
-
-    let text = value
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-
-    let confidence = value
-        .get("result")
-        .and_then(|v| v.as_array())
-        .map(|words| {
-            let mut total = 0.0_f32;
-            let mut count = 0_u32;
-            for word in words {
-                if let Some(conf) = word.get("conf").and_then(|v| v.as_f64()) {
-                    total += conf as f32;
-                    count += 1;
-                }
-            }
-            if count > 0 {
-                total / count as f32
-            } else {
-                0.0
-            }
-        })
-        .unwrap_or(0.0);
-
-    Ok((text, confidence))
 }
 
 #[cfg(test)]

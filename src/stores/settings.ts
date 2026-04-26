@@ -12,11 +12,11 @@ import type {
   SttModelVariant,
   Provider,
 } from "@/lib/types";
-import { isKnownBaseUrlPreset, providerFromBaseUrlPreset } from "@/lib/llm";
 import {
   normalizePrimaryLanguage,
 } from "@/lib/languages";
 import { normalizeHotkeyKeys } from "@/lib/hotkeys";
+import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
 import {
   DEFAULT_HISTORY_RETENTION_DAYS,
   normalizeHistoryRetentionDays,
@@ -24,7 +24,6 @@ import {
 import { appPersistStorage } from "@/lib/persistStorage";
 
 const SETTINGS_STORAGE_KEY = "ai-interview-settings";
-const DEFAULT_PROXY_BASE_URL = "http://85.198.82.221:8080";
 let apiKeyPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function areHotkeyBindingsEqual(a: string[] | undefined, b: string[]): boolean {
@@ -206,10 +205,10 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       provider: "custom",
       baseUrlPreset: "custom",
-      customBaseUrl: DEFAULT_PROXY_BASE_URL,
+      customBaseUrl: HARDCODED_PROXY_BASE_URL,
       primaryLanguage: defaultPrimaryLanguage,
       secondaryLanguage: "none",
-      primarySttVariant: "large",
+      primarySttVariant: "small",
       secondarySttVariant: "small",
       microphoneDeviceId: "",
       systemAudioDeviceId: "",
@@ -225,25 +224,27 @@ export const useSettingsStore = create<SettingsState>()(
       historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
       hotkeys: cloneDefaultHotkeys(),
 
-      setProvider: (provider) =>
+      setProvider: () =>
         set({
-          provider,
-          baseUrlPreset: provider,
+          provider: "custom",
+          baseUrlPreset: "custom",
+          customBaseUrl: HARDCODED_PROXY_BASE_URL,
           selectedModel: null,
         }),
-      setBaseUrlPreset: (baseUrlPreset) =>
+      setBaseUrlPreset: () =>
         set({
-          baseUrlPreset,
-          provider: providerFromBaseUrlPreset(baseUrlPreset),
+          baseUrlPreset: "custom",
+          provider: "custom",
+          customBaseUrl: HARDCODED_PROXY_BASE_URL,
           selectedModel: null,
         }),
-      setCustomBaseUrl: (customBaseUrl) =>
+      setCustomBaseUrl: () =>
         set((state) => ({
-          customBaseUrl,
+          customBaseUrl: HARDCODED_PROXY_BASE_URL,
           selectedModel: state.baseUrlPreset === "custom" ? null : state.selectedModel,
         })),
-      setPrimaryLanguage: (primaryLanguage) => set({ primaryLanguage }),
-      setSecondaryLanguage: (secondaryLanguage) => set({ secondaryLanguage }),
+      setPrimaryLanguage: () => set({ primaryLanguage: defaultPrimaryLanguage }),
+      setSecondaryLanguage: () => set({ secondaryLanguage: "none" }),
       setPrimarySttVariant: (primarySttVariant) => set({ primarySttVariant }),
       setSecondarySttVariant: (secondarySttVariant) => set({ secondarySttVariant }),
       setMicrophoneDeviceId: (microphoneDeviceId) => set({ microphoneDeviceId }),
@@ -320,44 +321,11 @@ export const useSettingsStore = create<SettingsState>()(
           return;
         }
 
-        const normalizedPrimaryLanguage = normalizePrimaryLanguage(
-          state.primaryLanguage,
-        );
-        const rawPreset = (state as unknown as { baseUrlPreset?: unknown })
-          .baseUrlPreset;
-        const rawProvider = (state as unknown as { provider?: unknown })
-          .provider;
-        const inferredPreset = isKnownBaseUrlPreset(rawPreset)
-          ? rawPreset
-          : isKnownBaseUrlPreset(rawProvider)
-            ? rawProvider
-            : "custom";
-        state.baseUrlPreset = inferredPreset;
-        state.provider = providerFromBaseUrlPreset(inferredPreset);
-        const rawCustomBaseUrl = (state as unknown as { customBaseUrl?: unknown })
-          .customBaseUrl;
-        state.customBaseUrl =
-          typeof rawCustomBaseUrl === "string" && rawCustomBaseUrl.trim().length > 0
-            ? rawCustomBaseUrl
-            : DEFAULT_PROXY_BASE_URL;
-
-        state.primaryLanguage = normalizedPrimaryLanguage;
-        const rawSecondary = (state as unknown as { secondaryLanguage?: unknown })
-          .secondaryLanguage;
-        if (
-          typeof rawSecondary === "string" &&
-          rawSecondary.trim().toLowerCase() === "none"
-        ) {
-          state.secondaryLanguage = "none";
-        } else if (
-          typeof rawSecondary === "undefined" ||
-          rawSecondary === null ||
-          (typeof rawSecondary === "string" && rawSecondary.trim().length === 0)
-        ) {
-          state.secondaryLanguage = "none";
-        } else {
-          state.secondaryLanguage = normalizePrimaryLanguage(rawSecondary);
-        }
+        state.baseUrlPreset = "custom";
+        state.provider = "custom";
+        state.customBaseUrl = HARDCODED_PROXY_BASE_URL;
+        state.primaryLanguage = defaultPrimaryLanguage;
+        state.secondaryLanguage = "none";
 
         const rawPrimaryVariant = (state as unknown as { primarySttVariant?: unknown })
           .primarySttVariant;

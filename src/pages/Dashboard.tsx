@@ -9,7 +9,6 @@ import {
   Download,
   RefreshCw,
   X,
-  Keyboard,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -20,11 +19,10 @@ import { useSessionStore } from "@/stores/session";
 import { useSettingsStore } from "@/stores/settings";
 import { refreshCloudReadinessNow, refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
 import type { SettingsFocusTarget, SettingsTab } from "@/lib/types";
-import { formatHotkey } from "@/lib/hotkeys";
+import { getSttPerformanceProfileLabel } from "@/lib/sttProfiles";
+import { logError, logInfo, logWarn } from "@/lib/diagnostics";
 
 const START_READINESS_TIMEOUT_MS = 8000;
-const START_OVERLAY_TIMEOUT_MS = 7000;
-const START_CAPTURE_PROTECTION_TIMEOUT_MS = 2500;
 
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -61,7 +59,7 @@ function toFriendlyStartError(error: unknown): string {
     return "Запуск занял слишком много времени. Проверь сеть и устройства, затем попробуй еще раз.";
   }
   if (normalized.includes("overlay")) {
-    return "Не удалось открыть окно интервью. Попробуй запустить снова.";
+    return "Не удалось открыть встроенный helper. Попробуй запустить снова.";
   }
 
   return detail;
@@ -84,7 +82,7 @@ export function Dashboard() {
   const startSession = useSessionStore((s) => s.startSession);
   const primaryLanguage = useSettingsStore((s) => s.primaryLanguage);
   const primarySttVariant = useSettingsStore((s) => s.primarySttVariant);
-  const hotkeys = useSettingsStore((s) => s.hotkeys);
+  const secondarySttVariant = useSettingsStore((s) => s.secondarySttVariant);
   const [starting, setStarting] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
@@ -120,6 +118,10 @@ export function Dashboard() {
   const handleStartInterview = useCallback(async () => {
     setStarting(true);
     setStartError(null);
+    logInfo("interview.start", "Start interview requested", {
+      allReady,
+      installBlocksInterview,
+    });
     try {
       let readyToStart = allReady;
       if (!readyToStart) {
@@ -138,47 +140,23 @@ export function Dashboard() {
       }
 
       if (!readyToStart) {
+        logWarn("interview.start", "Readiness check failed, start blocked");
         return;
       }
 
-      const { createOverlayWindow, setCaptureProtectionForWindow, isTauri } =
-        await import("@/lib/tauri");
-      if (isTauri()) {
-        await withTimeout(
-          createOverlayWindow(),
-          START_OVERLAY_TIMEOUT_MS,
-          "Истекло время ожидания открытия окна интервью.",
-        );
-        const protectOverlay = useSettingsStore.getState().protectOverlay;
-        await withTimeout(
-          setCaptureProtectionForWindow("overlay", protectOverlay),
-          START_CAPTURE_PROTECTION_TIMEOUT_MS,
-          "Capture protection timeout",
-        ).catch((error) => {
-          console.warn("Failed to apply capture protection during start:", error);
-        });
-        setInterviewActive(true);
-      } else {
-        useAppStore.getState().setView("interview");
-        startSession();
-        setInterviewActive(true);
-      }
+      startSession();
+      setView("interview");
+      setInterviewActive(true);
+      logInfo("interview.start", "Embedded helper started successfully");
     } catch (e) {
       console.error("Failed to start interview", e);
+      logError("interview.start", "Failed to start interview", e);
       setInterviewActive(false);
-      try {
-        const { isTauri, restoreMainWindow } = await import("@/lib/tauri");
-        if (isTauri()) {
-          await restoreMainWindow();
-        }
-      } catch (restoreError) {
-        console.warn("Failed to restore main window after start error", restoreError);
-      }
       setStartError(toFriendlyStartError(e));
     } finally {
       setStarting(false);
     }
-  }, [allReady, installBlocksInterview, setInterviewActive, startSession]);
+  }, [allReady, installBlocksInterview, setInterviewActive, setView, startSession]);
 
   const missingItems = [
     readiness.apiKey !== "granted" ? "лицензионный ключ" : null,
@@ -189,15 +167,16 @@ export function Dashboard() {
     installBlocksInterview ? "идет обязательная установка компонентов распознавания" : null,
   ].filter((item): item is string => Boolean(item));
 
-  const sendHotkeyLabel = formatHotkey(
-    hotkeys.find((item) => item.action === "send_to_llm")?.keys ?? [],
+  const sttProfileLabel = getSttPerformanceProfileLabel(
+    primarySttVariant,
+    secondarySttVariant,
   );
-  const screenshotHotkeyLabel = formatHotkey(
-    hotkeys.find((item) => item.action === "send_with_screenshot")?.keys ?? [],
-  );
-  const endHotkeyLabel = formatHotkey(
-    hotkeys.find((item) => item.action === "end_interview")?.keys ?? [],
-  );
+  const currentAppVersion = appUpdate.currentVersion?.trim() || __APP_VERSION__ || "неизвестно";
+  const availableAppVersion = appUpdate.version?.trim() || null;
+  const hasPendingUpdate =
+    appUpdate.available &&
+    availableAppVersion !== null &&
+    availableAppVersion !== currentAppVersion;
 
   const readinessItems = [
     {
@@ -412,8 +391,24 @@ export function Dashboard() {
           <div className="mt-3 grid grid-cols-2 gap-3">
             <MetricPanel label="Готовность" value={allReady ? "100%" : `${5 - missingItems.length}/5`} tone={allReady ? "ready" : "warning"} />
             <MetricPanel label="Язык" value={primaryLanguage} tone="neutral" />
-            <MetricPanel label="STT" value={primarySttVariant} tone="neutral" />
+            <MetricPanel label="Профиль STT" value={sttProfileLabel} tone="neutral" />
             <MetricPanel label="Проблемы" value={missingItems.length.toString()} tone={missingItems.length === 0 ? "ready" : "warning"} />
+          </div>
+          <div className="mt-3 rounded-2xl border border-white/8 bg-white/[0.03] p-3">
+            <div className="text-[11px] uppercase tracking-[0.16em] text-text-muted">
+              Версия приложения
+            </div>
+            <div className="mt-1.5 text-sm text-text-primary">
+              {currentAppVersion}
+              {hasPendingUpdate ? ` -> ${availableAppVersion}` : ""}
+            </div>
+            <div className="mt-1 text-xs text-text-muted">
+              {appUpdate.checking
+                ? "Проверяем обновления..."
+                : hasPendingUpdate
+                  ? "Доступно обновление. Можно установить из карточки выше."
+                  : "Установлена актуальная версия."}
+            </div>
           </div>
         </Card>
       </section>
@@ -479,45 +474,6 @@ export function Dashboard() {
         </div>
       </Card>
 
-      <Card className="p-6">
-        <div className="mb-4 flex items-center justify-between gap-3">
-          <div>
-            <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">Управление</div>
-            <h2 className="mt-1 text-xl font-semibold text-text-primary">Горячие клавиши</h2>
-          </div>
-          <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.04]">
-            <Keyboard className="h-5 w-5 text-text-secondary" />
-          </div>
-        </div>
-
-        <div className="grid gap-3 md:grid-cols-3">
-          <ShortcutPanel
-            label="Отправить в помощник"
-            value={sendHotkeyLabel}
-            hint="Отправляет текущий контекст в сервис без скриншота."
-          />
-          <ShortcutPanel
-            label="Отправить со скриншотом"
-            value={screenshotHotkeyLabel}
-            hint="Добавляет к запросу текущий экран."
-          />
-          <ShortcutPanel
-            label="Завершить интервью"
-            value={endHotkeyLabel}
-            hint="Закрывает overlay и завершает текущую сессию."
-          />
-        </div>
-
-        <div className="mt-4 flex flex-wrap gap-3">
-          <Button
-            variant="secondary"
-            onClick={() => openSettingsTab("hotkeys", "hotkeys-bindings")}
-          >
-            Настроить клавиши
-          </Button>
-        </div>
-      </Card>
-
       <div className="grid gap-6">
         <Card className="p-6">
           <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">Последняя сессия</div>
@@ -551,26 +507,6 @@ export function Dashboard() {
           )}
         </Card>
       </div>
-    </div>
-  );
-}
-
-function ShortcutPanel({
-  label,
-  value,
-  hint,
-}: {
-  label: string;
-  value: string;
-  hint: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
-      <div className="text-[11px] uppercase tracking-[0.16em] text-text-muted">{label}</div>
-      <div className="mt-3 inline-flex rounded-xl border border-white/10 bg-black/15 px-3 py-2 font-mono text-sm text-text-primary">
-        {value}
-      </div>
-      <div className="mt-3 text-sm leading-6 text-text-secondary">{hint}</div>
     </div>
   );
 }

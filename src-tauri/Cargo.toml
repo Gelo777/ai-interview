@@ -37,6 +37,7 @@ zip = "2.2"
 libloading = "0.8"
 base64 = "0.22"
 keyring = "3"
+whisper-rs = "0.16"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }

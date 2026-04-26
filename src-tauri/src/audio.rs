@@ -87,7 +87,13 @@ fn normalize_device_selector(device_selector: Option<&str>) -> Option<&str> {
 }
 
 fn device_matches_selector(device: &cpal::Device, device_selector: &str) -> bool {
-    resolve_device_id(device) == device_selector || resolve_device_name(device) == device_selector
+    let normalized_selector = device_selector.trim();
+    resolve_device_id(device)
+        .trim()
+        .eq_ignore_ascii_case(normalized_selector)
+        || resolve_device_name(device)
+            .trim()
+            .eq_ignore_ascii_case(normalized_selector)
 }
 
 pub fn find_input_device(device_selector: Option<&str>) -> Option<cpal::Device> {

@@ -2,8 +2,22 @@ import { useEffect, useRef } from "react";
 import { useSettingsStore } from "@/stores/settings";
 import { isTauri } from "@/lib/tauri";
 import { normalizeHotkeyToken } from "@/lib/hotkeys";
+import { logInfo, logWarn } from "@/lib/diagnostics";
 
 type ShortcutCallback = (action: string) => void;
+
+let globalShortcutsBlockedByAcl = false;
+let globalShortcutsAclLogShown = false;
+
+function isAclDeniedError(error: unknown): boolean {
+  const text =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  return text.toLowerCase().includes("not allowed by acl");
+}
 
 function isMacPlatform(): boolean {
   if (typeof navigator === "undefined") {
@@ -73,7 +87,24 @@ export function useGlobalShortcuts(
   }, [onAction]);
 
   useEffect(() => {
-    if (!enabled || !isTauri()) return;
+    if (!enabled) {
+      logInfo("shortcuts.global", "Global shortcuts disabled");
+      return;
+    }
+    if (!isTauri()) {
+      logInfo("shortcuts.global", "Global shortcuts skipped (non-Tauri mode)");
+      return;
+    }
+    if (globalShortcutsBlockedByAcl) {
+      if (!globalShortcutsAclLogShown) {
+        logWarn(
+          "shortcuts.global",
+          "Global shortcuts are disabled because plugin access is blocked by ACL",
+        );
+        globalShortcutsAclLogShown = true;
+      }
+      return;
+    }
 
     let cleanup: (() => void) | null = null;
 
@@ -86,6 +117,7 @@ export function useGlobalShortcuts(
         await unregisterAll().catch(() => {
           // Ignore cleanup failures from stale registrations.
         });
+        logInfo("shortcuts.global", "Starting global shortcut registration");
 
         const registeredShortcuts: string[] = [];
 
@@ -108,6 +140,9 @@ export function useGlobalShortcuts(
                 registeredShortcuts.push(accelerator);
                 return { ok: true, used: accelerator, error: null };
               } catch (err) {
+                if (isAclDeniedError(err)) {
+                  return { ok: false, used: null, error: err };
+                }
                 lastError = err;
               }
             }
@@ -115,27 +150,71 @@ export function useGlobalShortcuts(
           };
 
           const customResult = await tryRegister(customCandidates);
+          if (isAclDeniedError(customResult.error)) {
+            globalShortcutsBlockedByAcl = true;
+            globalShortcutsAclLogShown = true;
+            logWarn(
+              "shortcuts.global",
+              "Global shortcuts are blocked by ACL; skipping registration",
+              {
+                action: hk.action,
+                error: customResult.error,
+              },
+            );
+            break;
+          }
           if (customResult.ok) {
             continue;
           }
 
           const fallbackResult = await tryRegister(fallbackCandidates);
+          if (isAclDeniedError(fallbackResult.error)) {
+            globalShortcutsBlockedByAcl = true;
+            globalShortcutsAclLogShown = true;
+            logWarn(
+              "shortcuts.global",
+              "Global shortcuts are blocked by ACL; skipping fallback registration",
+              {
+                action: hk.action,
+                error: fallbackResult.error,
+              },
+            );
+            break;
+          }
           if (!fallbackResult.ok) {
-            console.warn(
-              `Failed to register global shortcut for action '${hk.action}'. Candidates: ${customCandidates.join(", ")}`,
-              customResult.error ?? fallbackResult.error,
+            logWarn(
+              "shortcuts.global",
+              `Failed to register shortcut '${hk.action}'`,
+              {
+                action: hk.action,
+                candidates: customCandidates,
+                fallbackCandidates,
+                error: customResult.error ?? fallbackResult.error ?? null,
+              },
             );
             continue;
           }
 
-          console.warn(
-            `Custom shortcut for action '${hk.action}' could not be registered. Fallback to default '${fallbackResult.used}'.`,
+          logWarn(
+            "shortcuts.global",
+            `Custom shortcut fallback used for '${hk.action}'`,
+            {
+              action: hk.action,
+              fallback: fallbackResult.used,
+              customCandidates,
+            },
           );
         }
 
         if (registeredShortcuts.length === 0) {
+          logWarn(
+            "shortcuts.global",
+            "No global shortcuts were registered",
+          );
           cleanup = () => {
-            unregisterAll().catch(console.warn);
+            unregisterAll().catch((error: unknown) => {
+              logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+            });
           };
           return;
         }
@@ -143,15 +222,20 @@ export function useGlobalShortcuts(
         for (const shortcut of registeredShortcuts) {
           const registered = await isRegistered(shortcut).catch(() => false);
           if (!registered) {
-            console.warn(`Global shortcut '${shortcut}' is not registered.`);
+            logWarn("shortcuts.global", `Shortcut '${shortcut}' is not active after registration`);
           }
         }
+        logInfo("shortcuts.global", "Global shortcuts registered", {
+          shortcuts: registeredShortcuts,
+        });
 
         cleanup = () => {
-          unregisterAll().catch(console.warn);
+          unregisterAll().catch((error: unknown) => {
+            logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+          });
         };
       } catch (err) {
-        console.warn("Global shortcuts not available:", err);
+        logWarn("shortcuts.global", "Global shortcuts plugin not available", err);
       }
     }
 

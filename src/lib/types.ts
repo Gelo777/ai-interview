@@ -38,7 +38,8 @@ export type SettingsTab =
   | "images"
   | "privacy"
   | "storage"
-  | "hotkeys";
+  | "hotkeys"
+  | "diagnostics";
 
 export type SettingsFocusTarget =
   | "llm-api-key"

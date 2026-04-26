@@ -46,6 +46,7 @@ export function Slider({
           [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent
           [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:cursor-pointer
           [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-bg-primary
+          focus:outline-none focus:ring-2 focus:ring-accent/30 focus:ring-offset-2 focus:ring-offset-bg-primary
           disabled:cursor-not-allowed"
         style={{
           background: `linear-gradient(to right, var(--color-accent) ${pct}%, var(--color-bg-tertiary) ${pct}%)`,

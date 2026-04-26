@@ -9,12 +9,11 @@ import { useState } from "react";
 import { useAppStore } from "@/stores/app";
 import type { AppView } from "@/lib/types";
 
-const navItems: { id: AppView; label: string; icon: typeof LayoutDashboard }[] =
-  [
-    { id: "dashboard", label: "Главная", icon: LayoutDashboard },
-    { id: "settings", label: "Настройки", icon: Settings },
-    { id: "history", label: "История", icon: History },
-  ];
+const navItems: { id: AppView; label: string; icon: typeof LayoutDashboard }[] = [
+  { id: "dashboard", label: "Главная", icon: LayoutDashboard },
+  { id: "settings", label: "Настройки", icon: Settings },
+  { id: "history", label: "История", icon: History },
+];
 
 export function Sidebar() {
   const {
@@ -52,31 +51,39 @@ export function Sidebar() {
   };
 
   return (
-    <aside className="w-64 shrink-0 rounded-[28px] border border-white/8 bg-[linear-gradient(180deg,rgba(17,27,41,0.92),rgba(10,17,27,0.96))] shadow-[0_24px_80px_rgba(0,0,0,0.35)] backdrop-blur-xl flex flex-col h-full overflow-hidden">
-      <div className="relative p-5 flex items-center gap-3 border-b border-white/6">
-        <div className="absolute inset-x-0 top-0 h-20 bg-[radial-gradient(circle_at_top_left,rgba(255,135,91,0.2),transparent_65%)]" />
-        <div className="relative w-11 h-11 rounded-2xl bg-[linear-gradient(135deg,#ff875b,#ffb36e)] flex items-center justify-center shadow-[0_12px_28px_rgba(255,135,91,0.35)]">
-          <Mic className="w-5 h-5 text-slate-950" />
-        </div>
-        <div className="relative">
-          <div className="text-sm font-bold text-text-primary leading-tight tracking-[0.08em] uppercase">
-            Interview Helper
+    <aside className="flex h-full w-[276px] shrink-0 flex-col overflow-hidden rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(17,29,46,0.95),rgba(8,14,24,0.96))] shadow-[0_26px_84px_rgba(0,0,0,0.42)] backdrop-blur-xl">
+      <div className="relative border-b border-white/8 px-5 py-5">
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-[radial-gradient(circle_at_top_left,rgba(87,208,255,0.28),transparent_68%)]" />
+        <div className="relative flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[linear-gradient(135deg,#57d0ff,#7addff)] shadow-[0_12px_28px_rgba(87,208,255,0.38)]">
+            <Mic className="h-5 w-5 text-slate-950" />
           </div>
-          <div className="text-[11px] text-text-muted">Помощник для собеседований</div>
+          <div>
+            <div className="text-sm font-bold uppercase tracking-[0.08em] text-text-primary">
+              Interview Helper
+            </div>
+            <div className="text-[11px] text-text-muted">
+              Умный помощник для собеседований
+            </div>
+          </div>
         </div>
       </div>
 
       <div className="px-5 pt-5">
-        <div className="rounded-2xl border border-white/6 bg-white/[0.03] px-4 py-3">
-          <div className="text-[10px] uppercase tracking-[0.24em] text-text-muted">Рабочая зона</div>
-          <div className="mt-1 text-sm font-semibold text-text-primary">Панель помощника</div>
+        <div className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3">
+          <div className="text-[10px] uppercase tracking-[0.24em] text-text-muted">
+            Рабочая зона
+          </div>
+          <div className="mt-1 text-sm font-semibold text-text-primary">
+            Панель помощника
+          </div>
           <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
-            Всё важное в одном месте: лицензия, готовность, история и запуск помощника.
+            Все важное в одном месте: лицензия, готовность, история и запуск помощника.
           </p>
         </div>
       </div>
 
-      <nav className="flex-1 px-3 py-5 space-y-1.5">
+      <nav className="flex-1 space-y-1.5 px-3 py-5">
         {navItems.map(({ id, label, icon: Icon }) => {
           const active = view === id;
           return (
@@ -85,20 +92,26 @@ export function Sidebar() {
               onClick={() => setView(id)}
               disabled={isInterviewActive}
               className={`
-                w-full flex items-center gap-3 px-3.5 py-3 rounded-2xl text-sm
-                transition-all duration-200 cursor-pointer text-left
-                ${
-                  active
-                    ? "bg-[linear-gradient(135deg,rgba(255,135,91,0.18),rgba(101,178,255,0.1))] text-text-primary font-medium border border-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
-                    : "text-text-secondary hover:text-text-primary hover:bg-white/[0.04]"
+                w-full cursor-pointer rounded-2xl px-3.5 py-3 text-left text-sm transition-all duration-200
+                ${active
+                  ? "border border-white/12 bg-[linear-gradient(135deg,rgba(87,208,255,0.18),rgba(115,183,255,0.12))] font-medium text-text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                  : "text-text-secondary hover:bg-white/[0.05] hover:text-text-primary"
                 }
-                disabled:opacity-50 disabled:cursor-not-allowed
+                disabled:cursor-not-allowed disabled:opacity-50
               `}
             >
-              <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border ${active ? "border-white/10 bg-white/[0.08]" : "border-white/6 bg-white/[0.03]"}`}>
-                <Icon className="w-4 h-4 shrink-0" />
+              <span className="flex items-center gap-3">
+                <span
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border ${
+                    active
+                      ? "border-white/14 bg-white/[0.08]"
+                      : "border-white/8 bg-white/[0.04]"
+                  }`}
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                </span>
+                <span className="flex-1">{label}</span>
               </span>
-              <span className="flex-1">{label}</span>
             </button>
           );
         })}
@@ -106,12 +119,14 @@ export function Sidebar() {
 
       <div className="px-4 pb-4">
         {sttInstall.active && (
-          <div className="p-4 mb-3 bg-warning-muted/70 border border-warning/30 rounded-2xl space-y-2">
-            <div className="text-[11px] font-medium uppercase tracking-[0.18em] text-warning">Установка Vosk</div>
-            <div className="text-[10px] text-warning leading-relaxed">
+          <div className="mb-3 space-y-2 rounded-2xl border border-warning/30 bg-warning-muted/70 p-4">
+            <div className="text-[11px] font-medium uppercase tracking-[0.18em] text-warning">
+              Установка Vosk
+            </div>
+            <div className="text-[10px] leading-relaxed text-warning">
               {sttInstall.detail || "Устанавливаем компоненты Vosk..."}
             </div>
-            <div className="h-1.5 rounded-full bg-black/20 overflow-hidden">
+            <div className="h-1.5 overflow-hidden rounded-full bg-black/20">
               <div
                 className="h-full bg-warning transition-all duration-200"
                 style={{
@@ -124,13 +139,12 @@ export function Sidebar() {
             </div>
             {sttInstall.percent !== null && sttInstall.percent <= 0 && (
               <div className="text-[10px] text-warning/90">
-                Загрузка может несколько минут показывать 0% — это нормально для крупных моделей.
+                При большой модели некоторое время может быть 0% — это нормально.
               </div>
             )}
             {sttInstallQueue.length > 0 && (
               <div className="text-[10px] text-warning/90">
                 В очереди: {sttInstallQueue.length}
-                
               </div>
             )}
             <button
@@ -139,20 +153,21 @@ export function Sidebar() {
                 void handleCancelInstall();
               }}
               disabled={cancelingInstall}
-              className="text-[10px] text-warning hover:text-warning/80 disabled:opacity-60 disabled:cursor-not-allowed"
+              className="text-[10px] text-warning transition-colors hover:text-warning/80 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {cancelingInstall ? "Отмена..." : "Отменить"}
             </button>
           </div>
         )}
-        <div className="rounded-2xl border border-white/6 bg-[linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.02))] p-4">
-          <div className="flex items-center gap-1.5 mb-1">
-            <Zap className="w-3.5 h-3.5 text-accent" />
+
+        <div className="rounded-2xl border border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.03))] p-4">
+          <div className="mb-1 flex items-center gap-1.5">
+            <Zap className="h-3.5 w-3.5 text-accent" />
             <span className="text-[11px] font-medium uppercase tracking-[0.18em] text-text-primary">
               Быстрый старт
             </span>
           </div>
-          <p className="text-[11px] text-text-muted leading-relaxed">
+          <p className="text-[11px] leading-relaxed text-text-muted">
             Введите лицензионный ключ, проверьте готовность и запускайте помощника.
           </p>
         </div>

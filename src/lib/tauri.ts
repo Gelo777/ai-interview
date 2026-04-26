@@ -6,6 +6,23 @@ export interface PlatformInfo {
   capture_protection: string;
 }
 
+export interface HardwareGpuInfo {
+  name: string;
+  vendor: string | null;
+  vram_mb: number | null;
+  integrated: boolean | null;
+}
+
+export interface HardwareProfile {
+  os: string;
+  arch: string;
+  logical_cpu_cores: number;
+  physical_cpu_cores: number | null;
+  total_memory_mb: number | null;
+  gpus: HardwareGpuInfo[];
+  detected_at_unix_ms: number;
+}
+
 export interface PermissionCheck {
   microphone: string;
   system_audio: string;
@@ -24,6 +41,78 @@ export interface AudioDeviceInfo {
 export interface AudioDeviceSelectionRequest {
   microphoneDeviceId?: string;
   systemAudioDeviceId?: string;
+}
+
+export interface StartSttSessionRequest extends AudioDeviceSelectionRequest {
+  language?: string;
+}
+
+export interface AudioDebugEndpoint {
+  selected_device_id: string | null;
+  selected_device: AudioDeviceInfo | null;
+  default_device: AudioDeviceInfo | null;
+  effective_device: AudioDeviceInfo | null;
+  available: boolean;
+  detail: string;
+}
+
+export interface AudioDebugSnapshot {
+  microphone: AudioDebugEndpoint;
+  system_audio: AudioDebugEndpoint;
+  system_audio_status: SystemAudioStatus;
+  input_devices: AudioDeviceInfo[];
+  output_devices: AudioDeviceInfo[];
+  notes: string[];
+}
+
+export interface CaptureAudioSampleRequest extends AudioDeviceSelectionRequest {
+  durationSeconds?: number;
+  openOutputDir?: boolean;
+}
+
+export interface CapturedAudioTrack {
+  source: string;
+  requested_device_id: string | null;
+  device_name: string | null;
+  sample_rate: number | null;
+  sample_count: number;
+  duration_ms: number;
+  file_path: string | null;
+  available: boolean;
+  detail: string;
+}
+
+export interface CaptureAudioSampleResult {
+  output_dir: string;
+  duration_seconds: number;
+  microphone: CapturedAudioTrack;
+  system_audio: CapturedAudioTrack;
+  captured_at_unix_ms: number;
+}
+
+export interface TranscribeCapturedAudioRequest {
+  captureDir?: string;
+  language?: string;
+}
+
+export interface TranscribedAudioTrack {
+  source: string;
+  file_path: string | null;
+  sample_rate: number | null;
+  sample_count: number;
+  duration_ms: number;
+  text: string;
+  available: boolean;
+  detail: string;
+}
+
+export interface TranscribeCapturedAudioResult {
+  capture_dir: string;
+  model_path: string;
+  language: string;
+  microphone: TranscribedAudioTrack;
+  system_audio: TranscribedAudioTrack;
+  transcribed_at_unix_ms: number;
 }
 
 export interface SystemAudioStatus {
@@ -74,6 +163,19 @@ export interface ActivateLicenseRequest {
 
 export interface LicenseActivationResult {
   status: LicenseStatus;
+}
+
+export interface ProxyLicenseStatusRequest {
+  licenseKey: string;
+  baseUrl: string;
+}
+
+export interface ProxyLicenseStatusResponse {
+  status: string;
+  plan?: string | null;
+  expiresAt?: string | null;
+  limits?: Record<string, unknown> | null;
+  usageToday?: Record<string, unknown> | null;
 }
 
 export interface SttResultEvent {
@@ -175,6 +277,10 @@ export async function ocrImage(
   });
 }
 
+export async function captureScreenPngBase64(): Promise<string> {
+  return invoke("capture_screen_png_base64");
+}
+
 export async function getSecureApiKey(): Promise<string | null> {
   return invoke("get_secure_api_key");
 }
@@ -195,6 +301,17 @@ export async function activateLicense(
 
 export async function clearLicense(): Promise<LicenseStatus> {
   return invoke("clear_license");
+}
+
+export async function getProxyLicenseStatus(
+  request: ProxyLicenseStatusRequest,
+): Promise<ProxyLicenseStatusResponse> {
+  return invoke("get_proxy_license_status", {
+    request: {
+      license_key: request.licenseKey,
+      base_url: request.baseUrl,
+    },
+  });
 }
 
 export async function checkAppUpdate(): Promise<AppUpdateStatus> {
@@ -221,6 +338,10 @@ export async function getPlatformInfo(): Promise<PlatformInfo> {
   return invoke("get_platform_info");
 }
 
+export async function getHardwareProfile(): Promise<HardwareProfile> {
+  return invoke("get_hardware_profile");
+}
+
 export async function checkPermissions(
   request?: AudioDeviceSelectionRequest,
 ): Promise<PermissionCheck> {
@@ -233,15 +354,59 @@ export async function listAudioDevices(): Promise<AudioDeviceInfo[]> {
   return invoke("list_audio_devices");
 }
 
+export async function getAudioDebugSnapshot(
+  request?: AudioDeviceSelectionRequest,
+): Promise<AudioDebugSnapshot> {
+  return invoke("get_audio_debug_snapshot", {
+    request: normalizeAudioDeviceSelection(request),
+  });
+}
+
+export async function captureAudioSample(
+  request?: CaptureAudioSampleRequest,
+): Promise<CaptureAudioSampleResult> {
+  return invoke("capture_audio_sample", {
+    request: {
+      ...normalizeAudioDeviceSelection(request),
+      duration_seconds:
+        typeof request?.durationSeconds === "number"
+          ? Math.round(request.durationSeconds)
+          : undefined,
+      open_output_dir:
+        typeof request?.openOutputDir === "boolean"
+          ? request.openOutputDir
+          : undefined,
+    },
+  });
+}
+
+export async function transcribeCapturedAudio(
+  request?: TranscribeCapturedAudioRequest,
+): Promise<TranscribeCapturedAudioResult> {
+  return invoke("transcribe_captured_audio", {
+    request: {
+      capture_dir: request?.captureDir?.trim() || undefined,
+      language: request?.language?.trim() || undefined,
+    },
+  });
+}
+
 export async function getSttStatus(): Promise<SttStatus> {
   return invoke("get_stt_status");
 }
 
+export async function getVoskSttStatus(): Promise<SttStatus> {
+  return invoke("get_vosk_stt_status");
+}
+
 export async function startSttSession(
-  request?: AudioDeviceSelectionRequest,
+  request?: StartSttSessionRequest,
 ): Promise<void> {
   return invoke("start_stt_session", {
-    request: normalizeAudioDeviceSelection(request),
+    request: {
+      ...normalizeAudioDeviceSelection(request),
+      language: request?.language?.trim() || undefined,
+    },
   });
 }
 
@@ -251,6 +416,29 @@ export async function stopSttSession(): Promise<void> {
 
 export async function isSttSessionRunning(): Promise<boolean> {
   return invoke("is_stt_session_running");
+}
+
+export async function startVoskSttSession(
+  request?: StartSttSessionRequest,
+): Promise<void> {
+  return invoke("start_vosk_stt_session", {
+    request: {
+      ...normalizeAudioDeviceSelection(request),
+      language: request?.language?.trim() || undefined,
+    },
+  });
+}
+
+export async function stopVoskSttSession(): Promise<void> {
+  return invoke("stop_vosk_stt_session");
+}
+
+export async function isVoskSttSessionRunning(): Promise<boolean> {
+  return invoke("is_vosk_stt_session_running");
+}
+
+export async function switchSttLanguage(language: string): Promise<void> {
+  return invoke("switch_stt_language", { language });
 }
 
 export async function listVoskRuntimeVersions(): Promise<VoskRuntimeVersion[]> {
@@ -316,6 +504,13 @@ export interface VoskModelDownloadProgress {
   phase: string;
 }
 
+export interface WhisperModelDownloadProgress {
+  bytes_downloaded: number;
+  content_length: number | null;
+  percent: number;
+  phase: string;
+}
+
 export interface VoskModelOption {
   id: string;
   name: string;
@@ -328,6 +523,16 @@ export interface VoskModelOption {
   update_available: boolean;
   installed_versions: string[];
   default_baseline: boolean;
+}
+
+export interface WhisperModelOption {
+  id: string;
+  name: string;
+  profile: string;
+  size_mb: number;
+  download_url: string;
+  installed: boolean;
+  active: boolean;
 }
 
 export async function downloadVoskModel(
@@ -368,6 +573,40 @@ export async function switchSttModel(modelId: string): Promise<void> {
 
 export async function preloadSttModel(modelId: string): Promise<void> {
   return invoke("preload_stt_model", { modelId });
+}
+
+export async function listWhisperModels(): Promise<WhisperModelOption[]> {
+  return invoke("list_whisper_models");
+}
+
+export async function setActiveWhisperModel(modelId: string): Promise<void> {
+  return invoke("set_active_whisper_model", { modelId });
+}
+
+export async function removeWhisperModel(modelId: string): Promise<void> {
+  return invoke("remove_whisper_model", { modelId });
+}
+
+export async function downloadWhisperModel(
+  url: string,
+  modelId: string,
+  onProgress?: (p: WhisperModelDownloadProgress) => void,
+): Promise<string> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = onProgress
+    ? await listen<WhisperModelDownloadProgress>("whisper_model_download_progress", (e) =>
+        onProgress(e.payload),
+      )
+    : undefined;
+  try {
+    return await invoke<string>("download_whisper_model", {
+      url,
+      modelId,
+    });
+  } finally {
+    unlisten?.();
+  }
 }
 
 export async function removeVoskModel(modelId: string): Promise<void> {

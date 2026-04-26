@@ -1,12 +1,13 @@
-﻿import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Key,
-  Keyboard,
-  Languages,
   Brain,
+  Mic,
   Volume2,
+  Copy,
   Loader2,
   RotateCcw,
+  Trash2,
   Info,
   Eye,
   EyeOff,
@@ -23,9 +24,16 @@ import { StatusIndicator } from "@/components/ui/StatusIndicator";
 import { useSettingsStore } from "@/stores/settings";
 import { useAppStore } from "@/stores/app";
 import { useHistoryStore } from "@/stores/history";
-import { BASE_URL_PRESET_OPTIONS, resolveLlmEndpointConfig } from "@/lib/llm";
+import { useDiagnosticsStore } from "@/stores/diagnostics";
+import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
 import { useApiKeyValidation } from "@/hooks/useApiKeyValidation";
 import { APP_LANGUAGE_OPTIONS, getLanguageLabel } from "@/lib/languages";
+import {
+  buildDiagnosticsReport,
+  copyDiagnosticsReportToClipboard,
+  logInfo,
+  logWarn,
+} from "@/lib/diagnostics";
 import {
   formatHotkey,
   HOTKEY_MAX_KEYS,
@@ -43,9 +51,13 @@ import {
   normalizeRuntimeVersion,
   resolveLatestStableRuntimeVersion,
 } from "@/lib/runtimeVersion";
+import {
+  STT_QUALITY_PROFILES,
+  getSttQualityProfileById,
+  resolveSttQualityProfile,
+} from "@/lib/sttProfiles";
 import type {
   HotkeyAction,
-  LlmBaseUrlPreset,
   PrimaryLanguage,
   SettingsFocusTarget,
   SettingsTab,
@@ -53,6 +65,8 @@ import type {
   SttModelVariant,
 } from "@/lib/types";
 import type {
+  AudioDebugEndpoint,
+  AudioDebugSnapshot,
   AudioDeviceInfo,
   VoskModelDownloadProgress,
   VoskModelOption,
@@ -62,10 +76,18 @@ import type {
 const TABS: { id: SettingsTab; label: string; icon: typeof Key }[] = [
   { id: "llm", label: "Ключ", icon: Key },
   { id: "audio", label: "Аудио", icon: Volume2 },
-  { id: "language", label: "Язык", icon: Languages },
   { id: "speech", label: "Распознавание", icon: Brain },
-  { id: "hotkeys", label: "Клавиши", icon: Keyboard },
 ];
+
+const STT_MANUAL_PROFILE_OVERRIDE_KEY = "ai-interview-stt-manual-profile-override-v1";
+
+function markManualSttProfileOverride(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(STT_MANUAL_PROFILE_OVERRIDE_KEY, "1");
+}
+
 
 const SIMPLE_HOTKEY_PRESET: ReadonlyArray<{
   action: HotkeyAction;
@@ -84,6 +106,7 @@ function getFocusSectionClass(isFocused: boolean): string {
   return "rounded-xl ring-2 ring-accent/80 ring-offset-2 ring-offset-bg-primary bg-accent/5 transition-all";
 }
 
+
 export function SettingsPage() {
   const {
     isInterviewActive,
@@ -94,10 +117,15 @@ export function SettingsPage() {
   } = useAppStore();
   const [tab, setTab] = useState<SettingsTab>(settingsTab);
   const [activeFocus, setActiveFocus] = useState<SettingsFocusTarget | null>(null);
+  const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : "unknown";
 
   useEffect(() => {
-    setTab(settingsTab);
-  }, [settingsTab]);
+    const availableTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "speech";
+    setTab(availableTab);
+    if (availableTab !== settingsTab) {
+      setSettingsTab(availableTab);
+    }
+  }, [setSettingsTab, settingsTab]);
 
   useEffect(() => {
     if (!settingsFocus) {
@@ -121,10 +149,10 @@ export function SettingsPage() {
   }, [clearSettingsFocus, settingsFocus, tab]);
 
   return (
-    <div className="p-6 max-w-4xl">
+    <div className="max-w-5xl p-6">
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-text-primary">Настройки</h1>
-        <p className="text-sm text-text-muted mt-1">
+        <h1 className="text-3xl font-bold tracking-tight text-text-primary">Настройки</h1>
+        <p className="mt-2 text-sm leading-7 text-text-muted">
           Только основные настройки для обычного пользователя.
           {isInterviewActive && (
             <span className="text-warning ml-2">
@@ -132,9 +160,10 @@ export function SettingsPage() {
             </span>
           )}
         </p>
+        <p className="mt-1 text-xs text-text-muted">App version: {appVersionLabel}</p>
       </div>
 
-      <div className="flex gap-1 mb-6 p-1 bg-bg-secondary rounded-lg border border-border overflow-x-auto">
+      <div className="mb-6 flex gap-1.5 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-1.5">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
@@ -143,9 +172,11 @@ export function SettingsPage() {
               setSettingsTab(id);
             }}
             className={`
-              flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium whitespace-nowrap
+              flex items-center gap-1.5 whitespace-nowrap rounded-xl px-3.5 py-2 text-xs font-medium
               transition-colors cursor-pointer
-              ${tab === id ? "bg-bg-tertiary text-text-primary" : "text-text-muted hover:text-text-secondary"}
+              ${tab === id
+                ? "border border-white/12 bg-[linear-gradient(135deg,rgba(87,208,255,0.2),rgba(115,183,255,0.14))] text-text-primary"
+                : "text-text-muted hover:bg-white/[0.05] hover:text-text-secondary"}
             `}
           >
             <Icon className="w-3.5 h-3.5" />
@@ -159,22 +190,12 @@ export function SettingsPage() {
         {tab === "audio" && (
           <AudioSettings disabled={isInterviewActive} focusTarget={activeFocus} />
         )}
-        {tab === "language" && (
-          <LanguageSettings
-            disabled={isInterviewActive}
-            focusTarget={activeFocus}
-            section="language"
-          />
-        )}
         {tab === "speech" && (
           <LanguageSettings
             disabled={isInterviewActive}
             focusTarget={activeFocus}
             section="speech"
           />
-        )}
-        {tab === "hotkeys" && (
-          <HotkeySettings disabled={isInterviewActive} focusTarget={activeFocus} />
         )}
       </div>
     </div>
@@ -189,10 +210,6 @@ function LlmSettings({
   focusTarget: SettingsFocusTarget | null;
 }) {
   const {
-    baseUrlPreset,
-    setBaseUrlPreset,
-    customBaseUrl,
-    setCustomBaseUrl,
     apiKey,
     setApiKey,
     interviewContext,
@@ -200,20 +217,14 @@ function LlmSettings({
   } = useSettingsStore();
 
   const [showKey, setShowKey] = useState(false);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const endpoint = useMemo(
-    () => resolveLlmEndpointConfig(baseUrlPreset, customBaseUrl),
-    [baseUrlPreset, customBaseUrl],
-  );
   const { validating, valid, detail } = useApiKeyValidation(
     apiKey,
-    baseUrlPreset,
-    customBaseUrl,
+    "custom",
+    HARDCODED_PROXY_BASE_URL,
     disabled,
   );
 
   const hasApiKey = apiKey.trim().length > 0;
-  const hasBaseUrl = endpoint.baseUrl.trim().length > 0;
 
   return (
     <div className="space-y-5">
@@ -268,15 +279,6 @@ function LlmSettings({
             </p>
           )}
 
-          <div className="mt-4 flex flex-wrap gap-3">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setShowAdvanced((value) => !value)}
-            >
-              {showAdvanced ? "Скрыть служебные настройки" : "Показать служебные настройки"}
-            </Button>
-          </div>
         </Card>
       </div>
 
@@ -318,51 +320,155 @@ function LlmSettings({
         <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
           <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
           <p className="text-xs text-warning leading-relaxed">
-            Пока нет лицензионного ключа. Для запуска пользователю нужны только ключ и адрес прокси.
+            Пока нет лицензионного ключа. Для запуска пользователю нужен только ключ.
           </p>
         </div>
       )}
 
-      {showAdvanced && (
-        <Card
-          title="Служебные настройки прокси"
-          description="Для MVP здесь оставляем только адрес сервера. Модели и провайдеры скрыты от пользователя."
-        >
-          <div className="space-y-2">
-            <label className="block text-xs text-text-muted">Режим адреса</label>
-            <Select
-              value={baseUrlPreset}
-              onChange={(value) => setBaseUrlPreset(value as LlmBaseUrlPreset)}
-              options={BASE_URL_PRESET_OPTIONS}
-              disabled={disabled}
-            />
-          </div>
+      <Card
+        title="Подключение к сервису"
+        description="Адрес прокси зафиксирован в приложении."
+      >
+        <div className="space-y-2">
+          <label className="block text-xs text-text-muted">Адрес прокси</label>
+          <input
+            type="text"
+            value={HARDCODED_PROXY_BASE_URL}
+            readOnly
+            disabled
+            className="w-full bg-bg-input border border-border rounded-lg px-3 py-2.5
+            text-sm text-text-primary placeholder:text-text-muted
+            focus:outline-none transition-colors
+            disabled:opacity-50"
+          />
+        </div>
+      </Card>
+    </div>
+  );
+}
 
-          <div className="space-y-2 mt-4">
-            <label className="block text-xs text-text-muted">Адрес прокси</label>
-            <input
-              type="text"
-              value={baseUrlPreset === "custom" ? customBaseUrl : endpoint.baseUrl}
-              onChange={(e) => {
-                if (baseUrlPreset === "custom") {
-                  setCustomBaseUrl(e.target.value);
-                }
-              }}
-              disabled={disabled || baseUrlPreset !== "custom"}
-              placeholder="http://localhost:8080"
-              className="w-full bg-bg-input border border-border rounded-lg px-3 py-2.5
-              text-sm text-text-primary placeholder:text-text-muted
-              focus:border-accent focus:outline-none transition-colors
-              disabled:opacity-50"
-            />
-          </div>
+function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
+  const entries = useDiagnosticsStore((state) => state.entries);
+  const clearEntries = useDiagnosticsStore((state) => state.clearEntries);
+  const [copied, setCopied] = useState(false);
 
-          <div className="mt-4 rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-            Рабочий сценарий: клиент хранит лицензионный ключ, отправляет его в прокси и получает готовые ответы.
-            Выбор моделей, токенов и поведения LLM остается на стороне сервера.
-          </div>
-        </Card>
-      )}
+  const stats = useMemo(() => {
+    let info = 0;
+    let warn = 0;
+    let error = 0;
+    for (const entry of entries) {
+      if (entry.level === "error") {
+        error += 1;
+      } else if (entry.level === "warn") {
+        warn += 1;
+      } else {
+        info += 1;
+      }
+    }
+    return { info, warn, error };
+  }, [entries]);
+
+  const reportText = useMemo(() => buildDiagnosticsReport(entries), [entries]);
+  const visibleEntries = useMemo(() => entries.slice(0, 120), [entries]);
+
+  const handleCopyReport = useCallback(async () => {
+    const ok = await copyDiagnosticsReportToClipboard(reportText);
+    if (!ok) {
+      return;
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  }, [reportText]);
+
+  return (
+    <div className="space-y-5">
+      <Card
+        title="Журнал диагностики"
+        description="Служебные события приложения для разбора зависаний, ошибок STT, клавиш и запросов к прокси."
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="muted">Событий: {entries.length}</Badge>
+          <Badge variant="danger">Ошибки: {stats.error}</Badge>
+          <Badge variant="warning">Предупреждения: {stats.warn}</Badge>
+          <Badge variant="muted">Инфо: {stats.info}</Badge>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              void handleCopyReport();
+            }}
+            icon={<Copy className="w-3.5 h-3.5" />}
+          >
+            {copied ? "Отчет скопирован" : "Копировать отчет"}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => clearEntries()}
+            icon={<Trash2 className="w-3.5 h-3.5" />}
+            disabled={disabled || entries.length === 0}
+          >
+            Очистить журнал
+          </Button>
+        </div>
+
+        <p className="mt-4 text-xs text-text-muted leading-relaxed">
+          После воспроизведения проблемы откройте эту вкладку, нажмите
+          "Копировать отчет" и отправьте текст. Так проще найти точный этап
+          сбоя и не гадать по симптомам.
+        </p>
+
+        <div className="mt-4 max-h-[420px] space-y-2 overflow-y-auto rounded-xl border border-white/10 bg-bg-primary/30 p-2">
+          {visibleEntries.length === 0 && (
+            <div className="rounded-lg border border-dashed border-white/10 p-3 text-xs text-text-muted">
+              Логов пока нет. Выполните действие (например, старт интервью или
+              отправка подсказки) и откройте вкладку снова.
+            </div>
+          )}
+
+          {visibleEntries.map((entry) => (
+            <div
+              key={entry.id}
+              className="rounded-lg border border-white/8 bg-black/20 p-3"
+            >
+              <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs">
+                <Badge
+                  variant={
+                    entry.level === "error"
+                      ? "danger"
+                      : entry.level === "warn"
+                        ? "warning"
+                        : "muted"
+                  }
+                >
+                  {entry.level.toUpperCase()}
+                </Badge>
+                <span className="text-text-muted">
+                  {new Date(entry.timestamp).toLocaleString("ru-RU")}
+                </span>
+                <span className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
+                  {entry.scope}
+                </span>
+              </div>
+              <p className="text-sm text-text-primary">{entry.message}</p>
+              {entry.details && (
+                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-[11px] leading-relaxed text-text-muted">
+                  {entry.details}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {entries.length > visibleEntries.length && (
+          <p className="mt-3 text-xs text-text-muted">
+            Показаны последние {visibleEntries.length} записей из {entries.length}.
+          </p>
+        )}
+      </Card>
     </div>
   );
 }
@@ -493,6 +599,410 @@ function buildAudioDeviceOptions(
   ];
 }
 
+function normalizeDeviceNameForMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-zа-яё0-9\s\-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function findBrowserMediaDeviceIdByName(
+  kind: "audioinput" | "audiooutput",
+  preferredName: string | null,
+): Promise<string | null> {
+  if (
+    typeof navigator === "undefined" ||
+    !navigator.mediaDevices ||
+    typeof navigator.mediaDevices.enumerateDevices !== "function"
+  ) {
+    return null;
+  }
+
+  const target = normalizeDeviceNameForMatch(preferredName ?? "");
+  if (!target) {
+    return null;
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const candidates = devices.filter((device) => device.kind === kind);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const exact = candidates.find(
+    (device) => normalizeDeviceNameForMatch(device.label) === target,
+  );
+  if (exact?.deviceId) {
+    return exact.deviceId;
+  }
+
+  const partial = candidates.find((device) => {
+    const normalizedLabel = normalizeDeviceNameForMatch(device.label);
+    return (
+      normalizedLabel.includes(target) ||
+      target.includes(normalizedLabel)
+    );
+  });
+
+  return partial?.deviceId ?? null;
+}
+
+function toAudioTestErrorMessage(error: unknown): string {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Неизвестная ошибка";
+  const normalized = message.toLowerCase();
+
+  if (
+    normalized.includes("permission") ||
+    normalized.includes("denied") ||
+    normalized.includes("notallowederror")
+  ) {
+    return "Доступ к аудио запрещен. Разрешите микрофон приложению в Windows.";
+  }
+  if (normalized.includes("notfounderror") || normalized.includes("device")) {
+    return "Не удалось найти выбранное устройство. Обновите список и попробуйте снова.";
+  }
+  if (normalized.includes("webview")) {
+    return "WebView не смог привязать тест к выбранному устройству. Проверьте доступность устройства и запустите проверку снова.";
+  }
+  if (normalized.includes("sinkid")) {
+    return "Этот WebView не поддерживает проверку конкретного динамика через setSinkId.";
+  }
+
+  return message;
+}
+
+interface MicTestDebugInfo {
+  requestedDeviceName: string | null;
+  preferredBrowserDeviceId: string | null;
+  trackLabel: string | null;
+  trackSettings: MediaTrackSettings | null;
+  resolutionStage: string;
+  selectionMatched: boolean;
+}
+
+interface SpeakerTestDebugInfo {
+  requestedOutputName: string | null;
+  preferredSinkId: string | null;
+  activeSinkId: string | null;
+  setSinkIdSupported: boolean;
+  routedToPreferredSink: boolean;
+}
+
+function buildMicrophoneTestConstraints(
+  preferredBrowserDeviceId: string | null,
+): MediaTrackConstraints {
+  return preferredBrowserDeviceId
+    ? {
+        deviceId: { exact: preferredBrowserDeviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      }
+    : {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      };
+}
+
+function doesTrackMatchPreferredMicrophone(
+  track: MediaStreamTrack | null,
+  preferredName: string | null,
+  preferredBrowserDeviceId: string | null,
+): boolean {
+  if (!track || !preferredName) {
+    return true;
+  }
+
+  const settings =
+    typeof track.getSettings === "function" ? track.getSettings() : null;
+  if (preferredBrowserDeviceId && settings?.deviceId === preferredBrowserDeviceId) {
+    return true;
+  }
+
+  const normalizedTrackLabel = normalizeDeviceNameForMatch(track.label ?? "");
+  const normalizedPreferredName = normalizeDeviceNameForMatch(preferredName);
+  if (!normalizedTrackLabel || !normalizedPreferredName) {
+    return false;
+  }
+
+  return (
+    normalizedTrackLabel.includes(normalizedPreferredName) ||
+    normalizedPreferredName.includes(normalizedTrackLabel)
+  );
+}
+
+async function openPreferredMicrophoneTestStream(
+  preferredName: string | null,
+  strictSelection: boolean,
+): Promise<{
+  stream: MediaStream;
+  preferredBrowserDeviceId: string | null;
+  resolutionStage: string;
+  selectionMatched: boolean;
+}> {
+  let preferredBrowserDeviceId = await findBrowserMediaDeviceIdByName(
+    "audioinput",
+    preferredName,
+  );
+  let resolutionStage = preferredBrowserDeviceId ? "preflight-match" : "default-mode";
+
+  if (strictSelection && !preferredBrowserDeviceId) {
+    const permissionProbeStream = await navigator.mediaDevices.getUserMedia({
+      audio: buildMicrophoneTestConstraints(null),
+    });
+    permissionProbeStream.getTracks().forEach((track) => track.stop());
+    preferredBrowserDeviceId = await findBrowserMediaDeviceIdByName(
+      "audioinput",
+      preferredName,
+    );
+    resolutionStage = preferredBrowserDeviceId
+      ? "post-permission-match"
+      : "selected-device-unresolved";
+    if (!preferredBrowserDeviceId) {
+      throw new Error("Selected microphone is not available in WebView");
+    }
+  }
+
+  let stream = await navigator.mediaDevices.getUserMedia({
+    audio: buildMicrophoneTestConstraints(preferredBrowserDeviceId),
+  });
+  let track = stream.getAudioTracks()[0] ?? null;
+  let selectionMatched = doesTrackMatchPreferredMicrophone(
+    track,
+    preferredName,
+    preferredBrowserDeviceId,
+  );
+
+  if (!preferredName || selectionMatched) {
+    return { stream, preferredBrowserDeviceId, resolutionStage, selectionMatched };
+  }
+
+  const retriedBrowserDeviceId = await findBrowserMediaDeviceIdByName(
+    "audioinput",
+    preferredName,
+  );
+  if (!retriedBrowserDeviceId) {
+    if (strictSelection) {
+      stream.getTracks().forEach((currentTrack) => currentTrack.stop());
+      throw new Error("Selected microphone is not available in WebView");
+    }
+    return {
+      stream,
+      preferredBrowserDeviceId,
+      resolutionStage: "unresolved-fallback",
+      selectionMatched,
+    };
+  }
+
+  preferredBrowserDeviceId = retriedBrowserDeviceId;
+  if (
+    doesTrackMatchPreferredMicrophone(track, preferredName, preferredBrowserDeviceId)
+  ) {
+    return {
+      stream,
+      preferredBrowserDeviceId,
+      resolutionStage: "post-permission-confirmed",
+      selectionMatched: true,
+    };
+  }
+
+  stream.getTracks().forEach((currentTrack) => currentTrack.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: buildMicrophoneTestConstraints(preferredBrowserDeviceId),
+  });
+  track = stream.getAudioTracks()[0] ?? null;
+  selectionMatched = doesTrackMatchPreferredMicrophone(
+    track,
+    preferredName,
+    preferredBrowserDeviceId,
+  );
+
+  return {
+    stream,
+    preferredBrowserDeviceId,
+    resolutionStage: strictSelection
+      ? "strict-rematch"
+      : "post-permission-rematch",
+    selectionMatched,
+  };
+}
+
+function formatAudioDebugDevice(device: AudioDeviceInfo | null | undefined): string {
+  if (!device) {
+    return "не найдено";
+  }
+
+  const defaultLabel = device.is_default ? ", Windows default" : "";
+  return `${device.name} [${device.id}] (${device.sample_rate} Hz, ${device.channels} ch${defaultLabel})`;
+}
+
+function formatAudioDebugSelection(endpoint: AudioDebugEndpoint): string {
+  if (endpoint.selected_device) {
+    return formatAudioDebugDevice(endpoint.selected_device);
+  }
+  if (endpoint.selected_device_id) {
+    return `не найдено (${endpoint.selected_device_id})`;
+  }
+  return "режим Windows по умолчанию";
+}
+
+function buildAudioRouteSummary(params: {
+  endpoint: AudioDebugEndpoint;
+  usesWindowsDefault: boolean;
+}): { title: string; detail: string; auxiliary: string | null } {
+  const { endpoint, usesWindowsDefault } = params;
+
+  if (!usesWindowsDefault) {
+    return {
+      title: `Выбран: ${formatAudioDebugSelection(endpoint)}`,
+      detail: endpoint.detail,
+      auxiliary: endpoint.available ? null : "Выбранное устройство сейчас недоступно.",
+    };
+  }
+
+  return {
+    title: "Режим: Windows по умолчанию",
+    detail: endpoint.detail,
+    auxiliary: endpoint.default_device
+      ? `Текущий default: ${formatAudioDebugDevice(endpoint.default_device)}`
+      : "Windows default устройство не найдено.",
+  };
+}
+
+function appendAudioDeviceList(
+  lines: string[],
+  title: string,
+  devices: AudioDeviceInfo[],
+): void {
+  lines.push(title);
+  if (devices.length === 0) {
+    lines.push("- none");
+    return;
+  }
+
+  for (const device of devices) {
+    lines.push(`- ${formatAudioDebugDevice(device)}`);
+  }
+}
+
+function buildAudioDebugReport(params: {
+  snapshot: AudioDebugSnapshot | null;
+  fetchedAt: number | null;
+  micLevel: number;
+  micPeakLevel: number;
+  micAverageLevel: number;
+  micSilentDurationMs: number;
+  micTestActive: boolean;
+  micTestMessage: string | null;
+  micTestDebugInfo: MicTestDebugInfo | null;
+  speakerTestRunning: boolean;
+  speakerTestMessage: string | null;
+  speakerTestDebugInfo: SpeakerTestDebugInfo | null;
+}): string {
+  const {
+    snapshot,
+    fetchedAt,
+    micLevel,
+    micPeakLevel,
+    micAverageLevel,
+    micSilentDurationMs,
+    micTestActive,
+    micTestMessage,
+    micTestDebugInfo,
+    speakerTestRunning,
+    speakerTestMessage,
+    speakerTestDebugInfo,
+  } = params;
+  const lines = [
+    "AI Interview Audio Debug Report",
+    "================================",
+    `Generated at: ${new Date().toISOString()}`,
+    `Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    `Snapshot captured at: ${fetchedAt ? new Date(fetchedAt).toISOString() : "not yet captured"}`,
+    "",
+  ];
+
+  if (!snapshot) {
+    lines.push("No Tauri audio snapshot available yet.");
+  } else {
+    lines.push("Snapshot");
+    lines.push(`- Microphone selected: ${formatAudioDebugSelection(snapshot.microphone)}`);
+    lines.push(`- Microphone effective: ${formatAudioDebugDevice(snapshot.microphone.effective_device)}`);
+    lines.push(`- Microphone default: ${formatAudioDebugDevice(snapshot.microphone.default_device)}`);
+    lines.push(`- Microphone detail: ${snapshot.microphone.detail}`);
+    lines.push(`- Output selected: ${formatAudioDebugSelection(snapshot.system_audio)}`);
+    lines.push(`- Output effective: ${formatAudioDebugDevice(snapshot.system_audio.effective_device)}`);
+    lines.push(`- Output default: ${formatAudioDebugDevice(snapshot.system_audio.default_device)}`);
+    lines.push(`- Output detail: ${snapshot.system_audio.detail}`);
+    lines.push(
+      `- System audio loopback: ${
+        snapshot.system_audio_status.available
+          ? "available"
+          : snapshot.system_audio_status.supported
+            ? "unavailable"
+            : "unsupported"
+      }`,
+    );
+    lines.push(`- System audio detail: ${snapshot.system_audio_status.detail}`);
+    lines.push("");
+    appendAudioDeviceList(lines, "Input devices", snapshot.input_devices);
+    lines.push("");
+    appendAudioDeviceList(lines, "Output devices", snapshot.output_devices);
+    if (snapshot.notes.length > 0) {
+      lines.push("");
+      lines.push("Notes");
+      for (const note of snapshot.notes) {
+        lines.push(`- ${note}`);
+      }
+    }
+  }
+
+  lines.push("");
+  lines.push("Microphone live test");
+  lines.push(`- Active: ${micTestActive ? "yes" : "no"}`);
+  lines.push(`- Current level: ${Math.round(micLevel * 100)}%`);
+  lines.push(`- Peak level: ${Math.round(micPeakLevel * 100)}%`);
+  lines.push(`- Average level: ${Math.round(micAverageLevel * 100)}%`);
+  lines.push(`- Silent for: ${Math.round(micSilentDurationMs / 100) / 10}s`);
+  lines.push(`- Message: ${micTestMessage ?? "none"}`);
+  if (micTestDebugInfo) {
+    lines.push(`- Requested device: ${micTestDebugInfo.requestedDeviceName ?? "Windows default"}`);
+    lines.push(`- Browser device id: ${micTestDebugInfo.preferredBrowserDeviceId ?? "not resolved"}`);
+    lines.push(`- Track label: ${micTestDebugInfo.trackLabel ?? "unknown"}`);
+    lines.push(`- Resolution stage: ${micTestDebugInfo.resolutionStage}`);
+    lines.push(`- Selection matched: ${micTestDebugInfo.selectionMatched ? "yes" : "no"}`);
+    lines.push(
+      `- Track settings: ${
+        micTestDebugInfo.trackSettings
+          ? JSON.stringify(micTestDebugInfo.trackSettings)
+          : "unavailable"
+      }`,
+    );
+  }
+
+  lines.push("");
+  lines.push("Speaker test");
+  lines.push(`- Running: ${speakerTestRunning ? "yes" : "no"}`);
+  lines.push(`- Message: ${speakerTestMessage ?? "none"}`);
+  if (speakerTestDebugInfo) {
+    lines.push(`- Requested output: ${speakerTestDebugInfo.requestedOutputName ?? "Windows default"}`);
+    lines.push(`- Browser sink id: ${speakerTestDebugInfo.preferredSinkId ?? "not resolved"}`);
+    lines.push(`- setSinkId supported: ${speakerTestDebugInfo.setSinkIdSupported ? "yes" : "no"}`);
+    lines.push(`- Routed to preferred sink: ${speakerTestDebugInfo.routedToPreferredSink ? "yes" : "no"}`);
+    lines.push(`- Active sink id: ${speakerTestDebugInfo.activeSinkId ?? "unknown"}`);
+  }
+
+  return lines.join("\n");
+}
+
 function AudioSettings({
   disabled,
   focusTarget,
@@ -510,6 +1020,35 @@ function AudioSettings({
   const [audioDevices, setAudioDevices] = useState<AudioDeviceInfo[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
   const [audioDeviceLoadError, setAudioDeviceLoadError] = useState<string | null>(null);
+  const [micTestActive, setMicTestActive] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [micPeakLevel, setMicPeakLevel] = useState(0);
+  const [micAverageLevel, setMicAverageLevel] = useState(0);
+  const [micSilentDurationMs, setMicSilentDurationMs] = useState(0);
+  const [micTestMessage, setMicTestMessage] = useState<string | null>(null);
+  const [micTestDebugInfo, setMicTestDebugInfo] = useState<MicTestDebugInfo | null>(null);
+  const [speakerTestRunning, setSpeakerTestRunning] = useState(false);
+  const [speakerTestMessage, setSpeakerTestMessage] = useState<string | null>(null);
+  const [speakerTestDebugInfo, setSpeakerTestDebugInfo] =
+    useState<SpeakerTestDebugInfo | null>(null);
+  const [audioDebugSnapshot, setAudioDebugSnapshot] = useState<AudioDebugSnapshot | null>(null);
+  const [audioDebugLoading, setAudioDebugLoading] = useState(false);
+  const [audioDebugMessage, setAudioDebugMessage] = useState<string | null>(null);
+  const [audioDebugFetchedAt, setAudioDebugFetchedAt] = useState<number | null>(null);
+  const [audioDebugCopied, setAudioDebugCopied] = useState(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micAudioContextRef = useRef<AudioContext | null>(null);
+  const micAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micRafRef = useRef<number | null>(null);
+  const micPeakLevelRef = useRef(0);
+  const micLevelSumRef = useRef(0);
+  const micLevelSampleCountRef = useRef(0);
+  const micSilentSinceRef = useRef<number | null>(null);
+  const lastMicrophoneSelectionRef = useRef<string | null | undefined>(undefined);
+  const speakerAudioContextRef = useRef<AudioContext | null>(null);
+  const speakerAudioRef = useRef<HTMLAudioElement | null>(null);
+  const speakerTimerRef = useRef<number | null>(null);
+  const lastSystemAudioSelectionRef = useRef<string | null | undefined>(undefined);
 
   const refreshAudioDevices = useCallback(async () => {
     const { isTauri, listAudioDevices } = await import("@/lib/tauri");
@@ -525,6 +1064,7 @@ function AudioSettings({
       setAudioDevices(devices);
       setAudioDeviceLoadError(null);
     } catch (error) {
+      logWarn("audio.devices", "Не удалось загрузить список аудиоустройств", error);
       setAudioDeviceLoadError(
         error instanceof Error
           ? error.message
@@ -555,7 +1095,479 @@ function AudioSettings({
     () => audioDevices.find((device) => !device.is_input && device.is_default) ?? null,
     [audioDevices],
   );
+  const selectedMicrophoneDevice = useMemo(
+    () =>
+      (microphoneDeviceId
+        ? audioDevices.find(
+            (device) => device.is_input && device.id === microphoneDeviceId,
+          ) ?? null
+        : null),
+    [audioDevices, microphoneDeviceId],
+  );
+  const selectedSystemAudioDevice = useMemo(
+    () =>
+      (systemAudioDeviceId
+        ? audioDevices.find(
+            (device) => !device.is_input && device.id === systemAudioDeviceId,
+          ) ?? null
+        : null),
+    [audioDevices, systemAudioDeviceId],
+  );
+  const microphoneUsesWindowsDefault = !microphoneDeviceId;
+  const systemAudioUsesWindowsDefault = !systemAudioDeviceId;
   const controlsDisabled = disabled || loadingDevices;
+  const micSilenceHint = useMemo(() => {
+    if (!micTestActive || micSilentDurationMs < 1800) {
+      return null;
+    }
+    return "Сигнал почти нулевой уже несколько секунд. Проверьте нужный микрофон, mute и уровень входа в Windows.";
+  }, [micSilentDurationMs, micTestActive]);
+
+  const refreshAudioDebugSnapshot = useCallback(
+    async (reason: "auto" | "manual" = "auto") => {
+      const { isTauri, getAudioDebugSnapshot } = await import("@/lib/tauri");
+      if (!isTauri()) {
+        setAudioDebugSnapshot(null);
+        setAudioDebugMessage(null);
+        setAudioDebugFetchedAt(null);
+        return;
+      }
+
+      setAudioDebugLoading(true);
+      try {
+        const snapshot = await getAudioDebugSnapshot({
+          microphoneDeviceId,
+          systemAudioDeviceId,
+        });
+        setAudioDebugSnapshot(snapshot);
+        setAudioDebugFetchedAt(Date.now());
+        setAudioDebugMessage(null);
+
+        if (reason === "manual") {
+          logInfo("audio.debug", "Снимок аудио-диагностики обновлен", {
+            microphone: snapshot.microphone,
+            systemAudio: snapshot.system_audio,
+            systemAudioStatus: snapshot.system_audio_status,
+            notes: snapshot.notes,
+          });
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Не удалось собрать аудио-диагностику.";
+        setAudioDebugMessage(message);
+        logWarn("audio.debug", "Не удалось собрать аудио-диагностику", error);
+      } finally {
+        setAudioDebugLoading(false);
+      }
+    },
+    [microphoneDeviceId, systemAudioDeviceId],
+  );
+
+  useEffect(() => {
+    if (loadingDevices) {
+      return;
+    }
+    void refreshAudioDebugSnapshot();
+  }, [loadingDevices, refreshAudioDebugSnapshot]);
+
+  const audioDebugReport = useMemo(
+    () =>
+      buildAudioDebugReport({
+        snapshot: audioDebugSnapshot,
+        fetchedAt: audioDebugFetchedAt,
+        micLevel,
+        micPeakLevel,
+        micAverageLevel,
+        micSilentDurationMs,
+        micTestActive,
+        micTestMessage,
+        micTestDebugInfo,
+        speakerTestRunning,
+        speakerTestMessage,
+        speakerTestDebugInfo,
+      }),
+    [
+      audioDebugFetchedAt,
+      audioDebugSnapshot,
+      micAverageLevel,
+      micLevel,
+      micPeakLevel,
+      micSilentDurationMs,
+      micTestActive,
+      micTestDebugInfo,
+      micTestMessage,
+      speakerTestDebugInfo,
+      speakerTestMessage,
+      speakerTestRunning,
+    ],
+  );
+
+  const handleCopyAudioDebugReport = useCallback(async () => {
+    const ok = await copyDiagnosticsReportToClipboard(audioDebugReport);
+    if (!ok) {
+      setAudioDebugMessage("Не удалось скопировать аудио-отчет.");
+      return;
+    }
+    setAudioDebugCopied(true);
+    setAudioDebugMessage("Аудио-отчет скопирован в буфер обмена.");
+    window.setTimeout(() => setAudioDebugCopied(false), 1400);
+  }, [audioDebugReport]);
+
+  const stopMicTest = useCallback(() => {
+    if (micRafRef.current !== null) {
+      window.cancelAnimationFrame(micRafRef.current);
+      micRafRef.current = null;
+    }
+    if (micAudioSourceRef.current) {
+      micAudioSourceRef.current.disconnect();
+      micAudioSourceRef.current = null;
+    }
+    if (micStreamRef.current) {
+      for (const track of micStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      micStreamRef.current = null;
+    }
+    if (micAudioContextRef.current) {
+      void micAudioContextRef.current.close().catch(() => {
+        // Ignore close failures during cleanup.
+      });
+      micAudioContextRef.current = null;
+    }
+    micSilentSinceRef.current = null;
+    setMicLevel(0);
+    setMicSilentDurationMs(0);
+    setMicTestActive(false);
+  }, []);
+
+  const stopSpeakerTest = useCallback(() => {
+    if (speakerTimerRef.current !== null) {
+      window.clearTimeout(speakerTimerRef.current);
+      speakerTimerRef.current = null;
+    }
+    if (speakerAudioRef.current) {
+      speakerAudioRef.current.pause();
+      speakerAudioRef.current.srcObject = null;
+      speakerAudioRef.current = null;
+    }
+    if (speakerAudioContextRef.current) {
+      void speakerAudioContextRef.current.close().catch(() => {
+        // Ignore close failures during cleanup.
+      });
+      speakerAudioContextRef.current = null;
+    }
+    setSpeakerTestRunning(false);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopMicTest();
+      stopSpeakerTest();
+    };
+  }, [stopMicTest, stopSpeakerTest]);
+
+  useEffect(() => {
+    const currentSelection = microphoneDeviceId ?? null;
+    if (typeof lastMicrophoneSelectionRef.current === "undefined") {
+      lastMicrophoneSelectionRef.current = currentSelection;
+      return;
+    }
+
+    if (lastMicrophoneSelectionRef.current === currentSelection) {
+      return;
+    }
+
+    lastMicrophoneSelectionRef.current = currentSelection;
+    if (micTestActive) {
+      stopMicTest();
+      logInfo("audio.micTest", "Выбор микрофона изменился, тест остановлен");
+    }
+    setMicTestDebugInfo(null);
+    setMicPeakLevel(0);
+    setMicAverageLevel(0);
+    setMicSilentDurationMs(0);
+    setMicLevel(0);
+    setMicTestMessage("Выбрано другое устройство. Запустите проверку микрофона снова.");
+  }, [microphoneDeviceId, micTestActive, stopMicTest]);
+
+  useEffect(() => {
+    const currentSelection = systemAudioDeviceId ?? null;
+    if (typeof lastSystemAudioSelectionRef.current === "undefined") {
+      lastSystemAudioSelectionRef.current = currentSelection;
+      return;
+    }
+
+    if (lastSystemAudioSelectionRef.current === currentSelection) {
+      return;
+    }
+
+    lastSystemAudioSelectionRef.current = currentSelection;
+    if (speakerTestRunning) {
+      stopSpeakerTest();
+      logInfo("audio.speakerTest", "Выбор устройства вывода изменился, тест остановлен");
+    }
+    setSpeakerTestDebugInfo(null);
+    setSpeakerTestMessage("Выбрано другое устройство. Запустите проверку динамика снова.");
+  }, [speakerTestRunning, stopSpeakerTest, systemAudioDeviceId]);
+
+  const startMicTest = useCallback(async () => {
+    if (controlsDisabled) {
+      return;
+    }
+
+    stopMicTest();
+    micPeakLevelRef.current = 0;
+    micLevelSumRef.current = 0;
+    micLevelSampleCountRef.current = 0;
+    micSilentSinceRef.current = null;
+    setMicPeakLevel(0);
+    setMicAverageLevel(0);
+    setMicSilentDurationMs(0);
+    setMicTestMessage("Запрашиваем доступ к микрофону...");
+    setMicTestDebugInfo(null);
+
+    try {
+      if (
+        typeof navigator === "undefined" ||
+        !navigator.mediaDevices ||
+        typeof navigator.mediaDevices.getUserMedia !== "function"
+      ) {
+        throw new Error("MediaDevices API is not available");
+      }
+      if (!microphoneUsesWindowsDefault && !selectedMicrophoneDevice) {
+        throw new Error("Selected microphone is not available");
+      }
+
+      const selectedMicrophone =
+        selectedMicrophoneDevice?.name ?? (microphoneUsesWindowsDefault ? defaultMicrophone?.name ?? null : null);
+      const {
+        stream,
+        preferredBrowserDeviceId,
+        resolutionStage,
+        selectionMatched,
+      } = await openPreferredMicrophoneTestStream(
+        selectedMicrophone,
+        !microphoneUsesWindowsDefault,
+      );
+
+      const AudioContextCtor =
+        window.AudioContext ??
+        ((window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext ?? null);
+      if (!AudioContextCtor) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("AudioContext is not available");
+      }
+
+      const audioContext = new AudioContextCtor();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.6;
+      source.connect(analyser);
+
+      const buffer = new Uint8Array(analyser.fftSize);
+      const updateLevel = () => {
+        analyser.getByteTimeDomainData(buffer);
+        let energy = 0;
+        for (let index = 0; index < buffer.length; index += 1) {
+          const value = (buffer[index] - 128) / 128;
+          energy += value * value;
+        }
+        const rms = Math.sqrt(energy / buffer.length);
+        const normalized = Math.max(0, Math.min(1, rms * 3.5));
+        const now = performance.now();
+        if (normalized < 0.02) {
+          if (micSilentSinceRef.current === null) {
+            micSilentSinceRef.current = now;
+          }
+        } else {
+          micSilentSinceRef.current = null;
+        }
+        micLevelSampleCountRef.current += 1;
+        micLevelSumRef.current += normalized;
+        micPeakLevelRef.current = Math.max(micPeakLevelRef.current, normalized);
+        setMicLevel(normalized);
+        setMicPeakLevel(micPeakLevelRef.current);
+        setMicAverageLevel(
+          micLevelSumRef.current / Math.max(1, micLevelSampleCountRef.current),
+        );
+        setMicSilentDurationMs(
+          micSilentSinceRef.current === null ? 0 : Math.round(now - micSilentSinceRef.current),
+        );
+        micRafRef.current = window.requestAnimationFrame(updateLevel);
+      };
+
+      const track = stream.getAudioTracks()[0] ?? null;
+      const trackSettings =
+        track && typeof track.getSettings === "function" ? track.getSettings() : null;
+
+      micStreamRef.current = stream;
+      micAudioContextRef.current = audioContext;
+      micAudioSourceRef.current = source;
+      micRafRef.current = window.requestAnimationFrame(updateLevel);
+      setMicTestActive(true);
+      setMicTestDebugInfo({
+        requestedDeviceName: selectedMicrophone,
+        preferredBrowserDeviceId,
+        trackLabel: track?.label ?? null,
+        trackSettings,
+        resolutionStage,
+        selectionMatched,
+      });
+      logInfo("audio.micTest", "Проверка микрофона запущена", {
+        requestedDeviceName: selectedMicrophone,
+        preferredBrowserDeviceId,
+        trackLabel: track?.label ?? null,
+        trackSettings,
+        resolutionStage,
+        selectionMatched,
+      });
+      setMicTestMessage(
+        !microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched
+          ? `Проверка запущена, но WebView использует другое устройство: ${track?.label ?? "неизвестно"}.`
+          : selectedMicrophone
+          ? `Проверка запущена: ${selectedMicrophone}`
+          : "Проверка запущена. Скажите что-нибудь в микрофон.",
+      );
+      if (!microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched) {
+        logWarn(
+          "audio.micTest",
+          "Browser test stream did not bind to the selected microphone",
+          {
+            requestedDeviceName: selectedMicrophone,
+            preferredBrowserDeviceId,
+            trackLabel: track?.label ?? null,
+            resolutionStage,
+          },
+        );
+      }
+    } catch (error) {
+      stopMicTest();
+      setMicTestMessage(`Ошибка проверки микрофона: ${toAudioTestErrorMessage(error)}`);
+      logWarn("audio.micTest", "Проверка микрофона завершилась ошибкой", error);
+    }
+  }, [
+    controlsDisabled,
+    defaultMicrophone?.name,
+    microphoneUsesWindowsDefault,
+    selectedMicrophoneDevice?.name,
+    stopMicTest,
+  ]);
+
+  const runSpeakerTest = useCallback(async () => {
+    if (controlsDisabled) {
+      return;
+    }
+    stopSpeakerTest();
+    setSpeakerTestRunning(true);
+    setSpeakerTestMessage("Воспроизводим тестовый звук...");
+    setSpeakerTestDebugInfo(null);
+
+    try {
+      const AudioContextCtor =
+        window.AudioContext ??
+        ((window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext ?? null);
+      if (!AudioContextCtor) {
+        throw new Error("AudioContext is not available");
+      }
+      if (!systemAudioUsesWindowsDefault && !selectedSystemAudioDevice) {
+        throw new Error("Selected output device is not available");
+      }
+
+      const selectedOutputName =
+        selectedSystemAudioDevice?.name ??
+        (systemAudioUsesWindowsDefault ? defaultSystemAudio?.name ?? null : null);
+      const preferredSinkId = await findBrowserMediaDeviceIdByName(
+        "audiooutput",
+        selectedOutputName,
+      );
+      if (!systemAudioUsesWindowsDefault && !preferredSinkId) {
+        throw new Error("Selected output device is not available in WebView");
+      }
+
+      const context = new AudioContextCtor();
+      const mediaDestination = context.createMediaStreamDestination();
+      const audioElement = new Audio();
+      audioElement.srcObject = mediaDestination.stream;
+      audioElement.autoplay = false;
+
+      const withSink = audioElement as HTMLAudioElement & {
+        setSinkId?: (sinkId: string) => Promise<void>;
+        sinkId?: string;
+      };
+      const setSinkIdSupported = typeof withSink.setSinkId === "function";
+      if (!systemAudioUsesWindowsDefault && !setSinkIdSupported) {
+        throw new Error("setSinkId is not available for selected output device");
+      }
+      if (preferredSinkId && setSinkIdSupported) {
+        await withSink.setSinkId(preferredSinkId);
+      }
+
+      await audioElement.play();
+
+      const scheduleBeep = (offsetSeconds: number) => {
+        const now = context.currentTime + offsetSeconds;
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(880, now);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.16, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+        oscillator.connect(gain);
+        gain.connect(mediaDestination);
+        oscillator.start(now);
+        oscillator.stop(now + 0.24);
+      };
+
+      scheduleBeep(0.05);
+      scheduleBeep(0.40);
+
+      const activeSinkId =
+        typeof withSink.sinkId === "string" && withSink.sinkId.trim()
+          ? withSink.sinkId
+          : null;
+
+      speakerAudioContextRef.current = context;
+      speakerAudioRef.current = audioElement;
+      setSpeakerTestDebugInfo({
+        requestedOutputName: selectedOutputName,
+        preferredSinkId,
+        activeSinkId,
+        setSinkIdSupported,
+        routedToPreferredSink:
+          systemAudioUsesWindowsDefault || Boolean(preferredSinkId && activeSinkId === preferredSinkId),
+      });
+      logInfo("audio.speakerTest", "Проверка динамика запущена", {
+        requestedOutputName: selectedOutputName,
+        preferredSinkId,
+        activeSinkId,
+        setSinkIdSupported,
+      });
+      speakerTimerRef.current = window.setTimeout(() => {
+        stopSpeakerTest();
+        setSpeakerTestMessage(
+          selectedOutputName
+            ? `Тест завершен: ${selectedOutputName}`
+            : "Тест завершен. Если звук не слышен, проверьте громкость и устройство вывода Windows.",
+        );
+      }, 1100);
+    } catch (error) {
+      stopSpeakerTest();
+      setSpeakerTestMessage(`Ошибка проверки динамика: ${toAudioTestErrorMessage(error)}`);
+      logWarn("audio.speakerTest", "Проверка динамика завершилась ошибкой", error);
+    }
+  }, [
+    controlsDisabled,
+    defaultSystemAudio?.name,
+    selectedSystemAudioDevice?.name,
+    systemAudioUsesWindowsDefault,
+    stopSpeakerTest,
+  ]);
 
   return (
     <div className="space-y-5">
@@ -609,19 +1621,102 @@ function AudioSettings({
             Если выбрать конкретные устройства, во время интервью будут использоваться именно они.
           </div>
 
-          <div className="mt-3 rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted leading-relaxed">
-            Сейчас Windows по умолчанию использует:
-            <div className="mt-2 text-text-secondary">
-              Микрофон: {defaultMicrophone?.name ?? "не найден"}
+          <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3">
+            <div className="text-xs text-text-muted uppercase tracking-wider">
+              Проверка устройств
             </div>
-            <div className="mt-1 text-text-secondary">
-              Системный звук: {defaultSystemAudio?.name ?? "не найден"}
-            </div>
-          </div>
+            <div className="mt-3 grid gap-3 md:grid-cols-2">
+              <div className="rounded-lg border border-border bg-bg-primary/50 p-3">
+                <div className="flex items-center gap-2 text-sm text-text-secondary">
+                  <Mic className="h-4 w-4 text-accent" />
+                  Микрофон
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-bg-tertiary">
+                  <div
+                    className="h-full bg-accent transition-all duration-150"
+                    style={{ width: `${Math.round(micLevel * 100)}%` }}
+                  />
+                </div>
+                <div className="mt-1 text-xs text-text-muted">
+                  Уровень: {Math.round(micLevel * 100)}%
+                </div>
+                <div className="mt-1 text-xs text-text-muted">
+                  Пик: {Math.round(micPeakLevel * 100)}% · Средний: {Math.round(micAverageLevel * 100)}%
+                </div>
+                <div className="mt-1 text-xs text-text-muted">
+                  Тишина: {Math.round(micSilentDurationMs / 100) / 10} c
+                </div>
+                {micSilenceHint && (
+                  <div className="mt-2 text-xs leading-relaxed text-warning">
+                    {micSilenceHint}
+                  </div>
+                )}
+                {micTestDebugInfo && (
+                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                    Browser device: {micTestDebugInfo.preferredBrowserDeviceId ?? "не найден"}<br />
+                    Track: {micTestDebugInfo.trackLabel ?? "неизвестно"}<br />
+                    Match: {micTestDebugInfo.selectionMatched ? "совпадает" : "не совпадает"}<br />
+                    Resolve: {micTestDebugInfo.resolutionStage}
+                  </div>
+                )}
+                {micTestMessage && (
+                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                    {micTestMessage}
+                  </div>
+                )}
+                <div className="mt-3">
+                  <Button
+                    variant={micTestActive ? "ghost" : "secondary"}
+                    size="sm"
+                    disabled={controlsDisabled}
+                    onClick={() => {
+                      if (micTestActive) {
+                        stopMicTest();
+                        setMicTestMessage("Проверка микрофона остановлена.");
+                        logInfo("audio.micTest", "Проверка микрофона остановлена вручную");
+                        return;
+                      }
+                      void startMicTest();
+                    }}
+                  >
+                    {micTestActive ? "Остановить проверку" : "Проверить микрофон"}
+                  </Button>
+                </div>
+              </div>
 
-          <div className="mt-3 rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted leading-relaxed">
-            Виртуальные аудиомикшеры вроде SteelSeries Sonar могут показывать каналы `Chat`, `Gaming` или даже `Microphone`.
-            Это нормально: главное выбрать тот канал, на котором реально слышно собеседника.
+              <div className="rounded-lg border border-border bg-bg-primary/50 p-3">
+                <div className="flex items-center gap-2 text-sm text-text-secondary">
+                  <Volume2 className="h-4 w-4 text-accent" />
+                  Динамик
+                </div>
+                <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                  Нажмите кнопку, и приложение воспроизведет короткий двойной сигнал.
+                </div>
+                {speakerTestMessage && (
+                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                    {speakerTestMessage}
+                  </div>
+                )}
+                {speakerTestDebugInfo && (
+                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                    Browser sink: {speakerTestDebugInfo.preferredSinkId ?? "не найден"}<br />
+                    setSinkId: {speakerTestDebugInfo.setSinkIdSupported ? "доступен" : "недоступен"}
+                  </div>
+                )}
+                <div className="mt-3">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={controlsDisabled || speakerTestRunning}
+                    onClick={() => {
+                      void runSpeakerTest();
+                    }}
+                  >
+                    {speakerTestRunning ? "Тестируем..." : "Проверить динамик"}
+                  </Button>
+                </div>
+              </div>
+            </div>
           </div>
 
           {audioDeviceLoadError && (
@@ -674,7 +1769,6 @@ function LanguageSettings({
   const [runtimeNetworkHint, setRuntimeNetworkHint] = useState<string | null>(null);
   const [activeModelOperation, setActiveModelOperation] = useState<ModelOperation | null>(null);
   const [cancelingInstall, setCancelingInstall] = useState(false);
-  const [showAdvancedLanguage, setShowAdvancedLanguage] = useState(false);
   const queueWorkerBusyRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -729,9 +1823,14 @@ function LanguageSettings({
     void refresh();
   }, [refresh]);
 
+
   const installLatestRuntime = useCallback(async () => {
     const { isTauri, installVoskRuntime } = await import("@/lib/tauri");
     if (!isTauri()) {
+      const detail =
+        "Установка Vosk доступна только в desktop helper. Откройте приложение, а не вкладку браузера.";
+      setError(detail);
+      logWarn("stt.install", "Vosk runtime install requested outside Tauri", { detail });
       return false;
     }
 
@@ -795,6 +1894,14 @@ function LanguageSettings({
     async (language: PrimaryLanguage, variant: SttModelVariant) => {
       const { isTauri, downloadVoskModel, listVoskModels } = await import("@/lib/tauri");
       if (!isTauri()) {
+        const detail =
+          "Установка модели распознавания доступна только в desktop helper. Откройте приложение, а не вкладку браузера.";
+        setError(detail);
+        logWarn("stt.install", "Vosk model install requested outside Tauri", {
+          language,
+          variant,
+          detail,
+        });
         return false;
       }
 
@@ -1097,6 +2204,7 @@ function LanguageSettings({
         }
       }
 
+      markManualSttProfileOverride();
       setVariant(variant);
       setSuccess(
         `Предпочтительная модель для языка ${getLanguageLabel(language)}: ${variant === "large" ? "большая" : "быстрая"}.`,
@@ -1262,10 +2370,14 @@ function LanguageSettings({
   const showLatestRuntimeVersion = runtimeLatestVersion !== null;
 
   const runtimeInstalled = readiness.voskRuntimeLoaded;
-  const runtimeFullyReady = runtimeInstalled && readiness.voskModelLoaded;
   const runtimeNeedsInstall = !runtimeInstalled;
-  const primarySmallModelInstalled = hasInstalledModel(primaryModel.small ?? null);
-  const defaultModelMissing = runtimeInstalled && !primarySmallModelInstalled;
+  const selectedPrimaryModel =
+    primarySttVariant === "large" ? primaryModel.large : primaryModel.small;
+  const selectedPrimaryModelInstalled = hasInstalledModel(selectedPrimaryModel);
+  const selectedPrimaryModelSizeMb = selectedPrimaryModel?.size_mb ?? null;
+  const selectedPrimaryModelLabel = primarySttVariant === "large" ? "Large" : "Small";
+  const selectedPrimaryModelMissing =
+    runtimeInstalled && selectedPrimaryModel !== null && !selectedPrimaryModelInstalled;
   const runtimeNeedsUpdate =
     runtimeInstalled &&
     runtimeCurrentVersion !== null &&
@@ -1276,6 +2388,40 @@ function LanguageSettings({
   const secondaryModelInstalled = hasInstalledModel(secondaryModel?.small ?? null);
 
   const voskReady = readiness.vosk === "granted";
+  const selectedPrimaryModelInstalling =
+    sttInstall.active &&
+    sttInstall.phase === "model" &&
+    sttInstall.language === primaryLanguage &&
+    sttInstall.variant === primarySttVariant;
+  const selectedPrimaryModelQueued = queuedTaskKeys.has(
+    `${primaryLanguage}:${primarySttVariant}`,
+  );
+  const selectedPrimaryModelStatusVariant =
+    selectedPrimaryModelInstalling || selectedPrimaryModelQueued
+      ? "warning"
+      : selectedPrimaryModelInstalled
+        ? "success"
+        : selectedPrimaryModel === null
+          ? "danger"
+          : "muted";
+  const selectedPrimaryModelStatusLabel =
+    selectedPrimaryModelInstalling
+      ? "Устанавливается"
+      : selectedPrimaryModelQueued
+        ? "В очереди"
+        : selectedPrimaryModelInstalled
+          ? "Установлена"
+          : selectedPrimaryModel === null
+            ? "Недоступна"
+            : "Нужно установить";
+  const voskStatusDetail =
+    readiness.vosk === "granted"
+      ? "Vosk готов к live-распознаванию микрофона и системного звука."
+      : "Нужно установить локальный Vosk runtime и выбранную русскую модель.";
+  const currentQualityProfile = useMemo(
+    () => resolveSttQualityProfile(primarySttVariant, secondarySttVariant),
+    [primarySttVariant, secondarySttVariant],
+  );
 
   const switchHotkeyLabel =
     formatHotkey(
@@ -1303,6 +2449,18 @@ function LanguageSettings({
   const isLanguageSection = section === "language";
   const isSpeechSection = section === "speech";
 
+  const handleQualityProfileChange = useCallback(
+    (profileId: "small" | "large") => {
+      const profile = getSttQualityProfileById(profileId);
+      setPrimarySttVariant(profile.primaryVariant);
+      setSecondarySttVariant(profile.secondaryVariant);
+      markManualSttProfileOverride();
+
+      setSuccess(null);
+    },
+    [setPrimarySttVariant, setSecondarySttVariant],
+  );
+
   return (
     <div className="space-y-5">
       {isLanguageSection && (
@@ -1325,48 +2483,36 @@ function LanguageSettings({
 
             <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
               Собеседование начнется с языка <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>.
-              Дополнительные языковые режимы и ручное переключение можно включить ниже.
-            </div>
-
-            <div className="mt-4">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => setShowAdvancedLanguage((value) => !value)}
-              >
-                {showAdvancedLanguage ? "Скрыть дополнительные языки" : "Показать дополнительные языки"}
-              </Button>
+              Дополнительные языковые режимы и ручное переключение доступны ниже.
             </div>
           </Card>
 
-          {showAdvancedLanguage && (
-            <Card
-              title="Дополнительные языки"
-              description="Второй язык и ручное переключение во время собеседования."
-            >
-              <div className="space-y-1.5">
-                <div className="text-xs text-text-muted uppercase tracking-wider">Второй язык</div>
-                <Select
-                  value={secondaryLanguage}
-                  onChange={(value) => {
-                    void handleSecondaryLanguageChange(value);
-                  }}
-                  options={secondaryLanguageOptions.map((option) => ({
-                    value: option.value,
-                    label: option.label,
-                  }))}
-                  disabled={languageSelectorsDisabled}
-                />
-              </div>
+          <Card
+            title="Дополнительные языки"
+            description="Второй язык и ручное переключение во время собеседования."
+          >
+            <div className="space-y-1.5">
+              <div className="text-xs text-text-muted uppercase tracking-wider">Второй язык</div>
+              <Select
+                value={secondaryLanguage}
+                onChange={(value) => {
+                  void handleSecondaryLanguageChange(value);
+                }}
+                options={secondaryLanguageOptions.map((option) => ({
+                  value: option.value,
+                  label: option.label,
+                }))}
+                disabled={languageSelectorsDisabled}
+              />
+            </div>
 
-              <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
-                Горячая клавиша переключения языка:{" "}
-                <kbd className="mx-1 px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-[10px] font-mono text-text-primary">
-                  {switchHotkeyLabel}
-                </kbd>
-              </div>
-            </Card>
-          )}
+            <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
+              Горячая клавиша переключения языка:{" "}
+              <kbd className="mx-1 px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-[10px] font-mono text-text-primary">
+                {switchHotkeyLabel}
+              </kbd>
+            </div>
+          </Card>
         </>
       )}
 
@@ -1378,19 +2524,17 @@ function LanguageSettings({
           >
             <Card
               title="Голосовой движок"
-              description="Локальный Vosk runtime и состояние распознавания речи."
+              description="Локальный Vosk для live-распознавания на русском."
             >
               <StatusIndicator
                 status={readiness.vosk}
-                label="Статус движка"
-                description={readiness.voskDetail}
+                label="Vosk"
+                description={voskStatusDetail}
               />
 
-              <div className="mt-3 space-y-1 text-xs text-text-muted">
-                <p>Текущий runtime: {runtimeCurrentVersion ?? "не установлен"}</p>
-                {showLatestRuntimeVersion && <p>Последняя стабильная версия: {runtimeLatestVersion}</p>}
-                {runtimeNetworkHint && <p className="text-warning">{runtimeNetworkHint}</p>}
-              </div>
+              {runtimeNetworkHint && (
+                <p className="mt-3 text-xs leading-relaxed text-warning">{runtimeNetworkHint}</p>
+              )}
 
               <div className="mt-4 flex items-center gap-2">
                 {runtimeNeedsInstall || runtimeNeedsUpdate ? (
@@ -1410,30 +2554,29 @@ function LanguageSettings({
                   </Button>
                 ) : (
                   <Badge variant={showLatestRuntimeVersion ? "success" : "muted"}>
-                    {showLatestRuntimeVersion && runtimeFullyReady
-                      ? "Уже обновлен"
-                      : "Runtime установлен"}
+                    Runtime установлен
                   </Badge>
                 )}
-                {defaultModelMissing && (
+                {selectedPrimaryModelMissing && (
                   <Button
                     variant="secondary"
                     size="sm"
                     onClick={() => {
-                      void installModelVariant(primaryLanguage, "small");
+                      void requestModelInstall(primaryLanguage, primarySttVariant, {
+                        selectAsPreferred: true,
+                      });
                     }}
                     disabled={disabled || runtimeInstalling || sttInstall.active}
                   >
-                    Установить базовую модель ({getLanguageLabel(primaryLanguage)})
+                    Установить {selectedPrimaryModelLabel}
+                    {selectedPrimaryModelSizeMb !== null ? ` (${selectedPrimaryModelSizeMb} MB)` : ""}
                   </Button>
                 )}
               </div>
 
-              {defaultModelMissing && (
+              {selectedPrimaryModelMissing && (
                 <div className="mt-3 rounded-lg border border-warning/30 bg-warning-muted p-3 text-xs leading-relaxed text-warning">
-                  Runtime уже установлен, но базовая языковая модель для{" "}
-                  <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>{" "}
-                  еще не скачана. Без нее распознавание речи не запустится.
+                  Выбранная модель {selectedPrimaryModelLabel} еще не установлена. Без нее live-распознавание не запустится.
                 </div>
               )}
 
@@ -1465,8 +2608,47 @@ function LanguageSettings({
             className={getFocusSectionClass(focusTarget === "language-models")}
           >
             <Card
-              title="Модели распознавания"
-              description="Выбор быстрой или точной модели для каждого языка."
+              title="Качество распознавания"
+              description="Только русский Live STT: быстрый Small или точный Large."
+              className="mb-4"
+            >
+              <div className="grid gap-2 sm:grid-cols-2">
+                {STT_QUALITY_PROFILES.map((profile) => {
+                  const selected = currentQualityProfile?.id === profile.id;
+                  return (
+                    <button
+                      key={profile.id}
+                      type="button"
+                      onClick={() => {
+                        handleQualityProfileChange(profile.id);
+                      }}
+                      disabled={languageOpsDisabled}
+                      className={`rounded-lg border p-3 text-left transition-colors ${
+                        selected
+                          ? "border-accent bg-accent/8"
+                          : "border-border bg-bg-primary/40 hover:border-border-active"
+                      } ${languageOpsDisabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-text-primary">{profile.label}</div>
+                        <Badge variant={selected ? "success" : "muted"}>
+                          {selected ? "Активен" : "Выбрать"}
+                        </Badge>
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-text-secondary">
+                        {profile.id === "large"
+                          ? "Точнее, но тяжелее и дольше стартует."
+                          : "Быстрый старт и минимальная нагрузка."}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </Card>
+
+            <Card
+              title="Русская модель"
+              description="Для релиза оставляем два профиля: Small и Large. Язык сейчас фиксирован: русский."
             >
               {!voskReady && !sttInstall.active && (
                 <div className="mb-4 p-3 rounded-lg border border-warning/30 bg-warning-muted flex items-center justify-between gap-3">
@@ -1485,102 +2667,80 @@ function LanguageSettings({
                 </div>
               )}
 
-              <div className="mb-4 rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-                Язык интервью выбирается во вкладке <span className="text-text-primary">Язык</span>, а здесь настраивается качество распознавания:
-                <span className="text-text-primary"> Small</span> запускается быстрее,{" "}
-                <span className="text-text-primary">Large</span> распознает точнее, но скачивается дольше.
-              </div>
-
-              <div className="space-y-3">
-                <LanguageModelRow
-                  title="Основной"
-                  language={primaryLanguage}
-                  smallModel={primaryModel.small}
-                  largeModel={primaryModel.large}
-                  selectedVariant={primarySttVariant}
-                  activeOperation={
-                    activeModelOperation?.language === primaryLanguage ? activeModelOperation : null
-                  }
-                  installProgress={sttInstall.percent}
-                  onVariantChange={(variant) => {
-                    void handleVariantChange(primaryLanguage, variant, setPrimarySttVariant);
-                  }}
-                  onInstallModel={(variant) => {
-                    void requestModelInstall(primaryLanguage, variant, {
-                      selectAsPreferred: true,
-                    });
-                  }}
-                  onRemoveLarge={() => {
-                    void removeLargeModel(primaryLanguage);
-                  }}
-                  installPhase={sttInstall.phase}
-                  installActive={sttInstall.active}
-                  globalInstallingModelId={globalInstallingModelId}
-                  smallQueued={
-                    queuedSmallLanguages.has(primaryLanguage) ||
-                    queuedTaskKeys.has(`${primaryLanguage}:small`)
-                  }
-                  largeQueued={queuedTaskKeys.has(`${primaryLanguage}:large`)}
-                  onCancelInstall={() => {
-                    void handleCancelInstall();
-                  }}
-                  disabled={languageOpsDisabled}
-                />
-
-                {secondaryPrimaryLanguage ? (
-                  <LanguageModelRow
-                    title="Второй"
-                    language={secondaryPrimaryLanguage}
-                    smallModel={secondaryModel?.small ?? null}
-                    largeModel={secondaryModel?.large ?? null}
-                    selectedVariant={secondarySttVariant}
-                    activeOperation={
-                      activeModelOperation?.language === secondaryPrimaryLanguage
-                        ? activeModelOperation
-                        : null
-                    }
-                    installProgress={sttInstall.percent}
-                    onVariantChange={(variant) => {
-                      void handleVariantChange(
-                        secondaryPrimaryLanguage,
-                        variant,
-                        setSecondarySttVariant,
-                      );
-                    }}
-                    onInstallModel={(variant) => {
-                      void requestModelInstall(secondaryPrimaryLanguage, variant, {
-                        selectAsPreferred: true,
-                      });
-                    }}
-                    onRemoveLarge={() => {
-                      void removeLargeModel(secondaryPrimaryLanguage);
-                    }}
-                    installPhase={sttInstall.phase}
-                    installActive={sttInstall.active}
-                    globalInstallingModelId={globalInstallingModelId}
-                    smallQueued={
-                      queuedSmallLanguages.has(secondaryPrimaryLanguage) ||
-                      queuedTaskKeys.has(`${secondaryPrimaryLanguage}:small`)
-                    }
-                    largeQueued={queuedTaskKeys.has(`${secondaryPrimaryLanguage}:large`)}
-                    onCancelInstall={() => {
-                      void handleCancelInstall();
-                    }}
-                    disabled={languageOpsDisabled}
-                  />
-                ) : (
-                  <div className="rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted">
-                    Второй язык отключен.
+              <div className="rounded-lg border border-border bg-bg-secondary p-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={selectedPrimaryModelStatusVariant}>
+                        {selectedPrimaryModelStatusLabel}
+                      </Badge>
+                      <span className="text-sm font-semibold text-text-primary">
+                        {selectedPrimaryModelLabel}
+                      </span>
+                      {selectedPrimaryModelSizeMb !== null && (
+                        <span className="text-xs text-text-muted">
+                          {selectedPrimaryModelSizeMb} MB
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-xs leading-relaxed text-text-muted">
+                      {primarySttVariant === "large"
+                        ? "Более точное распознавание, модель тяжелее."
+                        : "Быстрый live-режим с низкой нагрузкой."}
+                    </p>
                   </div>
-                )}
-              </div>
 
-              <div className="mt-4 text-xs text-text-muted">
-                Активный язык при запуске: <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>
-                {secondaryPrimaryLanguage && secondaryModelInstalled && (
-                  <span>
-                    {" "}• доступно переключение на {getLanguageLabel(secondaryPrimaryLanguage)}
-                  </span>
+                  {selectedPrimaryModel !== null && !selectedPrimaryModelInstalled && (
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        void requestModelInstall(primaryLanguage, primarySttVariant, {
+                          selectAsPreferred: true,
+                        });
+                      }}
+                      disabled={
+                        disabled ||
+                        runtimeInstalling ||
+                        selectedPrimaryModelInstalling ||
+                        selectedPrimaryModelQueued
+                      }
+                    >
+                      {selectedPrimaryModelQueued
+                        ? "В очереди"
+                        : `Установить ${selectedPrimaryModelLabel}${
+                            selectedPrimaryModelSizeMb !== null
+                              ? ` (${selectedPrimaryModelSizeMb} MB)`
+                              : ""
+                          }`}
+                    </Button>
+                  )}
+                </div>
+
+                {selectedPrimaryModel === null && (
+                  <p className="mt-3 text-xs leading-relaxed text-warning">
+                    Модель {selectedPrimaryModelLabel} сейчас недоступна в списке Vosk.
+                  </p>
+                )}
+
+                {selectedPrimaryModelInstalling && (
+                  <div className="mt-3 space-y-2">
+                    <ProgressBar
+                      label={sttInstall.detail || `Устанавливаем ${selectedPrimaryModelLabel}...`}
+                      percent={sttInstall.percent}
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          void handleCancelInstall();
+                        }}
+                        disabled={cancelingInstall}
+                      >
+                        {cancelingInstall ? "Отменяем..." : "Отмена"}
+                      </Button>
+                    </div>
+                  </div>
                 )}
               </div>
             </Card>

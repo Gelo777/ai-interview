@@ -23,13 +23,13 @@ const icons: Record<string, React.ReactNode> = {
 };
 
 const statusLabels: Record<string, string> = {
-  granted: "Ready",
-  supported: "Supported",
-  denied: "Not available",
-  not_supported: "Not supported",
-  unknown: "Unknown",
-  limited: "Limited",
-  checking: "Checking...",
+  granted: "Готово",
+  supported: "Поддерживается",
+  denied: "Недоступно",
+  not_supported: "Не поддерживается",
+  unknown: "Неизвестно",
+  limited: "Ограничено",
+  checking: "Проверяем...",
 };
 
 export function StatusIndicator({
@@ -41,8 +41,8 @@ export function StatusIndicator({
   actionDisabled,
 }: Props) {
   return (
-    <div className="flex items-start gap-3 rounded-2xl border border-white/6 bg-white/[0.025] px-3 py-3">
-      <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.04]">
+    <div className="group flex items-start gap-3 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-3 transition-colors hover:border-white/18">
+      <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.05]">
         {icons[status]}
       </div>
       <div className="flex-1 min-w-0">
@@ -50,7 +50,7 @@ export function StatusIndicator({
           <span className="text-sm font-medium text-text-primary">
             {label}
           </span>
-          <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-text-muted">
+          <span className="rounded-full border border-white/10 bg-white/[0.06] px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-text-muted">
             {statusLabels[status]}
           </span>
           {actionLabel && onAction && (
@@ -58,7 +58,7 @@ export function StatusIndicator({
               type="button"
               onClick={onAction}
               disabled={actionDisabled}
-              className="ml-auto rounded-full border border-white/10 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary hover:text-text-primary hover:border-white/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="ml-auto rounded-full border border-white/12 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary transition-colors hover:border-accent/40 hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {actionLabel}
             </button>

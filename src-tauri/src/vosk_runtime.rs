@@ -162,6 +162,25 @@ fn candidate_library_paths(app: &tauri::AppHandle, lib_names: &[&str]) -> Vec<Pa
         }
     }
 
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            append_dir_candidates(exe_dir, lib_names, &mut candidates);
+
+            if let Some(platform_dir) = platform_resource_dir_name() {
+                append_dir_candidates(
+                    &exe_dir.join("vosk").join(platform_dir),
+                    lib_names,
+                    &mut candidates,
+                );
+                append_dir_candidates(
+                    &exe_dir.join("resources").join("vosk").join(platform_dir),
+                    lib_names,
+                    &mut candidates,
+                );
+            }
+        }
+    }
+
     if let Ok(app_data_dir) = app.path().app_data_dir() {
         if let Some(platform_dir) = platform_resource_dir_name() {
             let runtime_base = app_data_dir.join("runtime").join("vosk").join(platform_dir);
@@ -180,25 +199,6 @@ fn candidate_library_paths(app: &tauri::AppHandle, lib_names: &[&str]) -> Vec<Pa
                         append_dir_candidates(&path, lib_names, &mut candidates);
                     }
                 }
-            }
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            append_dir_candidates(exe_dir, lib_names, &mut candidates);
-
-            if let Some(platform_dir) = platform_resource_dir_name() {
-                append_dir_candidates(
-                    &exe_dir.join("vosk").join(platform_dir),
-                    lib_names,
-                    &mut candidates,
-                );
-                append_dir_candidates(
-                    &exe_dir.join("resources").join("vosk").join(platform_dir),
-                    lib_names,
-                    &mut candidates,
-                );
             }
         }
     }

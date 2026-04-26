@@ -1,5 +1,5 @@
-import { resolveLlmEndpointConfig } from "@/lib/llm";
 import type { LlmBaseUrlPreset, PrimaryLanguage } from "@/lib/types";
+import { logInfo, logWarn } from "@/lib/diagnostics";
 
 export interface ProxyLicenseStatus {
   status: string;
@@ -30,6 +30,7 @@ const MAX_LIST_ITEMS = 2;
 const MAX_LIST_ITEM_CHARS = 260;
 const MAX_CODE_LINES = 48;
 const MAX_CODE_CHARS = 2800;
+export const HARDCODED_PROXY_BASE_URL = "http://85.198.82.221:8080";
 
 function joinBaseUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
@@ -39,7 +40,9 @@ function getProxyBaseUrl(
   baseUrlPreset: LlmBaseUrlPreset,
   customBaseUrl: string,
 ): string {
-  return resolveLlmEndpointConfig(baseUrlPreset, customBaseUrl).baseUrl;
+  void baseUrlPreset;
+  void customBaseUrl;
+  return HARDCODED_PROXY_BASE_URL;
 }
 
 export async function getLicenseStatus(
@@ -57,6 +60,13 @@ export async function getLicenseStatus(
     throw new Error("Укажите адрес прокси.");
   }
 
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    const { getProxyLicenseStatus } = await import("@/lib/tauri");
+    return getProxyLicenseStatus({
+      licenseKey: trimmedKey,
+      baseUrl,
+    });
+  }
   const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/license/status"), {
     headers: {
       "X-License-Key": trimmedKey,
@@ -107,6 +117,7 @@ export async function validateLicenseKeyDetailed(
     };
   } catch (error) {
     const detail = normalizeValidationError(error);
+    logWarn("license.validation", "License validation failed", { detail, error });
     console.warn("License validation failed:", detail, error);
     return {
       valid: false,
@@ -123,9 +134,19 @@ export async function requestProxyHint(params: {
   question: string;
   language: PrimaryLanguage;
   imageBase64Png?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<ProxyHintResponse> {
-  const { licenseKey, baseUrlPreset, customBaseUrl, question, language, imageBase64Png } =
-    params;
+  const {
+    licenseKey,
+    baseUrlPreset,
+    customBaseUrl,
+    question,
+    language,
+    imageBase64Png,
+    timeoutMs,
+    signal,
+  } = params;
   const trimmedKey = licenseKey.trim();
   const baseUrl = getProxyBaseUrl(baseUrlPreset, customBaseUrl);
 
@@ -147,18 +168,74 @@ export async function requestProxyHint(params: {
     formData.set("image", base64ToBlob(imageBase64Png, "image/png"), "screenshot.png");
   }
 
-  const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/hint"), {
-    method: "POST",
-    headers: {
-      "X-License-Key": trimmedKey,
-    },
-    body: formData,
-  });
+  const effectiveTimeoutMs = Math.max(5_000, timeoutMs ?? 30_000);
+  const requestController = new AbortController();
+  let timeoutTriggered = false;
+  const timeoutId = globalThis.setTimeout(() => {
+    timeoutTriggered = true;
+    requestController.abort();
+  }, effectiveTimeoutMs);
 
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+  const forwardAbort = () => {
+    requestController.abort();
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      requestController.abort();
+    } else {
+      signal.addEventListener("abort", forwardAbort, { once: true });
+    }
   }
 
+  let response: Response;
+  try {
+    logInfo("proxy.hint", "Sending hint request", {
+      baseUrl,
+      language,
+      hasImage: Boolean(imageBase64Png),
+      timeoutMs: effectiveTimeoutMs,
+    });
+    response = await fetch(joinBaseUrl(baseUrl, "/api/v1/hint"), {
+      method: "POST",
+      headers: {
+        "X-License-Key": trimmedKey,
+      },
+      body: formData,
+      signal: requestController.signal,
+    });
+  } catch (error) {
+    if (timeoutTriggered) {
+      logWarn("proxy.hint", "Hint request timed out", {
+        timeoutMs: effectiveTimeoutMs,
+      });
+      throw new Error(
+        `Прокси не ответил за ${Math.round(effectiveTimeoutMs / 1000)} сек. Попробуйте еще раз.`,
+      );
+    }
+    if (signal?.aborted) {
+      logInfo("proxy.hint", "Hint request aborted by signal");
+      throw new Error("Запрос был отменен.");
+    }
+    logWarn("proxy.hint", "Hint request failed with network error", error);
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", forwardAbort);
+  }
+
+  if (!response.ok) {
+    const detail = await readErrorMessage(response);
+    logWarn("proxy.hint", "Hint request failed with HTTP status", {
+      status: response.status,
+      detail,
+    });
+    throw new Error(detail);
+  }
+
+  logInfo("proxy.hint", "Hint request completed successfully", {
+    status: response.status,
+  });
   return (await response.json()) as ProxyHintResponse;
 }
 
@@ -244,6 +321,10 @@ async function readErrorMessage(response: Response): Promise<string> {
       message?: string;
       error?: string | { message?: string; code?: string };
     };
+    const friendly = toFriendlyProxyError(parsed, response.status);
+    if (friendly) {
+      return friendly;
+    }
     if (typeof parsed.message === "string" && parsed.message.trim()) {
       return parsed.message;
     }
@@ -263,6 +344,31 @@ async function readErrorMessage(response: Response): Promise<string> {
   }
 
   return fallback;
+}
+
+function toFriendlyProxyError(
+  parsed: {
+    message?: string;
+    error?: string | { message?: string; code?: string };
+  },
+  status: number,
+): string | null {
+  const code = typeof parsed.error === "object" ? parsed.error.code ?? "" : "";
+  const message =
+    typeof parsed.message === "string"
+      ? parsed.message
+      : typeof parsed.error === "string"
+        ? parsed.error
+        : parsed.error?.message ?? "";
+  const normalized = `${code} ${message}`.toLowerCase();
+
+  if (normalized.includes("http 401 from openai") || normalized.includes("invalid_api_key")) {
+    return "AI-сервис временно недоступен: на сервере нужно обновить OpenAI API key.";
+  }
+  if (status === 502 && normalized.includes("openai")) {
+    return "AI-сервис временно недоступен: proxy не смог получить ответ от OpenAI.";
+  }
+  return null;
 }
 
 function normalizeValidationError(error: unknown): string {

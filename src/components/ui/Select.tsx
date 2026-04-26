@@ -30,10 +30,10 @@ export function Select({
         disabled={disabled}
         className={`
           w-full appearance-none
-          bg-bg-input border border-border rounded-lg
+          bg-bg-input border border-border rounded-xl
           px-3 py-2.5 pr-10 text-sm text-text-primary
-          transition-colors duration-150
-          hover:border-border-active focus:border-accent focus:outline-none
+          transition-all duration-150
+          hover:border-border-active focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30 focus:ring-offset-2 focus:ring-offset-bg-primary
           disabled:opacity-50 disabled:cursor-not-allowed
         `}
       >

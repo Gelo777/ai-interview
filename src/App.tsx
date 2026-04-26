@@ -11,10 +11,12 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { InterviewOverlay } from "@/pages/InterviewOverlay";
 import { isTauri } from "@/lib/tauri";
+import { ensureSttModelWarm } from "@/lib/sttWarmup";
 import { useReadinessMonitor } from "@/hooks/useReadinessMonitor";
 import type { PrimaryLanguage, SttModelVariant } from "@/lib/types";
 import { resolveLatestStableRuntimeVersion } from "@/lib/runtimeVersion";
-import type { AppUpdateProgressEvent, VoskModelOption } from "@/lib/tauri";
+import type { AppUpdateProgressEvent } from "@/lib/tauri";
+import { logInfo, logWarn } from "@/lib/diagnostics";
 
 function resolveInstalledModelId(model: {
   id: string;
@@ -40,6 +42,28 @@ function needsModelInstall(model: {
   return !hasInstalledVersion || model.update_available || model.installed_versions.length > 1;
 }
 
+function detectCurrentTauriWindowLabel(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const internals = window as unknown as {
+    __TAURI_INTERNALS__?: {
+      metadata?: {
+        currentWindow?: {
+          label?: string;
+        };
+      };
+    };
+  };
+
+  const label = internals.__TAURI_INTERNALS__?.metadata?.currentWindow?.label;
+  if (typeof label !== "string" || !label.trim()) {
+    return null;
+  }
+  return label;
+}
+
 export default function App() {
   const { view } = useAppStore();
   const isInterviewActive = useAppStore((s) => s.isInterviewActive);
@@ -56,13 +80,27 @@ export default function App() {
   const cleanup = useHistoryStore((s) => s.cleanup);
 
   const [isOverlayWindow, setIsOverlayWindow] = useState<boolean | null>(
-    () => (typeof window !== "undefined" && isTauri() ? null : false),
+    () => {
+      if (typeof window === "undefined" || !isTauri()) {
+        return false;
+      }
+      const label = detectCurrentTauriWindowLabel();
+      if (label === "overlay") {
+        logInfo("window.detect", "Detected overlay window from internals");
+        return true;
+      }
+      if (label === "main") {
+        logInfo("window.detect", "Detected main window from internals");
+        return false;
+      }
+      return null;
+    },
   );
   const updateDownloadRef = useRef<{ downloaded: number; total: number | null }>({
     downloaded: 0,
     total: null,
   });
-  useReadinessMonitor(isOverlayWindow === false);
+  useReadinessMonitor(isOverlayWindow === false && !isInterviewActive);
 
   useEffect(() => {
     cleanup();
@@ -104,6 +142,7 @@ export default function App() {
         if (!cancelled && legacyApiKey) {
           hydrateApiKey(legacyApiKey);
         }
+        logWarn("settings.apiKey", "Failed to hydrate API key from secure storage", error);
         console.warn("Failed to hydrate API key from secure storage:", error);
       }
     }
@@ -117,9 +156,19 @@ export default function App() {
 
   useEffect(() => {
     if (!isTauri() || isOverlayWindow !== null) return;
-    import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
-      setIsOverlayWindow(getCurrentWebviewWindow().label === "overlay");
-    });
+    const fromInternals = detectCurrentTauriWindowLabel();
+    if (fromInternals) {
+      setIsOverlayWindow(fromInternals === "overlay");
+      return;
+    }
+    import("@tauri-apps/api/webviewWindow")
+      .then(({ getCurrentWebviewWindow }) => {
+        setIsOverlayWindow(getCurrentWebviewWindow().label === "overlay");
+      })
+      .catch((error) => {
+        logWarn("window.detect", "Failed to detect current Tauri window label", error);
+        console.warn("Failed to detect current Tauri window label:", error);
+      });
   }, [isOverlayWindow]);
 
   useEffect(() => {
@@ -138,6 +187,14 @@ export default function App() {
     if (isOverlayWindow !== false || !isTauri()) {
       return;
     }
+    if (isInterviewActive) {
+      void import("@/lib/tauri")
+        .then(({ cancelVoskInstall }) => cancelVoskInstall())
+        .catch(() => {
+          // Best effort: stop any background Vosk install while interview is active.
+        });
+      return;
+    }
 
     const baselineKey = `${primaryLanguage}|${primarySttVariant}|${secondaryLanguage}|${secondarySttVariant}`;
     if (autoBaselineKeyRef.current === baselineKey) {
@@ -147,6 +204,7 @@ export default function App() {
 
     let cancelled = false;
     async function ensureBaselineSttAssets() {
+
       const {
         getSttStatus,
         listVoskRuntimeVersions,
@@ -214,10 +272,10 @@ export default function App() {
         }
 
         const targetLanguages = Array.from(
-          new Set<PrimaryLanguage>(
-            secondaryLanguage === "none"
-              ? [primaryLanguage]
-              : [primaryLanguage, secondaryLanguage],
+          new Set(
+            [primaryLanguage, secondaryLanguage].filter(
+              (language): language is PrimaryLanguage => language !== "none",
+            ),
           ),
         );
         const targetLanguageSet = new Set(targetLanguages);
@@ -326,100 +384,9 @@ export default function App() {
           return "small";
         };
 
-        const backgroundLargePlan = targetLanguages
-          .map((language) => {
-            const preferredVariant = pickVariantForLanguage(language);
-            if (preferredVariant !== "large") {
-              return null;
-            }
-
-            const preferredModel = models.find(
-              (model) => model.language === language && model.variant === preferredVariant,
-            );
-            if (!preferredModel || !needsModelInstall(preferredModel)) {
-              return null;
-            }
-
-            return {
-              language,
-              model: preferredModel,
-            };
-          })
-          .filter(
-            (
-              entry,
-            ): entry is {
-              language: PrimaryLanguage;
-              model: VoskModelOption;
-            } => Boolean(entry),
-          );
-
-        for (let index = 0; index < backgroundLargePlan.length; index += 1) {
-          if (cancelled) {
-            return;
-          }
-
-          const { language, model } = backgroundLargePlan[index];
-          const step = index + 1;
-          const total = backgroundLargePlan.length;
-
-          setSttInstall({
-            active: true,
-            phase: "background-model",
-            percent: Math.round((index / total) * 100),
-            detail: `Улучшаем распознавание: подготавливаем ${model.name} (${step}/${total})...`,
-            language,
-            variant: "large",
-          });
-
-          await downloadVoskModel(
-            model.download_url,
-            model.id,
-            (progress) => {
-              if (cancelled) {
-                return;
-              }
-
-              let itemPercent = progress.percent;
-              if (
-                itemPercent <= 0 &&
-                progress.content_length === null &&
-                progress.bytes_downloaded > 0 &&
-                model.size_mb > 0
-              ) {
-                itemPercent = Math.min(
-                  99,
-                  (progress.bytes_downloaded / (model.size_mb * 1024 * 1024)) * 100,
-                );
-              }
-
-              const overallPercent = Math.round(
-                ((index + Math.max(0, Math.min(100, itemPercent)) / 100) / total) * 100,
-              );
-
-              setSttInstall({
-                active: true,
-                phase: "background-model",
-                percent: overallPercent,
-                detail:
-                  progress.phase === "downloading"
-                    ? `Улучшаем распознавание: скачиваем ${model.name} (${step}/${total})...`
-                    : `Улучшаем распознавание: распаковываем ${model.name} (${step}/${total})...`,
-                language,
-                variant: "large",
-              });
-            },
-            model.installed_versions.filter((id) => id !== model.id),
-          );
-          if (cancelled) {
-            return;
-          }
-
-          models = await listVoskModels();
-          if (cancelled) {
-            return;
-          }
-        }
+        // Stability-first baseline:
+        // we auto-install only small models here.
+        // Large models stay manual in Settings to avoid heavy background load.
 
         const preferredVariant = pickVariantForLanguage(primaryLanguage);
         const preferredModel = models.find(
@@ -433,11 +400,35 @@ export default function App() {
         const activeModelId =
           resolveInstalledModelId(preferredModel ?? { id: "", installed: false, installed_versions: [] }) ??
           resolveInstalledModelId(fallbackSmall ?? { id: "", installed: false, installed_versions: [] });
+        const largeWarmupModelIds = Array.from(
+          new Set(
+            targetLanguages
+              .map((language) => {
+                const preferredVariant = pickVariantForLanguage(language);
+                if (preferredVariant !== "large") {
+                  return null;
+                }
+                return resolveInstalledModelId(
+                  models.find(
+                    (model) =>
+                      model.language === language && model.variant === preferredVariant,
+                  ) ?? { id: "", installed: false, installed_versions: [] },
+                );
+              })
+              .filter((modelId): modelId is string => Boolean(modelId)),
+          ),
+        );
 
-        if (activeModelId && !cancelled) {
-          await setActiveVoskModel(activeModelId);
+        const resolvedActiveModelId = activeModelId ?? "";
+        if (resolvedActiveModelId.length > 0 && !cancelled) {
+          await setActiveVoskModel(resolvedActiveModelId);
+        }
+
+        if (!cancelled && largeWarmupModelIds.length > 0) {
+          await Promise.allSettled(largeWarmupModelIds.map((modelId) => ensureSttModelWarm(modelId)));
         }
       } catch (error) {
+        logWarn("stt.baseline", "Automatic STT setup failed", error);
         console.warn("Automatic STT setup failed:", error);
       } finally {
         clearSttInstall();
@@ -450,6 +441,7 @@ export default function App() {
     };
   }, [
     clearSttInstall,
+    isInterviewActive,
     isOverlayWindow,
     primaryLanguage,
     primarySttVariant,
@@ -540,6 +532,7 @@ export default function App() {
         if (cancelled) {
           return;
         }
+        logWarn("updater.check", "Failed to check app updates", error);
         setAppUpdate({
           enabled: true,
           checking: false,
@@ -564,6 +557,7 @@ export default function App() {
     if (!isTauri() || isOverlayWindow !== false) return;
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen("interview_ended", async () => {
+        logInfo("window.main", "Received interview_ended event");
         useAppStore.getState().setInterviewActive(false);
         useAppStore.getState().setView("dashboard");
         const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
@@ -588,28 +582,12 @@ export default function App() {
     };
   }, [isOverlayWindow]);
 
-  useEffect(() => {
-    if (!isTauri() || isOverlayWindow !== false || !isInterviewActive) {
-      return;
-    }
-
-    import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
-      const mainWindow = getCurrentWebviewWindow();
-      mainWindow.setSkipTaskbar(true).catch(() => {
-        // Not supported on every platform/window manager.
-      });
-      mainWindow.hide().catch(() => {
-        // Window may already be hidden.
-      });
-    });
-  }, [isInterviewActive, isOverlayWindow]);
-
   if (isOverlayWindow === null) {
     return <div className="min-h-screen w-screen bg-transparent" />;
   }
 
   if (isOverlayWindow) {
-    return <InterviewOverlay />;
+    return <InterviewOverlay mode="detached" />;
   }
 
   return (
@@ -617,6 +595,7 @@ export default function App() {
       {view === "dashboard" && <Dashboard />}
       {view === "settings" && <SettingsPage />}
       {view === "history" && <HistoryPage />}
+      {view === "interview" && <InterviewOverlay mode="embedded" />}
     </MainLayout>
   );
 }
