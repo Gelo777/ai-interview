@@ -91,7 +91,7 @@ impl SttEngine {
                 }
                 (true, false) => format!(
                     "Vosk runtime found, but model is missing. Download a model to: {} \
-                     (https://alphacephei.com/vosk/models)",
+                     (https://e-rd.ru/downloads/ai-interview/vosk/model-list.json)",
                     if self.config.model_path.is_empty() {
                         "<app_data>/models/vosk/"
                     } else {

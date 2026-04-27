@@ -7,10 +7,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
-const GITHUB_RELEASES_API: &str =
-    "https://api.github.com/repos/alphacep/vosk-api/releases?per_page=30";
+const VOSK_RUNTIME_MIRROR_RELEASES_URL: &str =
+    "https://e-rd.ru/downloads/ai-interview/vosk/runtime/windows/releases.json";
+const VOSK_RUNTIME_MIRROR_VERSION: &str = "0.3.45";
+const VOSK_RUNTIME_MIRROR_TAG: &str = "v0.3.45";
+const VOSK_RUNTIME_MIRROR_ASSET_NAME: &str = "vosk-win64-0.3.45.zip";
+const VOSK_RUNTIME_MIRROR_DOWNLOAD_URL: &str =
+    "https://e-rd.ru/downloads/ai-interview/vosk/runtime/windows/vosk-win64-0.3.45.zip";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VoskRuntimeVersion {
     pub version: String,
     pub tag: String,
@@ -36,21 +41,6 @@ pub struct VoskRuntimeInstallResult {
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    published_at: Option<String>,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
 pub async fn list_versions() -> Result<Vec<VoskRuntimeVersion>, String> {
     let client = reqwest::Client::builder()
         .user_agent("ai-interview-desktop/0.1")
@@ -59,37 +49,26 @@ pub async fn list_versions() -> Result<Vec<VoskRuntimeVersion>, String> {
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let releases = client
-        .get(GITHUB_RELEASES_API)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch Vosk releases: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Vosk releases request failed: {}", e))?
-        .json::<Vec<GitHubRelease>>()
-        .await
-        .map_err(|e| format!("Failed to parse Vosk releases: {}", e))?;
+    let mirrored_versions = async {
+        client
+            .get(VOSK_RUNTIME_MIRROR_RELEASES_URL)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch mirrored Vosk runtime releases: {}", e))?
+            .error_for_status()
+            .map_err(|e| format!("Mirrored Vosk runtime releases request failed: {}", e))?
+            .json::<Vec<VoskRuntimeVersion>>()
+            .await
+            .map_err(|e| format!("Failed to parse mirrored Vosk runtime releases: {}", e))
+    }
+    .await
+    .unwrap_or_else(|_| fallback_runtime_versions());
 
-    let mut versions = releases
-        .into_iter()
-        .filter(|release| !release.draft && !release.prerelease)
-        .filter_map(|release| {
-            let asset = release
-                .assets
-                .into_iter()
-                .find(|a| asset_matches_platform(&a.name))?;
-            let tag = release.tag_name;
-            let version = normalize_tag(&tag);
-            Some(VoskRuntimeVersion {
-                version,
-                tag,
-                asset_name: asset.name,
-                download_url: asset.browser_download_url,
-                published_at: release.published_at.unwrap_or_default(),
-                is_latest_stable: false,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut versions = if mirrored_versions.is_empty() {
+        fallback_runtime_versions()
+    } else {
+        mirrored_versions
+    };
 
     versions.sort_by(|a, b| b.published_at.cmp(&a.published_at));
     if let Some(first) = versions.first_mut() {
@@ -320,21 +299,22 @@ fn normalize_tag(tag: &str) -> String {
     tag.trim_start_matches('v').to_string()
 }
 
-fn asset_matches_platform(asset_name: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        asset_name.starts_with("vosk-osx-") && asset_name.ends_with(".zip")
-    }
-
+fn fallback_runtime_versions() -> Vec<VoskRuntimeVersion> {
     #[cfg(target_os = "windows")]
     {
-        asset_name.starts_with("vosk-win64-") && asset_name.ends_with(".zip")
+        vec![VoskRuntimeVersion {
+            version: VOSK_RUNTIME_MIRROR_VERSION.to_string(),
+            tag: VOSK_RUNTIME_MIRROR_TAG.to_string(),
+            asset_name: VOSK_RUNTIME_MIRROR_ASSET_NAME.to_string(),
+            download_url: VOSK_RUNTIME_MIRROR_DOWNLOAD_URL.to_string(),
+            published_at: "2022-12-14T23:05:03Z".to_string(),
+            is_latest_stable: true,
+        }]
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     {
-        let _ = asset_name;
-        false
+        Vec::new()
     }
 }
 

@@ -2210,7 +2210,7 @@ pub async fn restore_main_window(
 
 const ACTIVE_MODEL_FILE: &str = "active_model.txt";
 const MODEL_INDEX_CACHE_FILE: &str = "model-index-cache.json";
-const VOSK_MODEL_INDEX_URL: &str = "https://alphacephei.com/vosk/models/model-list.json";
+const VOSK_MODEL_INDEX_URL: &str = "https://e-rd.ru/downloads/ai-interview/vosk/model-list.json";
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum VoskModelVariant {
@@ -2288,36 +2288,20 @@ struct VoskModelCatalogEntry {
 
 const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)] = &[
     (
-        "vosk-model-small-en-us-0.15",
-        "English (Small, US)",
-        "en-US",
-        VoskModelVariant::Small,
-        40,
-        "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-    ),
-    (
-        "vosk-model-en-us-0.22",
-        "English (Large, US)",
-        "en-US",
-        VoskModelVariant::Large,
-        1800,
-        "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
-    ),
-    (
         "vosk-model-small-ru-0.22",
         "Russian (Small)",
         "ru-RU",
         VoskModelVariant::Small,
-        91,
-        "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+        45,
+        "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-small-ru-0.22.zip",
     ),
     (
         "vosk-model-ru-0.42",
         "Russian (Large)",
         "ru-RU",
         VoskModelVariant::Large,
-        1800,
-        "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
+        1848,
+        "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-ru-0.42.zip",
     ),
 ];
 
@@ -2713,16 +2697,16 @@ async fn fetch_remote_model_index() -> Result<Vec<VoskModelIndexEntry>, String> 
 async fn load_vosk_catalog(app: &tauri::AppHandle) -> Result<VoskCatalogData, String> {
     let base_dir = models_base_dir(app)?;
 
-    if let Ok(cached) = read_cached_model_index(&base_dir) {
-        let catalog = build_catalog_from_index(cached);
+    if let Ok(remote) = fetch_remote_model_index().await {
+        let _ = write_cached_model_index(&base_dir, &remote);
+        let catalog = build_catalog_from_index(remote);
         if !catalog.latest_by_family.is_empty() {
             return Ok(catalog);
         }
     }
 
-    if let Ok(remote) = fetch_remote_model_index().await {
-        let _ = write_cached_model_index(&base_dir, &remote);
-        let catalog = build_catalog_from_index(remote);
+    if let Ok(cached) = read_cached_model_index(&base_dir) {
+        let catalog = build_catalog_from_index(cached);
         if !catalog.latest_by_family.is_empty() {
             return Ok(catalog);
         }
