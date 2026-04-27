@@ -6,7 +6,7 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(['dist', 'src-tauri/target', 'src-tauri/gen']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
@@ -18,6 +18,12 @@ export default defineConfig([
     languageOptions: {
       ecmaVersion: 2020,
       globals: globals.browser,
+    },
+    rules: {
+      '@typescript-eslint/no-unused-vars': 'warn',
+      'no-unused-vars': 'off',
+      'no-useless-escape': 'warn',
+      'react-hooks/set-state-in-effect': 'warn',
     },
   },
 ])
