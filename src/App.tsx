@@ -206,7 +206,7 @@ export default function App() {
     async function ensureBaselineSttAssets() {
 
       const {
-        getSttStatus,
+        getVoskSttStatus,
         listVoskRuntimeVersions,
         installVoskRuntime,
         listVoskModels,
@@ -216,7 +216,7 @@ export default function App() {
       } = await import("@/lib/tauri");
 
       try {
-        const sttStatus = await getSttStatus();
+        const sttStatus = await getVoskSttStatus();
         if (cancelled) {
           return;
         }
@@ -246,6 +246,8 @@ export default function App() {
             active: true,
             phase: "runtime",
             percent: 0,
+            bytesDownloaded: null,
+            contentLength: null,
             detail: "Устанавливаем Vosk runtime...",
             language: null,
             variant: null,
@@ -258,6 +260,8 @@ export default function App() {
               active: true,
               phase: "runtime",
               percent: Math.round(progress.percent),
+              bytesDownloaded: progress.bytes_downloaded,
+              contentLength: progress.content_length,
               detail:
                 progress.phase === "downloading"
                   ? "Скачиваем Vosk runtime..."
@@ -323,6 +327,8 @@ export default function App() {
             active: true,
             phase: "model",
             percent: Math.round((index / total) * 100),
+            bytesDownloaded: null,
+            contentLength: null,
             detail: `Подготавливаем базовую модель ${small.name} (${step}/${total})...`,
             language: small.language as PrimaryLanguage,
             variant: "small",
@@ -354,6 +360,8 @@ export default function App() {
                 active: true,
                 phase: "model",
                 percent: overallPercent,
+                bytesDownloaded: progress.bytes_downloaded,
+                contentLength: progress.content_length,
                 detail:
                   progress.phase === "downloading"
                     ? `Скачиваем базовую модель ${small.name} (${step}/${total})...`

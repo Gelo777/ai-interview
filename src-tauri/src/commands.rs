@@ -1558,6 +1558,11 @@ pub fn set_secure_api_key(api_key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn get_device_identity() -> crate::device_identity::DeviceIdentity {
+    crate::device_identity::resolve()
+}
+
+#[tauri::command]
 pub fn get_license_status(app: tauri::AppHandle) -> Result<license::LicenseStatus, String> {
     license::get_license_status(&app)
 }
@@ -1611,9 +1616,12 @@ pub async fn get_proxy_license_status(
         .timeout(std::time::Duration::from_secs(PROXY_LICENSE_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("Не удалось подготовить HTTP-клиент: {}", e))?;
+    let device_identity = crate::device_identity::resolve();
     let response = client
         .get(url)
         .header("X-License-Key", license_key)
+        .header("X-Device-Fingerprint", device_identity.fingerprint)
+        .header("X-Device-Name", device_identity.name)
         .send()
         .await
         .map_err(|e| format!("Не удалось подключиться к прокси: {}", e))?;
@@ -2304,6 +2312,8 @@ const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)]
         "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-ru-0.42.zip",
     ),
 ];
+const RUSSIAN_SMALL_MODEL_ID: &str = "vosk-model-small-ru-0.22";
+const LEGACY_NON_RUSSIAN_MODEL_IDS: &[&str] = &["vosk-model-small-en-us-0.15"];
 
 struct VoskCatalogData {
     latest_by_family: Vec<VoskModelCatalogEntry>,
@@ -2383,6 +2393,45 @@ fn installed_model_ids(base_dir: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     models.sort();
     models
+}
+
+fn cleanup_models_outside_languages(
+    base_dir: &Path,
+    catalog: &VoskCatalogData,
+    target_languages: &[String],
+) -> Result<(), String> {
+    let allowed_families = catalog
+        .latest_by_family
+        .iter()
+        .filter(|entry| target_languages.iter().any(|language| language == &entry.language))
+        .map(|entry| entry.family_key.clone())
+        .collect::<Vec<_>>();
+
+    for installed_id in installed_model_ids(base_dir) {
+        let keep = catalog
+            .id_to_family
+            .get(&installed_id)
+            .is_some_and(|family| allowed_families.iter().any(|allowed| allowed == family));
+        if keep {
+            continue;
+        }
+
+        let model_dir = base_dir.join(&installed_id);
+        if model_dir.strip_prefix(base_dir).is_err() {
+            continue;
+        }
+        if model_dir.is_dir() {
+            std::fs::remove_dir_all(&model_dir).map_err(|e| {
+                format!(
+                    "Failed to remove unused Vosk model '{}': {}",
+                    model_dir.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_catalog_language(raw: &str) -> String {
@@ -2981,12 +3030,10 @@ pub async fn ensure_default_stt_assets(
         }
     }
 
-    let mut baseline = vec!["en-US".to_string()];
-    if normalized_language != "en-US" {
-        baseline.push(normalized_language.clone());
-    }
+    let baseline = vec![normalized_language.clone()];
 
     let base_dir = models_base_dir(&app)?;
+    cleanup_models_outside_languages(&base_dir, &catalog, &baseline)?;
 
     for language in baseline {
         if let Some(default_small) =
@@ -3192,7 +3239,35 @@ fn models_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let models_dir = app_data.join("models").join("vosk");
     std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
     seed_bundled_models_if_needed(app, &models_dir)?;
+    cleanup_legacy_non_russian_models(&models_dir)?;
     Ok(models_dir)
+}
+
+fn cleanup_legacy_non_russian_models(models_dir: &Path) -> Result<(), String> {
+    for model_id in LEGACY_NON_RUSSIAN_MODEL_IDS {
+        let model_dir = models_dir.join(model_id);
+        if model_dir.strip_prefix(models_dir).is_err() {
+            continue;
+        }
+        if model_dir.is_dir() {
+            std::fs::remove_dir_all(&model_dir).map_err(|e| {
+                format!(
+                    "Failed to remove legacy Vosk model '{}': {}",
+                    model_dir.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    let active_model_is_legacy = read_active_model_id(models_dir)
+        .as_deref()
+        .is_some_and(|active| LEGACY_NON_RUSSIAN_MODEL_IDS.contains(&active));
+    if active_model_is_legacy && models_dir.join(RUSSIAN_SMALL_MODEL_ID).is_dir() {
+        let _ = write_active_model_id(models_dir, RUSSIAN_SMALL_MODEL_ID);
+    }
+
+    Ok(())
 }
 
 fn seed_bundled_models_if_needed(app: &tauri::AppHandle, models_dir: &Path) -> Result<(), String> {

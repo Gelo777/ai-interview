@@ -37,6 +37,8 @@ interface AppState {
     active: boolean;
     phase: string;
     percent: number | null;
+    bytesDownloaded: number | null;
+    contentLength: number | null;
     detail: string;
     language: PrimaryLanguage | null;
     variant: SttModelVariant | null;
@@ -113,6 +115,8 @@ export const useAppStore = create<AppState>()(
         active: false,
         phase: "",
         percent: null,
+        bytesDownloaded: null,
+        contentLength: null,
         detail: "",
         language: null,
         variant: null,
@@ -159,6 +163,8 @@ export const useAppStore = create<AppState>()(
             active: false,
             phase: "",
             percent: null,
+            bytesDownloaded: null,
+            contentLength: null,
             detail: "",
             language: null,
             variant: null,

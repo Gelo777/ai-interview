@@ -2,6 +2,7 @@ mod app_updates;
 mod audio;
 mod capture_protection;
 mod commands;
+mod device_identity;
 mod install_control;
 mod license;
 mod ocr;
@@ -153,6 +154,7 @@ pub fn run() {
             commands::capture_screen_png_base64,
             commands::get_secure_api_key,
             commands::set_secure_api_key,
+            commands::get_device_identity,
             commands::get_license_status,
             commands::activate_license,
             commands::clear_license,

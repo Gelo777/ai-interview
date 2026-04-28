@@ -60,7 +60,7 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
     const settings = useSettingsStore.getState();
     const microphoneDeviceId = settings.microphoneDeviceId.trim();
     const systemAudioDeviceId = settings.systemAudioDeviceId.trim();
-    const { checkPermissions, getSttStatus, getSystemAudioStatus, isTauri, listAudioDevices } =
+    const { checkPermissions, getVoskSttStatus, getSystemAudioStatus, isTauri, listAudioDevices } =
       await import("@/lib/tauri");
 
     if (!isTauri()) {
@@ -83,7 +83,7 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
         microphoneDeviceId: microphoneDeviceId || undefined,
         systemAudioDeviceId: systemAudioDeviceId || undefined,
       }),
-      getSttStatus(),
+      getVoskSttStatus(),
       getSystemAudioStatus({
         systemAudioDeviceId: systemAudioDeviceId || undefined,
       }).catch(() => null),

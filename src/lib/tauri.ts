@@ -141,6 +141,11 @@ export interface LicenseProxyConfig {
   dialect: string | null;
 }
 
+export interface DeviceIdentity {
+  fingerprint: string;
+  name: string;
+}
+
 export interface LicenseStatus {
   has_license_key: boolean;
   is_activated: boolean;
@@ -287,6 +292,10 @@ export async function getSecureApiKey(): Promise<string | null> {
 
 export async function setSecureApiKey(apiKey: string): Promise<void> {
   return invoke("set_secure_api_key", { apiKey });
+}
+
+export async function getDeviceIdentity(): Promise<DeviceIdentity> {
+  return invoke("get_device_identity");
 }
 
 export async function getLicenseStatus(): Promise<LicenseStatus> {

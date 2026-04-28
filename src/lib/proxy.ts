@@ -45,6 +45,28 @@ function getProxyBaseUrl(
   return HARDCODED_PROXY_BASE_URL;
 }
 
+async function getDeviceHeaders(): Promise<Record<string, string>> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return {};
+  }
+
+  try {
+    const { getDeviceIdentity } = await import("@/lib/tauri");
+    const identity = await getDeviceIdentity();
+    if (!identity.fingerprint.trim()) {
+      return {};
+    }
+
+    return {
+      "X-Device-Fingerprint": identity.fingerprint,
+      "X-Device-Name": identity.name,
+    };
+  } catch (error) {
+    logWarn("license.deviceIdentity", "Failed to resolve device identity", error);
+    return {};
+  }
+}
+
 export async function getLicenseStatus(
   licenseKey: string,
   baseUrlPreset: LlmBaseUrlPreset,
@@ -70,6 +92,7 @@ export async function getLicenseStatus(
   const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/license/status"), {
     headers: {
       "X-License-Key": trimmedKey,
+      ...(await getDeviceHeaders()),
     },
   });
 
@@ -200,6 +223,7 @@ export async function requestProxyHint(params: {
       method: "POST",
       headers: {
         "X-License-Key": trimmedKey,
+        ...(await getDeviceHeaders()),
       },
       body: formData,
       signal: requestController.signal,

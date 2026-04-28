@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { useAppStore } from "@/stores/app";
+import { formatTransferSize } from "@/lib/installProgress";
 import type { AppView } from "@/lib/types";
 
 const navItems: { id: AppView; label: string; icon: typeof LayoutDashboard }[] = [
@@ -26,6 +27,10 @@ export function Sidebar() {
     clearSttInstallQueue,
   } = useAppStore();
   const [cancelingInstall, setCancelingInstall] = useState(false);
+  const installTransferLabel = formatTransferSize(
+    sttInstall.bytesDownloaded,
+    sttInstall.contentLength,
+  );
 
   const handleCancelInstall = async () => {
     clearSttInstallQueue();
@@ -137,6 +142,9 @@ export function Sidebar() {
                 }}
               />
             </div>
+            {installTransferLabel && (
+              <div className="text-[10px] text-warning/90">{installTransferLabel}</div>
+            )}
             {sttInstall.percent !== null && sttInstall.percent <= 0 && (
               <div className="text-[10px] text-warning/90">
                 При большой модели некоторое время может быть 0% — это нормально.

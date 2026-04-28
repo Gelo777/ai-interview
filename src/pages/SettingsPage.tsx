@@ -27,6 +27,8 @@ import { useHistoryStore } from "@/stores/history";
 import { useDiagnosticsStore } from "@/stores/diagnostics";
 import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
 import { useApiKeyValidation } from "@/hooks/useApiKeyValidation";
+import { refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
+import { formatTransferSize } from "@/lib/installProgress";
 import { APP_LANGUAGE_OPTIONS, getLanguageLabel } from "@/lib/languages";
 import {
   buildDiagnosticsReport,
@@ -543,6 +545,10 @@ type ModelOperation = {
   language: PrimaryLanguage;
   variant: SttModelVariant;
   action: "install" | "remove";
+};
+
+type InstallModelOptions = {
+  skipRuntimeInstall?: boolean;
 };
 
 function isPrimaryLanguage(value: string): value is PrimaryLanguage {
@@ -1769,6 +1775,7 @@ function LanguageSettings({
   const [runtimeNetworkHint, setRuntimeNetworkHint] = useState<string | null>(null);
   const [activeModelOperation, setActiveModelOperation] = useState<ModelOperation | null>(null);
   const [cancelingInstall, setCancelingInstall] = useState(false);
+  const [bootstrapInstalling, setBootstrapInstalling] = useState(false);
   const queueWorkerBusyRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -1816,6 +1823,7 @@ function LanguageSettings({
       setRuntimeNetworkHint(hint || null);
     }
 
+    await refreshLocalReadinessNow().catch(() => null);
     setLoading(false);
   }, [setReadiness]);
 
@@ -1843,6 +1851,8 @@ function LanguageSettings({
       active: true,
       phase: "runtime",
       percent: 0,
+      bytesDownloaded: null,
+      contentLength: null,
       detail: "Устанавливаем последнюю стабильную версию Vosk runtime...",
       language: null,
       variant: null,
@@ -1856,6 +1866,8 @@ function LanguageSettings({
           active: true,
           phase: "runtime",
           percent,
+          bytesDownloaded: progress.bytes_downloaded,
+          contentLength: progress.content_length,
           detail:
             progress.phase === "downloading"
               ? "Скачиваем последнюю стабильную версию Vosk runtime..."
@@ -1865,6 +1877,7 @@ function LanguageSettings({
         });
       });
       setSuccess("Vosk runtime установлен.");
+      await refresh();
       return true;
     } catch (err: unknown) {
       if (isInstallCancelledError(err)) {
@@ -1891,7 +1904,11 @@ function LanguageSettings({
   }, [clearSttInstall, refresh, setSttInstall]);
 
   const installModelVariant = useCallback(
-    async (language: PrimaryLanguage, variant: SttModelVariant) => {
+    async (
+      language: PrimaryLanguage,
+      variant: SttModelVariant,
+      options: InstallModelOptions = {},
+    ) => {
       const { isTauri, downloadVoskModel, listVoskModels } = await import("@/lib/tauri");
       if (!isTauri()) {
         const detail =
@@ -1905,7 +1922,7 @@ function LanguageSettings({
         return false;
       }
 
-      const runtimeMissing = !readiness.voskRuntimeLoaded;
+      const runtimeMissing = !options.skipRuntimeInstall && !readiness.voskRuntimeLoaded;
       if (runtimeMissing) {
         const runtimeInstalled = await installLatestRuntime();
         if (!runtimeInstalled) {
@@ -1948,6 +1965,8 @@ function LanguageSettings({
         active: true,
         phase: "model",
         percent: 0,
+        bytesDownloaded: null,
+        contentLength: null,
         detail: `Устанавливаем ${model.name}...`,
         language,
         variant,
@@ -1975,6 +1994,8 @@ function LanguageSettings({
               active: true,
               phase: "model",
               percent,
+              bytesDownloaded: progress.bytes_downloaded,
+              contentLength: progress.content_length,
               detail:
                 progress.phase === "downloading"
                   ? `Скачиваем ${model.name}...`
@@ -2214,32 +2235,66 @@ function LanguageSettings({
   );
 
   const handleInstallVosk = useCallback(async () => {
+    if (bootstrapInstalling || runtimeInstalling || sttInstall.active) {
+      return;
+    }
+
+    setBootstrapInstalling(true);
+    setError(null);
+    setSuccess(null);
+    setSttInstall({
+      active: true,
+      phase: readiness.voskRuntimeLoaded ? "model" : "runtime",
+      percent: 0,
+      bytesDownloaded: null,
+      contentLength: null,
+      detail: readiness.voskRuntimeLoaded
+        ? "Проверяем русскую модель Vosk..."
+        : "Запускаем установку Vosk runtime...",
+      language: readiness.voskRuntimeLoaded ? primaryLanguage : null,
+      variant: readiness.voskRuntimeLoaded ? "small" : null,
+    });
+
     const targetLanguages: PrimaryLanguage[] =
       secondaryLanguage !== "none"
         ? [primaryLanguage, secondaryLanguage]
         : [primaryLanguage];
 
-    const runtimeInstalledNow = readiness.voskRuntimeLoaded
-      ? true
-      : await installLatestRuntime();
-    if (!runtimeInstalledNow) {
-      return;
-    }
-
-    for (const language of targetLanguages) {
-      const installed = await installModelVariant(language, "small");
-      if (!installed) {
+    try {
+      const runtimeInstalledNow = readiness.voskRuntimeLoaded
+        ? true
+        : await installLatestRuntime();
+      if (!runtimeInstalledNow) {
         return;
       }
-    }
 
-    setSuccess("Vosk runtime и нужные быстрые модели установлены.");
+      for (const language of targetLanguages) {
+        const installed = await installModelVariant(language, "small", {
+          skipRuntimeInstall: true,
+        });
+        if (!installed) {
+          return;
+        }
+      }
+
+      await refresh();
+      setSuccess("Vosk runtime и русская Small-модель установлены.");
+    } finally {
+      setBootstrapInstalling(false);
+      clearSttInstall();
+    }
   }, [
+    bootstrapInstalling,
+    clearSttInstall,
     installLatestRuntime,
     primaryLanguage,
     installModelVariant,
     readiness.voskRuntimeLoaded,
+    refresh,
+    runtimeInstalling,
     secondaryLanguage,
+    setSttInstall,
+    sttInstall.active,
   ]);
 
   const handlePrimaryLanguageChange = useCallback(
@@ -2413,7 +2468,34 @@ function LanguageSettings({
           ? "Установлена"
           : selectedPrimaryModel === null
             ? "Недоступна"
-            : "Нужно установить";
+          : "Нужно установить";
+  const activeInstallTransferLabel = formatTransferSize(
+    sttInstall.bytesDownloaded,
+    sttInstall.contentLength,
+  );
+  const activeInstallTitle =
+    sttInstall.phase === "runtime"
+      ? "Устанавливаем Vosk runtime"
+      : sttInstall.variant === "large"
+        ? "Скачиваем большую русскую модель"
+        : "Скачиваем быструю русскую модель";
+  const activeInstallHint =
+    sttInstall.phase === "model" && sttInstall.variant === "large"
+      ? "Источник: e-rd.ru. Large весит около 1.8 ГБ, поэтому на медленном интернете установка может занять несколько минут."
+      : "Источник: e-rd.ru. Если процент пару секунд стоит на 0%, это нормально: соединение и размер архива еще подготавливаются.";
+  const voskInstallBusy = bootstrapInstalling || runtimeInstalling || sttInstall.active;
+  const voskInstallButtonLabel = voskInstallBusy
+    ? "Устанавливаем..."
+    : runtimeNeedsInstall
+      ? "Установить Vosk runtime"
+      : selectedPrimaryModelMissing
+        ? `Установить ${selectedPrimaryModelLabel}`
+        : "Проверить Vosk";
+  const voskInstallHint = runtimeNeedsInstall
+    ? "Не хватает Vosk runtime: это набор локальных DLL для распознавания речи. Small-модель уже может быть установлена отдельно."
+    : selectedPrimaryModelMissing
+      ? `Не хватает выбранной модели ${selectedPrimaryModelLabel}. Без нее live-распознавание не запустится.`
+      : "Компоненты на диске есть, но движок еще не подтвердил готовность. Нажмите, чтобы перепроверить и обновить состояние.";
   const voskStatusDetail =
     readiness.vosk === "granted"
       ? "Vosk готов к live-распознаванию микрофона и системного звука."
@@ -2650,19 +2732,75 @@ function LanguageSettings({
               title="Русская модель"
               description="Для релиза оставляем два профиля: Small и Large. Язык сейчас фиксирован: русский."
             >
+              {sttInstall.active && (
+                <div className="mb-4 rounded-xl border border-accent/30 bg-accent/8 p-4 shadow-[0_0_30px_rgba(87,208,255,0.08)]">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-text-primary">
+                        {activeInstallTitle}
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-text-secondary">
+                        {sttInstall.detail || "Устанавливаем компоненты Vosk..."}
+                      </p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                        {activeInstallHint}
+                      </p>
+                    </div>
+                    <Badge variant="warning">
+                      {sttInstall.percent === null
+                        ? "..."
+                        : `${Math.max(0, Math.min(100, Math.round(sttInstall.percent)))}%`}
+                    </Badge>
+                  </div>
+
+                  <div className="mt-3">
+                    <ProgressBar
+                      label={activeInstallTransferLabel ?? "Ожидаем первые данные загрузки..."}
+                      percent={sttInstall.percent}
+                    />
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-muted">
+                    <span>
+                      {activeInstallTransferLabel
+                        ? "Загрузка идет. После скачивания приложение распакует модель автоматически."
+                        : "Кнопку можно не нажимать повторно: установка уже запущена."}
+                    </span>
+                    {sttInstallQueue.length > 0 && (
+                      <span className="text-warning">В очереди: {sttInstallQueue.length}</span>
+                    )}
+                  </div>
+
+                  <div className="mt-3 flex justify-end">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        void handleCancelInstall();
+                      }}
+                      disabled={cancelingInstall}
+                    >
+                      {cancelingInstall ? "Отменяем..." : "Отменить установку"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               {!voskReady && !sttInstall.active && (
                 <div className="mb-4 p-3 rounded-lg border border-warning/30 bg-warning-muted flex items-center justify-between gap-3">
                   <div className="text-xs text-warning leading-relaxed">
-                    Vosk еще не полностью готов. Основные компоненты можно установить автоматически.
+                    <div className="font-semibold">Vosk еще не полностью готов.</div>
+                    <div className="mt-1">{voskInstallHint}</div>
                   </div>
                   <Button
                     size="sm"
                     onClick={() => {
                       void handleInstallVosk();
                     }}
-                    disabled={disabled || runtimeInstalling || sttInstall.active}
+                    disabled={disabled || voskInstallBusy}
+                    icon={voskInstallBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
                   >
-                    Установить Vosk
+                    {voskInstallButtonLabel}
                   </Button>
                 </div>
               )}
