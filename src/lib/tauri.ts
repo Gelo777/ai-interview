@@ -477,6 +477,11 @@ export async function cancelVoskInstall(): Promise<void> {
   return invoke("cancel_vosk_install");
 }
 
+export async function openExternalUrl(url: string): Promise<void> {
+  const { open } = await import("@tauri-apps/plugin-shell");
+  await open(url);
+}
+
 export function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -560,6 +565,39 @@ export async function downloadVoskModel(
   try {
     return await invoke<string>("download_vosk_model", {
       url,
+      modelId,
+      cleanupModelIds: cleanupModelIds && cleanupModelIds.length > 0 ? cleanupModelIds : undefined,
+    });
+  } finally {
+    unlisten?.();
+  }
+}
+
+export async function pickVoskModelZip(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Vosk model ZIP", extensions: ["zip"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function installVoskModelFromZip(
+  archivePath: string,
+  modelId: string,
+  onProgress?: (p: VoskModelDownloadProgress) => void,
+  cleanupModelIds?: string[],
+): Promise<string> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = onProgress
+    ? await listen<VoskModelDownloadProgress>("vosk_model_download_progress", (e) =>
+        onProgress(e.payload),
+      )
+    : undefined;
+  try {
+    return await invoke<string>("install_vosk_model_from_zip", {
+      archivePath,
       modelId,
       cleanupModelIds: cleanupModelIds && cleanupModelIds.length > 0 ? cleanupModelIds : undefined,
     });

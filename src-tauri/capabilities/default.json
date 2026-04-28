@@ -5,6 +5,7 @@
   "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
+    "dialog:default",
     "os:default",
     "shell:default",
     "store:default",

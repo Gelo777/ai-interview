@@ -29,6 +29,7 @@ fn app_window_url(app: &tauri::AppHandle) -> tauri::WebviewUrl {
 
 fn ensure_main_window_visible(app: &tauri::AppHandle) {
     if let Some(main_window) = app.get_webview_window("main") {
+        commands::protect_window_from_capture(&main_window);
         let _ = main_window.set_skip_taskbar(false);
         let _ = main_window.show();
         let _ = main_window.unminimize();
@@ -49,6 +50,7 @@ fn ensure_main_window_visible(app: &tauri::AppHandle) {
         .transparent(false)
         .build()
     {
+        commands::protect_window_from_capture(&main_window);
         let _ = main_window.set_skip_taskbar(false);
         let _ = main_window.show();
         let _ = main_window.unminimize();
@@ -62,6 +64,7 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(commands::InterviewWindowLock::default())
         .manage(app_updates::PendingUpdate::default())
@@ -78,6 +81,9 @@ pub fn run() {
                     .level(log::LevelFilter::Info)
                     .build(),
             )?;
+            if let Some(main_window) = app.get_webview_window("main") {
+                commands::protect_window_from_capture(&main_window);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -170,6 +176,7 @@ pub fn run() {
             commands::close_main_window,
             commands::restore_main_window,
             commands::download_vosk_model,
+            commands::install_vosk_model_from_zip,
             commands::list_vosk_models,
             commands::set_active_vosk_model,
             commands::switch_stt_model,

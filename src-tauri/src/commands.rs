@@ -1726,7 +1726,7 @@ fn apply_capture_protection_to_window(
     Ok(())
 }
 
-fn protect_overlay_from_capture(window: &tauri::WebviewWindow) {
+pub(crate) fn protect_window_from_capture(window: &tauri::WebviewWindow) {
     match apply_capture_protection_to_window(window, true) {
         Ok(()) => log::info!("Capture protection enabled for window '{}'", window.label()),
         Err(err) => log::warn!(
@@ -2133,7 +2133,7 @@ pub async fn create_overlay_window(
 
     if let Some(existing_overlay) = app.get_webview_window("overlay") {
         lock.set_active(true);
-        protect_overlay_from_capture(&existing_overlay);
+        protect_window_from_capture(&existing_overlay);
         let _ = existing_overlay.unminimize();
         let _ = existing_overlay.show();
         let _ = existing_overlay.set_focus();
@@ -2155,7 +2155,7 @@ pub async fn create_overlay_window(
         .build()
         .map_err(|e: tauri::Error| e.to_string())?;
 
-    protect_overlay_from_capture(&overlay_window);
+    protect_window_from_capture(&overlay_window);
     let _ = overlay_window.show();
     let _ = overlay_window.unminimize();
     let _ = overlay_window.set_focus();
@@ -2187,6 +2187,7 @@ pub async fn restore_main_window(
 ) -> Result<(), String> {
     lock.set_active(false);
     if let Some(main_window) = app.get_webview_window("main") {
+        protect_window_from_capture(&main_window);
         let _ = main_window.set_skip_taskbar(false);
         let _ = main_window.show();
         let _ = main_window.unminimize();
@@ -2208,6 +2209,7 @@ pub async fn restore_main_window(
         .build()
         .map_err(|e: tauri::Error| format!("Failed to create main window: {}", e))?;
 
+    protect_window_from_capture(&main_window);
     let _ = main_window.set_skip_taskbar(false);
     let _ = main_window.show();
     let _ = main_window.unminimize();
@@ -3016,6 +3018,47 @@ pub async fn download_vosk_model(
 }
 
 #[tauri::command]
+pub async fn install_vosk_model_from_zip(
+    app: tauri::AppHandle,
+    archive_path: String,
+    model_id: String,
+    cleanup_model_ids: Option<Vec<String>>,
+) -> Result<String, String> {
+    install_control::reset_cancel();
+    let cleanup_model_ids = cleanup_model_ids.unwrap_or_default();
+    let archive_path = PathBuf::from(archive_path.trim());
+    if archive_path.as_os_str().is_empty() {
+        return Err("Select a Vosk model ZIP archive first.".to_string());
+    }
+    if !archive_path.is_file() {
+        return Err(format!(
+            "Selected Vosk model archive does not exist: {}",
+            archive_path.display()
+        ));
+    }
+    let is_zip = archive_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        return Err("Selected file must be a .zip archive.".to_string());
+    }
+
+    let models_dir = models_base_dir(&app)?;
+    let archive_size = std::fs::metadata(&archive_path).ok().map(|metadata| metadata.len());
+    install_vosk_model_archive(
+        &app,
+        &archive_path,
+        &models_dir,
+        model_id.trim(),
+        true,
+        &cleanup_model_ids,
+        archive_size,
+        5.0,
+    )
+}
+
+#[tauri::command]
 pub async fn ensure_default_stt_assets(
     app: tauri::AppHandle,
     primary_language: String,
@@ -3142,32 +3185,78 @@ async fn download_vosk_model_internal(
         .map_err(|e| format!("Failed to flush Vosk model archive: {}", e))?;
     drop(archive_file);
 
+    let install_result = install_vosk_model_archive(
+        app,
+        &temp_archive_path,
+        &models_dir,
+        model_id,
+        emit_progress,
+        cleanup_model_ids,
+        Some(downloaded),
+        90.0,
+    );
+    let _ = std::fs::remove_file(&temp_archive_path);
+    install_result
+}
+
+fn emit_vosk_model_progress(
+    app: &tauri::AppHandle,
+    bytes_downloaded: u64,
+    content_length: Option<u64>,
+    percent: f32,
+    phase: &str,
+) {
+    let _ = app.emit(
+        "vosk_model_download_progress",
+        VoskModelDownloadProgress {
+            bytes_downloaded,
+            content_length,
+            percent,
+            phase: phase.to_string(),
+        },
+    );
+}
+
+fn install_vosk_model_archive(
+    app: &tauri::AppHandle,
+    archive_path: &Path,
+    models_dir: &Path,
+    model_id: &str,
+    emit_progress: bool,
+    cleanup_model_ids: &[String],
+    archive_size: Option<u64>,
+    extracting_start_percent: f32,
+) -> Result<String, String> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err("Vosk model id is empty.".to_string());
+    }
+    let progress_bytes = archive_size.unwrap_or(0);
     if emit_progress {
-        let _ = app.emit(
-            "vosk_model_download_progress",
-            VoskModelDownloadProgress {
-                bytes_downloaded: downloaded,
-                content_length: Some(downloaded),
-                percent: 90.0,
-                phase: "extracting".to_string(),
-            },
+        emit_vosk_model_progress(
+            app,
+            progress_bytes,
+            archive_size,
+            extracting_start_percent,
+            "extracting",
         );
     }
-
     let extract_dir = models_dir.join(format!(".{}.partial", model_id));
     if extract_dir.exists() {
         std::fs::remove_dir_all(&extract_dir).map_err(|e| e.to_string())?;
     }
     std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
 
-    let archive_file = std::fs::File::open(&temp_archive_path).map_err(|e| {
+    let archive_file = std::fs::File::open(archive_path).map_err(|e| {
         format!(
-            "Failed to open temp archive '{}': {}",
-            temp_archive_path.display(),
+            "Failed to open Vosk model archive '{}': {}",
+            archive_path.display(),
             e
         )
     })?;
-    let mut archive = zip::ZipArchive::new(archive_file).map_err(|e| e.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).map_err(|e| format!("Invalid Vosk model ZIP: {}", e))?;
+    let archive_len = archive.len().max(1);
 
     for i in 0..archive.len() {
         if install_control::is_cancelled() {
@@ -3192,27 +3281,31 @@ async fn download_vosk_model_internal(
             let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
             std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
         }
+        if emit_progress && (i % 12 == 0 || i + 1 == archive_len) {
+            let extracted_ratio = (i + 1) as f32 / archive_len as f32;
+            let percent = extracting_start_percent
+                + ((100.0 - extracting_start_percent) * extracted_ratio);
+            emit_vosk_model_progress(
+                app,
+                progress_bytes,
+                archive_size,
+                percent.min(99.0),
+                "extracting",
+            );
+        }
     }
 
     normalize_extracted_model_layout(&extract_dir)?;
+    validate_vosk_model_layout(&extract_dir)?;
 
     let target_dir = models_dir.join(model_id);
     if target_dir.exists() {
         std::fs::remove_dir_all(&target_dir).map_err(|e| e.to_string())?;
     }
     std::fs::rename(&extract_dir, &target_dir).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&temp_archive_path);
 
     if emit_progress {
-        let _ = app.emit(
-            "vosk_model_download_progress",
-            VoskModelDownloadProgress {
-                bytes_downloaded: downloaded,
-                content_length: Some(downloaded),
-                percent: 100.0,
-                phase: "extracting".to_string(),
-            },
-        );
+        emit_vosk_model_progress(app, progress_bytes, archive_size, 100.0, "extracting");
     }
 
     cleanup_selected_models(&models_dir, cleanup_model_ids, model_id)?;
@@ -3232,6 +3325,23 @@ async fn download_vosk_model_internal(
         .to_str()
         .ok_or_else(|| "Invalid path".to_string())
         .map(String::from)
+}
+
+fn validate_vosk_model_layout(model_dir: &Path) -> Result<(), String> {
+    let has_model_config = model_dir.join("conf").join("model.conf").is_file();
+    let has_acoustic_model = model_dir.join("am").join("final.mdl").is_file()
+        || model_dir.join("final.mdl").is_file();
+    let has_graph = model_dir.join("graph").join("HCLG.fst").is_file()
+        || (model_dir.join("graph").join("HCLr.fst").is_file()
+            && model_dir.join("graph").join("Gr.fst").is_file());
+
+    if has_model_config && has_acoustic_model && has_graph {
+        return Ok(());
+    }
+
+    Err(
+        "Selected ZIP does not look like a Vosk model archive. Download the model ZIP from the links shown in AI Interview and select that file without unpacking it.".to_string(),
+    )
 }
 
 fn models_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {

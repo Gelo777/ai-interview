@@ -2039,6 +2039,140 @@ function LanguageSettings({
     ],
   );
 
+  const installModelVariantFromZip = useCallback(
+    async (language: PrimaryLanguage, variant: SttModelVariant) => {
+      const { isTauri, installVoskModelFromZip, listVoskModels, pickVoskModelZip } =
+        await import("@/lib/tauri");
+      if (!isTauri()) {
+        setError(
+          "Установка модели из ZIP доступна только в desktop helper. Откройте приложение, а не вкладку браузера.",
+        );
+        return false;
+      }
+
+      const runtimeMissing = !readiness.voskRuntimeLoaded;
+      if (runtimeMissing) {
+        const runtimeInstalled = await installLatestRuntime();
+        if (!runtimeInstalled) {
+          return false;
+        }
+      }
+
+      let model = getModelByVariant(models, language, variant);
+      if (!model) {
+        try {
+          const latestModels = await listVoskModels();
+          setModels(latestModels);
+          model = getModelByVariant(latestModels, language, variant);
+        } catch (err: unknown) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Не удалось обновить список языковых моделей.",
+          );
+          return false;
+        }
+      }
+      if (!model) {
+        setError(
+          `${variant === "large" ? "Большая" : "Быстрая"} модель недоступна для языка ${getLanguageLabel(language)}.`,
+        );
+        return false;
+      }
+
+      const archivePath = await pickVoskModelZip();
+      if (!archivePath) {
+        return false;
+      }
+
+      setActiveModelOperation({ language, variant, action: "install" });
+      setError(null);
+      setSuccess(null);
+      setSttInstall({
+        active: true,
+        phase: "model",
+        percent: 5,
+        bytesDownloaded: null,
+        contentLength: model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null,
+        detail: `Устанавливаем ${model.name} из ZIP...`,
+        language,
+        variant,
+      });
+
+      try {
+        await installVoskModelFromZip(
+          archivePath,
+          model.id,
+          (progress: VoskModelDownloadProgress) => {
+            const percent = Math.round(Math.max(0, Math.min(100, progress.percent)));
+            setSttInstall({
+              active: true,
+              phase: "model",
+              percent,
+              bytesDownloaded: progress.bytes_downloaded,
+              contentLength:
+                progress.content_length ??
+                (model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null),
+              detail: `Распаковываем ${model.name} из выбранного ZIP...`,
+              language,
+              variant,
+            });
+          },
+          model.installed_versions.filter((id) => id !== model.id),
+        );
+
+        setSuccess(
+          `${variant === "large" ? "Большая" : "Быстрая"} модель установлена из ZIP для языка ${getLanguageLabel(language)}.`,
+        );
+        return true;
+      } catch (err: unknown) {
+        if (isInstallCancelledError(err)) {
+          setSuccess(`Установка ${variant === "large" ? "большой" : "быстрой"} модели отменена.`);
+          setError(null);
+          return false;
+        }
+        setError(
+          err instanceof Error
+            ? err.message
+            : `Не удалось установить ${variant === "large" ? "большую" : "быструю"} модель из ZIP.`,
+        );
+        return false;
+      } finally {
+        setActiveModelOperation(null);
+        clearSttInstall();
+        await refresh();
+      }
+    },
+    [
+      clearSttInstall,
+      installLatestRuntime,
+      models,
+      readiness.voskRuntimeLoaded,
+      refresh,
+      setSttInstall,
+    ],
+  );
+
+  const openModelDownloadUrl = useCallback(async (url: string) => {
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const { isTauri, openExternalUrl } = await import("@/lib/tauri");
+      if (isTauri()) {
+        await openExternalUrl(url);
+      } else {
+        const opened = window.open(url, "_blank", "noopener,noreferrer");
+        if (!opened) {
+          throw new Error(`Браузер заблокировал открытие ссылки: ${url}`);
+        }
+      }
+      setSuccess("Открыли ссылку на ZIP в браузере.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : `Не удалось открыть ссылку: ${url}`);
+    }
+  }, []);
+
   const removeLargeModel = useCallback(
     async (language: PrimaryLanguage) => {
       const { isTauri, removeVoskModel } = await import("@/lib/tauri");
@@ -2853,6 +2987,36 @@ function LanguageSettings({
                     </Button>
                   )}
                 </div>
+
+                {selectedPrimaryModel !== null && (
+                  <div className="mt-3 rounded-lg border border-border/70 bg-bg-primary/35 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          void openModelDownloadUrl(selectedPrimaryModel.download_url);
+                        }}
+                      >
+                        Скачать ZIP вручную
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          void installModelVariantFromZip(primaryLanguage, primarySttVariant);
+                        }}
+                        disabled={disabled || runtimeInstalling || sttInstall.active}
+                      >
+                        Установить из ZIP
+                      </Button>
+                    </div>
+                    <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
+                      Если встроенная загрузка идет медленно, скачайте архив браузером или менеджером
+                      загрузок, затем выберите этот ZIP здесь. Распаковывать вручную не нужно.
+                    </p>
+                  </div>
+                )}
 
                 {selectedPrimaryModel === null && (
                   <p className="mt-3 text-xs leading-relaxed text-warning">
