@@ -37,16 +37,28 @@ const STT_STOP_COMMAND_TIMEOUT_SECS: u64 = 70;
 const WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD: f32 = 0.010;
 const WHISPER_CHUNK_SILENCE_RMS_THRESHOLD: f32 = 0.0035;
 const PROXY_LICENSE_TIMEOUT_SECS: u64 = 20;
+const SETTINGS_STATE_KEY: &str = "ai-interview-settings";
 
-fn app_window_url(app: &tauri::AppHandle) -> WebviewUrl {
+fn app_window_url(_app: &tauri::AppHandle) -> WebviewUrl {
     #[cfg(debug_assertions)]
     {
-        if let Some(dev_url) = &app.config().build.dev_url {
+        if let Some(dev_url) = &_app.config().build.dev_url {
             return WebviewUrl::External(dev_url.clone());
         }
     }
 
     WebviewUrl::App("index.html".into())
+}
+
+fn overlay_window_url(app: &tauri::AppHandle) -> WebviewUrl {
+    match app_window_url(app) {
+        WebviewUrl::External(mut url) => {
+            url.set_query(Some("aiWindow=overlay"));
+            WebviewUrl::External(url)
+        }
+        WebviewUrl::App(_) => WebviewUrl::App("index.html?aiWindow=overlay".into()),
+        other => other,
+    }
 }
 
 #[derive(Default)]
@@ -1727,14 +1739,49 @@ fn apply_capture_protection_to_window(
 }
 
 pub(crate) fn protect_window_from_capture(window: &tauri::WebviewWindow) {
-    match apply_capture_protection_to_window(window, true) {
-        Ok(()) => log::info!("Capture protection enabled for window '{}'", window.label()),
+    if std::env::var("AI_INTERVIEW_DISABLE_CAPTURE_PROTECTION")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        log::info!(
+            "Capture protection skipped for window '{}' by AI_INTERVIEW_DISABLE_CAPTURE_PROTECTION",
+            window.label()
+        );
+        return;
+    }
+
+    let enabled = read_capture_protection_preference(&window.app_handle());
+
+    match apply_capture_protection_to_window(window, enabled) {
+        Ok(()) => log::info!(
+            "Capture protection {} for window '{}'",
+            if enabled { "enabled" } else { "disabled" },
+            window.label()
+        ),
         Err(err) => log::warn!(
-            "Failed to enable capture protection for window '{}': {}",
+            "Failed to apply capture protection for window '{}': {}",
             window.label(),
             err
         ),
     }
+}
+
+fn read_capture_protection_preference(app: &tauri::AppHandle) -> bool {
+    let Ok(path) = app_state_file_path(app, SETTINGS_STATE_KEY) else {
+        return true;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return true;
+    };
+
+    value
+        .get("state")
+        .and_then(|state| state.get("protectOverlay"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
 }
 
 /// Applies or removes capture protection on a window (by label).
@@ -1748,7 +1795,13 @@ pub fn set_capture_protection_for_window(
         .get_webview_window(&window_label)
         .ok_or_else(|| format!("Window '{}' not found", window_label))?;
 
-    apply_capture_protection_to_window(&window, enabled)
+    apply_capture_protection_to_window(&window, enabled)?;
+    log::info!(
+        "Capture protection {} for window '{}' by user preference",
+        if enabled { "enabled" } else { "disabled" },
+        window.label()
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1850,19 +1903,29 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
     let model_path_string = model_path
         .as_ref()
         .and_then(|path| path.to_str().map(String::from));
+    let model_layout_error = model_path
+        .as_ref()
+        .and_then(|path| validate_vosk_model_layout(path).err());
+    let model_usable = model_path_string.is_some() && model_layout_error.is_none();
 
-    let detail = match (&runtime.available, &model_path_string, &active_model_id) {
-        (true, Some(_), Some(model_id)) => {
+    let detail = match (&runtime.available, &model_path_string, &active_model_id, &model_layout_error) {
+        (_, Some(_), Some(_), Some(error)) => {
+            format!(
+                "Vosk model is incomplete or corrupted. Reinstall the Russian model in Speech settings. {}",
+                error
+            )
+        }
+        (true, Some(_), Some(model_id), None) => {
             format!("Vosk is ready. Active model: {}.", model_id)
         }
-        (false, _, _) => runtime.detail.clone(),
-        (_, None, _) => "Vosk model is not installed. Prepare a Vosk model first.".to_string(),
+        (false, _, _, _) => runtime.detail.clone(),
+        (_, None, _, _) => "Vosk model is not installed. Prepare a Vosk model first.".to_string(),
         _ => "Vosk is not ready.".to_string(),
     };
 
     SttStatus {
-        available: runtime.available && model_path_string.is_some(),
-        model_loaded: runtime.available && model_path_string.is_some(),
+        available: runtime.available && model_usable,
+        model_loaded: runtime.available && model_usable,
         model_path: model_path_string,
         language: active_model_id.unwrap_or_else(|| "unknown".to_string()),
         runtime_library_loaded: runtime.available,
@@ -2096,13 +2159,16 @@ fn friendly_stt_detail(detail: &str) -> String {
         return "Vosk runtime and language model are missing. Install latest stable runtime, then install language models in Language settings.".to_string();
     }
     if lowered.contains("failed to load") {
-        return "Vosk runtime was found, but failed to load. Reinstall latest stable runtime in Language settings.".to_string();
+        if lowered.contains("model") {
+            return "Vosk language model could not be loaded. Reinstall the Russian model in Speech settings.".to_string();
+        }
+        return "Vosk runtime was found, but failed to load. Reinstall latest stable runtime in Speech settings.".to_string();
     }
     if (lowered.contains("model") && lowered.contains("missing"))
         || (lowered.contains("model") && lowered.contains("not found"))
         || lowered.contains("download a model")
     {
-        return "Vosk language model is not available. Install the model in Language settings."
+        return "Vosk language model is not available. Install the Russian Small model in Speech settings."
             .to_string();
     }
     if (lowered.contains("runtime") || lowered.contains("libvosk"))
@@ -2110,7 +2176,7 @@ fn friendly_stt_detail(detail: &str) -> String {
             || lowered.contains("missing")
             || lowered.contains("unloadable"))
     {
-        return "Vosk runtime is not available. Install latest stable runtime in Language settings.".to_string();
+        return "Vosk runtime is not available. Install latest stable runtime in Speech settings.".to_string();
     }
     normalized
         .split(';')
@@ -2141,7 +2207,7 @@ pub async fn create_overlay_window(
         return Ok(());
     }
 
-    let url = app_window_url(&app);
+    let url = overlay_window_url(&app);
 
     let overlay_window = tauri::WebviewWindowBuilder::new(&app, "overlay", url)
         .title("AI Interview — Overlay")

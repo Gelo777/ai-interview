@@ -39,6 +39,8 @@ interface AppState {
     percent: number | null;
     bytesDownloaded: number | null;
     contentLength: number | null;
+    speedBytesPerSecond: number | null;
+    etaSeconds: number | null;
     detail: string;
     language: PrimaryLanguage | null;
     variant: SttModelVariant | null;
@@ -117,6 +119,8 @@ export const useAppStore = create<AppState>()(
         percent: null,
         bytesDownloaded: null,
         contentLength: null,
+        speedBytesPerSecond: null,
+        etaSeconds: null,
         detail: "",
         language: null,
         variant: null,
@@ -165,6 +169,8 @@ export const useAppStore = create<AppState>()(
             percent: null,
             bytesDownloaded: null,
             contentLength: null,
+            speedBytesPerSecond: null,
+            etaSeconds: null,
             detail: "",
             language: null,
             variant: null,

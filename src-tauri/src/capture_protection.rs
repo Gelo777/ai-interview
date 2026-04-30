@@ -14,8 +14,7 @@ pub fn get_capture_protection_status() -> CaptureProtectionStatus {
     CaptureProtectionStatus {
         supported: true,
         level: "supported".to_string(),
-        detail: "macOS — window sharing type exclusion is available. \
-                 On macOS 15+ some browser-based capture may still include the window."
+        detail: "macOS - window sharing type exclusion is available. On macOS 15+ some browser-based capture may still include the window."
             .to_string(),
     }
 }
@@ -25,7 +24,7 @@ pub fn get_capture_protection_status() -> CaptureProtectionStatus {
     CaptureProtectionStatus {
         supported: true,
         level: "supported".to_string(),
-        detail: "Windows — WDA_EXCLUDEFROMCAPTURE display affinity available.".to_string(),
+        detail: "Windows - WDA_EXCLUDEFROMCAPTURE display affinity is available.".to_string(),
     }
 }
 

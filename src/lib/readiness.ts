@@ -40,16 +40,19 @@ export function toFriendlyVoskDetail(detail: string): string {
 
   const lowered = normalized.toLowerCase();
   if (lowered.includes("failed to load")) {
-    return "Не удалось загрузить Vosk runtime. Переустановите его в языковых настройках.";
+    if (lowered.includes("model")) {
+      return "Не удалось загрузить языковую модель Vosk. Переустановите русскую модель в настройках распознавания.";
+    }
+    return "Не удалось загрузить Vosk runtime. Переустановите его в настройках распознавания.";
   }
   if (lowered.includes("model") && lowered.includes("missing")) {
-    return "Не найдена языковая модель Vosk. Установите ее в языковых настройках.";
+    return "Не найдена языковая модель Vosk. Установите русскую модель Small в настройках распознавания.";
   }
   if (
     lowered.includes("runtime") &&
     (lowered.includes("not found") || lowered.includes("missing"))
   ) {
-    return "Не найден Vosk runtime. Установите его в языковых настройках.";
+    return "Не найден Vosk runtime. Установите его в настройках распознавания.";
   }
 
   return normalized.split(/[.;]/)[0] ?? "Vosk недоступен.";

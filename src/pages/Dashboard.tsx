@@ -1,4 +1,4 @@
-﻿import { useState, useCallback } from "react";
+﻿import { useState, useCallback, useRef } from "react";
 import {
   Play,
   AlertTriangle,
@@ -9,10 +9,17 @@ import {
   Download,
   RefreshCw,
   X,
+  CheckCircle,
+  Circle,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { StatusIndicator } from "@/components/ui/StatusIndicator";
+import { AudioQualityCheck } from "@/components/dashboard/AudioQualityCheck";
+import { ScreenShareProtectionCard } from "@/components/dashboard/ScreenShareProtectionCard";
+import { SupportReportCard } from "@/components/dashboard/SupportReportCard";
 import { useAppStore } from "@/stores/app";
 import { useHistoryStore } from "@/stores/history";
 import { useSessionStore } from "@/stores/session";
@@ -21,8 +28,11 @@ import { refreshCloudReadinessNow, refreshLocalReadinessNow } from "@/hooks/useR
 import type { SettingsFocusTarget, SettingsTab } from "@/lib/types";
 import { getSttPerformanceProfileLabel } from "@/lib/sttProfiles";
 import { logError, logInfo, logWarn } from "@/lib/diagnostics";
+import { formatTransferDiagnostics } from "@/lib/installProgress";
+import { applyCaptureProtectionPreference } from "@/lib/captureProtection";
 
 const START_READINESS_TIMEOUT_MS = 8000;
+const SETUP_GUIDE_DISMISSED_KEY = "ai-interview-setup-guide-dismissed-v1";
 
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -83,9 +93,20 @@ export function Dashboard() {
   const primaryLanguage = useSettingsStore((s) => s.primaryLanguage);
   const primarySttVariant = useSettingsStore((s) => s.primarySttVariant);
   const secondarySttVariant = useSettingsStore((s) => s.secondarySttVariant);
+  const protectOverlay = useSettingsStore((s) => s.protectOverlay);
+  const setProtectOverlay = useSettingsStore((s) => s.setProtectOverlay);
   const [starting, setStarting] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [applyingCaptureProtection, setApplyingCaptureProtection] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [captureProtectionError, setCaptureProtectionError] = useState<string | null>(null);
+  const [setupGuideDismissed, setSetupGuideDismissed] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.localStorage.getItem(SETUP_GUIDE_DISMISSED_KEY) === "1";
+  });
+  const audioCheckRef = useRef<HTMLDivElement | null>(null);
 
   const lastSession = sessions[0] ?? null;
   const backgroundModelInstall =
@@ -167,9 +188,48 @@ export function Dashboard() {
     installBlocksInterview ? "идет обязательная установка компонентов распознавания" : null,
   ].filter((item): item is string => Boolean(item));
 
+  const dismissSetupGuide = useCallback(() => {
+    setSetupGuideDismissed(true);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(SETUP_GUIDE_DISMISSED_KEY, "1");
+    }
+  }, []);
+
+  const scrollToAudioCheck = useCallback(() => {
+    audioCheckRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  const handleToggleScreenShareVisibility = useCallback(async () => {
+    const nextProtectOverlay = !protectOverlay;
+    setCaptureProtectionError(null);
+    setProtectOverlay(nextProtectOverlay);
+    setApplyingCaptureProtection(true);
+
+    try {
+      await applyCaptureProtectionPreference(nextProtectOverlay);
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Не удалось переключить видимость при шаринге.";
+      setCaptureProtectionError(detail);
+      logWarn("capture.protection", "Failed to toggle screen sharing visibility", error);
+    } finally {
+      setApplyingCaptureProtection(false);
+    }
+  }, [protectOverlay, setProtectOverlay]);
+
   const sttProfileLabel = getSttPerformanceProfileLabel(
     primarySttVariant,
     secondarySttVariant,
+  );
+  const sttInstallTransferLabel = formatTransferDiagnostics(
+    sttInstall.bytesDownloaded,
+    sttInstall.contentLength,
+    sttInstall.speedBytesPerSecond,
+    sttInstall.etaSeconds,
   );
   const currentAppVersion = appUpdate.currentVersion?.trim() || __APP_VERSION__ || "неизвестно";
   const availableAppVersion = appUpdate.version?.trim() || null;
@@ -238,6 +298,67 @@ export function Dashboard() {
           : () => openSettingsTab("speech", "language-runtime"),
     },
   ] as const;
+
+  const setupSteps = [
+    {
+      title: "Лицензия",
+      description: readiness.apiKey === "granted" ? "Ключ принят." : "Введите ключ из бота.",
+      done: readiness.apiKey === "granted",
+      actionLabel: readiness.apiKey === "granted" ? undefined : "Ввести ключ",
+      onAction:
+        readiness.apiKey === "granted"
+          ? undefined
+          : () => openSettingsTab("llm", "llm-api-key"),
+    },
+    {
+      title: "Голосовой движок",
+      description:
+        readiness.vosk === "granted"
+          ? "Vosk runtime и модель готовы."
+          : "Установите Vosk и русскую модель Small или Large.",
+      done: readiness.vosk === "granted" && !installBlocksInterview,
+      actionLabel: readiness.vosk === "granted" ? undefined : "Настроить STT",
+      onAction:
+        readiness.vosk === "granted"
+          ? undefined
+          : () => openSettingsTab("speech", "language-runtime"),
+    },
+    {
+      title: "Микрофон",
+      description:
+        permissions.microphone === "granted"
+          ? "Микрофон доступен."
+          : "Выберите или проверьте устройство записи.",
+      done: permissions.microphone === "granted",
+      actionLabel: permissions.microphone === "granted" ? undefined : "Настроить",
+      onAction:
+        permissions.microphone === "granted"
+          ? undefined
+          : () => openSettingsTab("audio", "audio-devices"),
+    },
+    {
+      title: "Системный звук",
+      description:
+        permissions.systemAudio === "granted"
+          ? "Loopback захват доступен."
+          : "Проверьте устройство вывода и системный звук.",
+      done: permissions.systemAudio === "granted",
+      actionLabel: permissions.systemAudio === "granted" ? undefined : "Настроить",
+      onAction:
+        permissions.systemAudio === "granted"
+          ? undefined
+          : () => openSettingsTab("audio", "audio-devices"),
+    },
+    {
+      title: "Тест качества",
+      description: "Запишите WAV и послушайте микрофон/системный звук.",
+      done: allReady,
+      actionLabel: "Записать тест",
+      onAction: scrollToAudioCheck,
+    },
+  ];
+
+  const shouldShowSetupGuide = !setupGuideDismissed || !allReady;
 
   const shouldShowUpdateCard =
     appUpdate.enabled &&
@@ -343,6 +464,14 @@ export function Dashboard() {
         </Card>
       )}
 
+      {shouldShowSetupGuide && (
+        <SetupGuideCard
+          steps={setupSteps}
+          allReady={allReady}
+          onDismiss={dismissSetupGuide}
+        />
+      )}
+
       <section className="grid gap-6 xl:grid-cols-[1.45fr_0.95fr]">
         <Card className="relative overflow-hidden p-7">
           <div className="pointer-events-none absolute right-0 top-0 h-44 w-44 rounded-full bg-accent/15 blur-3xl" />
@@ -375,10 +504,32 @@ export function Dashboard() {
               >
                 Ввести ключ
               </Button>
+              <Button
+                variant={protectOverlay ? "secondary" : "primary"}
+                size="lg"
+                onClick={() => void handleToggleScreenShareVisibility()}
+                disabled={applyingCaptureProtection}
+                icon={
+                  applyingCaptureProtection ? (
+                    <RefreshCw className="h-5 w-5 animate-spin" />
+                  ) : protectOverlay ? (
+                    <Eye className="h-5 w-5" />
+                  ) : (
+                    <EyeOff className="h-5 w-5" />
+                  )
+                }
+              >
+                {protectOverlay ? "Показать при шаринге" : "Скрыть при шаринге"}
+              </Button>
             </div>
             {startError && (
               <div className="mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
                 {startError}
+              </div>
+            )}
+            {captureProtectionError && (
+              <div className="mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
+                {captureProtectionError}
               </div>
             )}
           </div>
@@ -441,6 +592,11 @@ export function Dashboard() {
                 {sttInstall.detail}
                 {sttInstall.percent !== null ? ` ${sttInstall.percent}%` : ""}
               </div>
+              {sttInstallTransferLabel && (
+                <div className="mt-1 text-xs text-success/80">
+                  {sttInstallTransferLabel}
+                </div>
+              )}
               <div className="mt-2 text-xs text-text-muted">
                 Интервью можно запускать уже сейчас. Пока скачивается большая модель, приложение работает на базовой.
               </div>
@@ -475,6 +631,15 @@ export function Dashboard() {
       </Card>
 
       <div className="grid gap-6">
+        <div ref={audioCheckRef}>
+          <AudioQualityCheck />
+        </div>
+
+        <div className="grid gap-6 xl:grid-cols-2">
+          <ScreenShareProtectionCard />
+          <SupportReportCard />
+        </div>
+
         <Card className="p-6">
           <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">Последняя сессия</div>
           {!lastSession ? (
@@ -508,6 +673,93 @@ export function Dashboard() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function SetupGuideCard({
+  steps,
+  allReady,
+  onDismiss,
+}: {
+  steps: Array<{
+    title: string;
+    description: string;
+    done: boolean;
+    actionLabel?: string;
+    onAction?: () => void;
+  }>;
+  allReady: boolean;
+  onDismiss: () => void;
+}) {
+  const completedCount = steps.filter((step) => step.done).length;
+
+  return (
+    <Card className="border-accent/25 bg-[linear-gradient(180deg,rgba(87,208,255,0.12),rgba(20,31,47,0.94))] p-6">
+      <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-accent/80">
+            Первый запуск
+          </div>
+          <h2 className="mt-2 text-2xl font-semibold text-text-primary">
+            Доведем helper до рабочего состояния
+          </h2>
+          <p className="mt-2 max-w-3xl text-sm leading-7 text-text-secondary">
+            Это короткий чеклист: лицензия, Vosk, микрофон, системный звук и тестовая запись.
+            После него пользователь понимает, что именно готово, а не просто ждет.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs text-text-secondary">
+            {completedCount}/{steps.length} шагов
+          </div>
+          {allReady && (
+            <Button variant="secondary" size="sm" onClick={onDismiss}>
+              Скрыть чеклист
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-3 lg:grid-cols-5">
+        {steps.map((step, index) => (
+          <div
+            key={step.title}
+            className={`rounded-2xl border p-4 ${
+              step.done
+                ? "border-success/25 bg-success-muted/50"
+                : "border-white/10 bg-white/[0.035]"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[11px] uppercase tracking-[0.14em] text-text-muted">
+                Шаг {index + 1}
+              </div>
+              {step.done ? (
+                <CheckCircle className="h-4 w-4 text-success" />
+              ) : (
+                <Circle className="h-4 w-4 text-warning" />
+              )}
+            </div>
+            <div className="mt-3 text-sm font-semibold text-text-primary">
+              {step.title}
+            </div>
+            <div className="mt-1 min-h-[42px] text-xs leading-relaxed text-text-muted">
+              {step.description}
+            </div>
+            {step.actionLabel && step.onAction && (
+              <button
+                type="button"
+                onClick={step.onAction}
+                className="mt-3 rounded-full border border-white/12 px-3 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary transition-colors hover:border-accent/40 hover:text-text-primary"
+              >
+                {step.actionLabel}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 

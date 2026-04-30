@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { useAppStore } from "@/stores/app";
-import { formatTransferSize } from "@/lib/installProgress";
+import { formatTransferDiagnostics } from "@/lib/installProgress";
 import type { AppView } from "@/lib/types";
 
 const navItems: { id: AppView; label: string; icon: typeof LayoutDashboard }[] = [
@@ -27,10 +27,24 @@ export function Sidebar() {
     clearSttInstallQueue,
   } = useAppStore();
   const [cancelingInstall, setCancelingInstall] = useState(false);
-  const installTransferLabel = formatTransferSize(
+  const installTransferLabel = formatTransferDiagnostics(
     sttInstall.bytesDownloaded,
     sttInstall.contentLength,
+    sttInstall.speedBytesPerSecond,
+    sttInstall.etaSeconds,
   );
+  const installPercentLabel =
+    sttInstall.percent === null
+      ? "подготовка"
+      : `${Math.max(0, Math.min(100, Math.round(sttInstall.percent)))}%`;
+  const installPhaseLabel =
+    sttInstall.phase === "runtime"
+      ? "Vosk runtime"
+      : sttInstall.variant === "large"
+        ? "Large model"
+        : sttInstall.variant === "small"
+          ? "Small model"
+          : "Vosk";
 
   const handleCancelInstall = async () => {
     clearSttInstallQueue();
@@ -131,6 +145,10 @@ export function Sidebar() {
             <div className="text-[10px] leading-relaxed text-warning">
               {sttInstall.detail || "Устанавливаем компоненты Vosk..."}
             </div>
+            <div className="flex items-center justify-between gap-2 rounded-xl bg-black/15 px-2.5 py-1.5 text-[10px] text-warning/90">
+              <span>{installPhaseLabel}</span>
+              <span>{installPercentLabel}</span>
+            </div>
             <div className="h-1.5 overflow-hidden rounded-full bg-black/20">
               <div
                 className="h-full bg-warning transition-all duration-200"
@@ -150,6 +168,10 @@ export function Sidebar() {
                 При большой модели некоторое время может быть 0% — это нормально.
               </div>
             )}
+            <div className="text-[10px] leading-relaxed text-warning/90">
+              Если загрузка большой модели идет слишком медленно, откройте Настройки / Распознавание
+              и используйте “Скачать ZIP вручную”.
+            </div>
             {sttInstallQueue.length > 0 && (
               <div className="text-[10px] text-warning/90">
                 В очереди: {sttInstallQueue.length}

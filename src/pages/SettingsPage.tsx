@@ -28,7 +28,11 @@ import { useDiagnosticsStore } from "@/stores/diagnostics";
 import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
 import { useApiKeyValidation } from "@/hooks/useApiKeyValidation";
 import { refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
-import { formatTransferSize } from "@/lib/installProgress";
+import {
+  createTransferProgressTracker,
+  formatTransferDiagnostics,
+  updateTransferProgressTracker,
+} from "@/lib/installProgress";
 import { APP_LANGUAGE_OPTIONS, getLanguageLabel } from "@/lib/languages";
 import {
   buildDiagnosticsReport,
@@ -1847,12 +1851,15 @@ function LanguageSettings({
     setError(null);
     setSuccess(null);
     setRuntimeNetworkHint(null);
+    const runtimeProgressTracker = createTransferProgressTracker();
     setSttInstall({
       active: true,
       phase: "runtime",
       percent: 0,
       bytesDownloaded: null,
       contentLength: null,
+      speedBytesPerSecond: null,
+      etaSeconds: null,
       detail: "Устанавливаем последнюю стабильную версию Vosk runtime...",
       language: null,
       variant: null,
@@ -1861,6 +1868,11 @@ function LanguageSettings({
     try {
       await installVoskRuntime(undefined, (progress) => {
         const percent = Math.round(progress.percent);
+        const metrics = updateTransferProgressTracker(
+          runtimeProgressTracker,
+          progress.bytes_downloaded,
+          progress.content_length,
+        );
         setRuntimeInstallProgress(percent);
         setSttInstall({
           active: true,
@@ -1868,6 +1880,8 @@ function LanguageSettings({
           percent,
           bytesDownloaded: progress.bytes_downloaded,
           contentLength: progress.content_length,
+          speedBytesPerSecond: metrics.speedBytesPerSecond,
+          etaSeconds: metrics.etaSeconds,
           detail:
             progress.phase === "downloading"
               ? "Скачиваем последнюю стабильную версию Vosk runtime..."
@@ -1961,12 +1975,15 @@ function LanguageSettings({
       setActiveModelOperation({ language, variant, action: "install" });
       setError(null);
       setSuccess(null);
+      const modelProgressTracker = createTransferProgressTracker();
       setSttInstall({
         active: true,
         phase: "model",
         percent: 0,
         bytesDownloaded: null,
         contentLength: null,
+        speedBytesPerSecond: null,
+        etaSeconds: null,
         detail: `Устанавливаем ${model.name}...`,
         language,
         variant,
@@ -1990,12 +2007,21 @@ function LanguageSettings({
               );
             }
             const percent = Math.round(Math.max(0, Math.min(100, computedPercent)));
+            const estimatedContentLength =
+              progress.content_length ?? (model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null);
+            const metrics = updateTransferProgressTracker(
+              modelProgressTracker,
+              progress.bytes_downloaded,
+              estimatedContentLength,
+            );
             setSttInstall({
               active: true,
               phase: "model",
               percent,
               bytesDownloaded: progress.bytes_downloaded,
-              contentLength: progress.content_length,
+              contentLength: estimatedContentLength,
+              speedBytesPerSecond: metrics.speedBytesPerSecond,
+              etaSeconds: metrics.etaSeconds,
               detail:
                 progress.phase === "downloading"
                   ? `Скачиваем ${model.name}...`
@@ -2088,12 +2114,15 @@ function LanguageSettings({
       setActiveModelOperation({ language, variant, action: "install" });
       setError(null);
       setSuccess(null);
+      const zipProgressTracker = createTransferProgressTracker();
       setSttInstall({
         active: true,
         phase: "model",
         percent: 5,
         bytesDownloaded: null,
         contentLength: model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null,
+        speedBytesPerSecond: null,
+        etaSeconds: null,
         detail: `Устанавливаем ${model.name} из ZIP...`,
         language,
         variant,
@@ -2105,14 +2134,21 @@ function LanguageSettings({
           model.id,
           (progress: VoskModelDownloadProgress) => {
             const percent = Math.round(Math.max(0, Math.min(100, progress.percent)));
+            const estimatedContentLength =
+              progress.content_length ?? (model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null);
+            const metrics = updateTransferProgressTracker(
+              zipProgressTracker,
+              progress.bytes_downloaded,
+              estimatedContentLength,
+            );
             setSttInstall({
               active: true,
               phase: "model",
               percent,
               bytesDownloaded: progress.bytes_downloaded,
-              contentLength:
-                progress.content_length ??
-                (model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null),
+              contentLength: estimatedContentLength,
+              speedBytesPerSecond: metrics.speedBytesPerSecond,
+              etaSeconds: metrics.etaSeconds,
               detail: `Распаковываем ${model.name} из выбранного ZIP...`,
               language,
               variant,
@@ -2382,6 +2418,8 @@ function LanguageSettings({
       percent: 0,
       bytesDownloaded: null,
       contentLength: null,
+      speedBytesPerSecond: null,
+      etaSeconds: null,
       detail: readiness.voskRuntimeLoaded
         ? "Проверяем русскую модель Vosk..."
         : "Запускаем установку Vosk runtime...",
@@ -2603,9 +2641,11 @@ function LanguageSettings({
           : selectedPrimaryModel === null
             ? "Недоступна"
           : "Нужно установить";
-  const activeInstallTransferLabel = formatTransferSize(
+  const activeInstallTransferLabel = formatTransferDiagnostics(
     sttInstall.bytesDownloaded,
     sttInstall.contentLength,
+    sttInstall.speedBytesPerSecond,
+    sttInstall.etaSeconds,
   );
   const activeInstallTitle =
     sttInstall.phase === "runtime"

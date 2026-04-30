@@ -17,6 +17,11 @@ import type { PrimaryLanguage, SttModelVariant } from "@/lib/types";
 import { resolveLatestStableRuntimeVersion } from "@/lib/runtimeVersion";
 import type { AppUpdateProgressEvent } from "@/lib/tauri";
 import { logInfo, logWarn } from "@/lib/diagnostics";
+import {
+  createTransferProgressTracker,
+  updateTransferProgressTracker,
+} from "@/lib/installProgress";
+import { applyCaptureProtectionPreference } from "@/lib/captureProtection";
 
 function resolveInstalledModelId(model: {
   id: string;
@@ -47,6 +52,11 @@ function detectCurrentTauriWindowLabel(): string | null {
     return null;
   }
 
+  const urlLabel = new URL(window.location.href).searchParams.get("aiWindow");
+  if (urlLabel === "main" || urlLabel === "overlay") {
+    return urlLabel;
+  }
+
   const internals = window as unknown as {
     __TAURI_INTERNALS__?: {
       metadata?: {
@@ -73,6 +83,7 @@ export default function App() {
   const primarySttVariant = useSettingsStore((s) => s.primarySttVariant);
   const secondarySttVariant = useSettingsStore((s) => s.secondarySttVariant);
   const historyRetentionDays = useSettingsStore((s) => s.historyRetentionDays);
+  const protectOverlay = useSettingsStore((s) => s.protectOverlay);
   const setSttInstall = useAppStore((s) => s.setSttInstall);
   const clearSttInstall = useAppStore((s) => s.clearSttInstall);
   const setReadiness = useAppStore((s) => s.setReadiness);
@@ -93,7 +104,8 @@ export default function App() {
         logInfo("window.detect", "Detected main window from internals");
         return false;
       }
-      return null;
+      logWarn("window.detect", "Window label was not available on first render, assuming main window");
+      return false;
     },
   );
   const updateDownloadRef = useRef<{ downloaded: number; total: number | null }>({
@@ -156,19 +168,43 @@ export default function App() {
 
   useEffect(() => {
     if (!isTauri() || isOverlayWindow !== null) return;
+    let cancelled = false;
+    const fallbackTimeoutId = window.setTimeout(() => {
+      if (cancelled) {
+        return;
+      }
+      logWarn("window.detect", "Window label detection timed out, falling back to main window");
+      setIsOverlayWindow(false);
+    }, 1200);
+
+    const finish = (value: boolean) => {
+      if (cancelled) {
+        return;
+      }
+      window.clearTimeout(fallbackTimeoutId);
+      setIsOverlayWindow(value);
+    };
+
     const fromInternals = detectCurrentTauriWindowLabel();
     if (fromInternals) {
-      setIsOverlayWindow(fromInternals === "overlay");
+      finish(fromInternals === "overlay");
       return;
     }
+
     import("@tauri-apps/api/webviewWindow")
       .then(({ getCurrentWebviewWindow }) => {
-        setIsOverlayWindow(getCurrentWebviewWindow().label === "overlay");
+        finish(getCurrentWebviewWindow().label === "overlay");
       })
       .catch((error) => {
         logWarn("window.detect", "Failed to detect current Tauri window label", error);
         console.warn("Failed to detect current Tauri window label:", error);
+        finish(false);
       });
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fallbackTimeoutId);
+    };
   }, [isOverlayWindow]);
 
   useEffect(() => {
@@ -181,6 +217,24 @@ export default function App() {
       document.body.classList.remove("overlay-window");
     };
   }, [isOverlayWindow]);
+
+  useEffect(() => {
+    if (!isTauri() || isOverlayWindow === null) {
+      return;
+    }
+
+    applyCaptureProtectionPreference(protectOverlay)
+      .then(() => {
+        logInfo("capture.protection", "Capture protection preference applied", {
+          enabled: protectOverlay,
+          windowType: isOverlayWindow ? "overlay" : "main",
+        });
+      })
+      .catch((error) => {
+        logWarn("capture.protection", "Failed to apply capture protection preference", error);
+        console.warn("Failed to apply capture protection preference:", error);
+      });
+  }, [isOverlayWindow, protectOverlay]);
 
   const autoBaselineKeyRef = useRef<string>("");
   useEffect(() => {
@@ -242,12 +296,15 @@ export default function App() {
         const runtimeNeedsInstall = !sttStatus.runtime_library_loaded;
 
         if (runtimeNeedsInstall) {
+          const runtimeProgressTracker = createTransferProgressTracker();
           setSttInstall({
             active: true,
             phase: "runtime",
             percent: 0,
             bytesDownloaded: null,
             contentLength: null,
+            speedBytesPerSecond: null,
+            etaSeconds: null,
             detail: "Устанавливаем Vosk runtime...",
             language: null,
             variant: null,
@@ -256,12 +313,19 @@ export default function App() {
             if (cancelled) {
               return;
             }
+            const metrics = updateTransferProgressTracker(
+              runtimeProgressTracker,
+              progress.bytes_downloaded,
+              progress.content_length,
+            );
             setSttInstall({
               active: true,
               phase: "runtime",
               percent: Math.round(progress.percent),
               bytesDownloaded: progress.bytes_downloaded,
               contentLength: progress.content_length,
+              speedBytesPerSecond: metrics.speedBytesPerSecond,
+              etaSeconds: metrics.etaSeconds,
               detail:
                 progress.phase === "downloading"
                   ? "Скачиваем Vosk runtime..."
@@ -329,11 +393,14 @@ export default function App() {
             percent: Math.round((index / total) * 100),
             bytesDownloaded: null,
             contentLength: null,
+            speedBytesPerSecond: null,
+            etaSeconds: null,
             detail: `Подготавливаем базовую модель ${small.name} (${step}/${total})...`,
             language: small.language as PrimaryLanguage,
             variant: "small",
           });
 
+          const modelProgressTracker = createTransferProgressTracker();
           await downloadVoskModel(
             small.download_url,
             small.id,
@@ -356,12 +423,21 @@ export default function App() {
               const overallPercent = Math.round(
                 ((index + Math.max(0, Math.min(100, itemPercent)) / 100) / total) * 100,
               );
+              const estimatedContentLength =
+                progress.content_length ?? (small.size_mb > 0 ? small.size_mb * 1024 * 1024 : null);
+              const metrics = updateTransferProgressTracker(
+                modelProgressTracker,
+                progress.bytes_downloaded,
+                estimatedContentLength,
+              );
               setSttInstall({
                 active: true,
                 phase: "model",
                 percent: overallPercent,
                 bytesDownloaded: progress.bytes_downloaded,
-                contentLength: progress.content_length,
+                contentLength: estimatedContentLength,
+                speedBytesPerSecond: metrics.speedBytesPerSecond,
+                etaSeconds: metrics.etaSeconds,
                 detail:
                   progress.phase === "downloading"
                     ? `Скачиваем базовую модель ${small.name} (${step}/${total})...`

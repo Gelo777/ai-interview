@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+﻿import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Send,
   Scissors,
@@ -195,6 +195,36 @@ function isSttAlreadyStoppedDetail(detail: string): boolean {
   );
 }
 
+function isVoskModelStartupDetail(detail: string): boolean {
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("vosk failed to load model") ||
+    normalized.includes("vosk model is not installed") ||
+    (normalized.includes("языков") && normalized.includes("модель") && normalized.includes("vosk"))
+  );
+}
+
+function isVoskRuntimeStartupDetail(detail: string): boolean {
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("failed to load vosk runtime") ||
+    normalized.includes("vosk runtime") ||
+    normalized.includes("libvosk")
+  );
+}
+
+function strictStartupActionHint(detail: string): string {
+  if (isVoskModelStartupDetail(detail)) {
+    return "Откройте Настройки -> Распознавание, выберите профиль Small и переустановите русскую модель. Если модель уже отмечена как установленная, удалите ее и установите заново.";
+  }
+
+  if (isVoskRuntimeStartupDetail(detail)) {
+    return "Откройте Настройки -> Распознавание и нажмите установку Vosk runtime, затем перезапустите аудио.";
+  }
+
+  return "Исправьте выбранные микрофон и системный звук в настройках.";
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
@@ -221,13 +251,13 @@ function toFriendlySttStartupError(error: unknown): string {
     return "Выбранный динамик или устройство вывода недоступно. Проверьте настройки аудио.";
   }
   if (normalized.includes("vosk model is not installed")) {
-    return "Языковая модель Vosk не установлена. Откройте Настройки -> Язык.";
+    return "Языковая модель Vosk не установлена. Откройте Настройки -> Распознавание и установите русскую модель Small.";
   }
   if (normalized.includes("failed to load vosk runtime")) {
-    return "Не удалось загрузить Vosk runtime. Переустановите его в настройках языка.";
+    return "Не удалось загрузить Vosk runtime. Переустановите его в настройках распознавания.";
   }
   if (normalized.includes("vosk failed to load model")) {
-    return "Не удалось загрузить языковую модель Vosk. Попробуйте переустановить ее.";
+    return "Не удалось загрузить языковую модель Vosk. Переустановите русскую модель в настройках распознавания.";
   }
   if (normalized.includes("stt session is already running")) {
     return "Сессия распознавания уже запущена.";
@@ -309,6 +339,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const [aiPanelAtBottom, setAiPanelAtBottom] = useState(true);
   const [lastLlmError, setLastLlmError] = useState<string | null>(null);
   const [responseExpanded, setResponseExpanded] = useState(false);
+  const [showFullTranscript, setShowFullTranscript] = useState(false);
   const [copiedResponse, setCopiedResponse] = useState(false);
   const [isEndingInterview, setIsEndingInterview] = useState(false);
   const [activeSttLanguage, setActiveSttLanguage] = useState<PrimaryLanguage>(
@@ -685,7 +716,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: `Жёсткий режим аудио: запуск остановлен (${firstAttemptDetail}). Исправьте выбранные устройства в настройках.`,
+          text: `Жёсткий режим аудио: запуск остановлен (${firstAttemptDetail}). ${strictStartupActionHint(firstAttemptDetail)}`,
           isFinal: true,
         });
         setSttStatusText(`Жёсткий режим: ${firstAttemptDetail}`);
@@ -1571,6 +1602,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         transcript,
         interviewContext: settings.interviewContext,
         screenshotMode: withScreenshot,
+        manualQuestion: manualQuestionText,
       });
       let imageBase64Png: string | undefined;
 
@@ -1615,7 +1647,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
           if (screenshotBase64 !== null) {
             userPrompt +=
-              "\n\nЗадача по скриншоту: сначала определи намерение. Если видна формулировка дописать/implement/complete/solve/написать функцию - допиши решение. Если виден stack trace или ошибка - помоги отладить. Если есть только код без явной задачи - сделай code review. Если это не код - кратко реши задачу или объясни, что делать.";
+              "\n\nЗадача по скриншоту: обязательно выполни routing перед ответом. Ручная просьба пользователя важнее OCR/изображения. Если в ручном вопросе или на скриншоте просят дописать/implement/complete/solve/fix/написать функцию/реализовать метод - режим LIVE_CODING, не CODE_REVIEW. Если виден stack trace, failing test или ошибка - DEBUG. Если только код без явной задачи - CODE_REVIEW. Если это не код - THEORY.";
             if (settings.imageHandlingMode === "send_image") {
               imageBase64Png = screenshotBase64;
               userPrompt += "\n\nК запросу приложен скриншот экрана с кодом или задачей.";
@@ -2072,12 +2104,17 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
   const hasQuestionToSend =
     contextBuffer.length > 0 || manualQuestion.trim().length > 0;
+  const visibleMessages = showFullTranscript ? messages : messages.slice(-4);
   const helperRootClassName = isEmbeddedMode
     ? "flex h-full min-h-0 w-full flex-col bg-black/20 text-zinc-100"
     : "h-screen w-screen flex flex-col bg-black/35 text-zinc-100 backdrop-blur-[1px]";
   const newMessagesButtonClassName = isEmbeddedMode
     ? "absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-900/95 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg transition-colors hover:bg-zinc-800"
     : "fixed bottom-36 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-900/95 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg transition-colors hover:bg-zinc-800";
+  const chatAreaClassName =
+    lastLlmResponse && !showFullTranscript
+      ? "max-h-36 overflow-y-auto px-3 py-2 space-y-2 relative shrink-0 border-b border-zinc-800/70 bg-black/10"
+      : "flex-1 overflow-y-auto px-3 py-3 space-y-2.5 relative";
 
   return (
     <div className={helperRootClassName}>
@@ -2108,6 +2145,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         </div>
 
         <div className="flex items-center gap-1.5">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowFullTranscript((current) => !current)}
+          >
+            {showFullTranscript ? "Компактно" : "Транскрипт"}
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -2151,7 +2195,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       <div
         ref={chatContainerRef}
         onScroll={handleChatScroll}
-        className="flex-1 overflow-y-auto px-3 py-3 space-y-2.5 relative"
+        className={chatAreaClassName}
       >
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full">
@@ -2182,7 +2226,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           </div>
         )}
 
-        {messages.map((msg) => (
+        {!showFullTranscript && messages.length > visibleMessages.length && (
+          <div className="text-center text-[10px] text-zinc-500">
+            Показаны последние {visibleMessages.length} фразы. Полный транскрипт раскрывается вверху.
+          </div>
+        )}
+
+        {visibleMessages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} />
         ))}
 
@@ -2243,7 +2293,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           <div
             ref={aiPanelRef}
             onScroll={handleAiPanelScroll}
-            className={`px-3 py-2 overflow-y-auto bg-black/20 ${responseExpanded ? "max-h-[55vh]" : "max-h-40"}`}
+            className={`px-3 py-2 overflow-y-auto bg-black/20 ${responseExpanded ? "max-h-[62vh]" : "max-h-[46vh]"}`}
           >
             <p className="text-xs text-zinc-100 whitespace-pre-wrap leading-relaxed select-text">
               {lastLlmResponse.text || (
@@ -2485,27 +2535,99 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${pad(h)}:${pad(m % 60)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
 }
 
+type InterviewIntentMode = "LIVE_CODING" | "DEBUG" | "CODE_REVIEW" | "THEORY" | "AUTO";
+
+function inferManualIntentMode(text: string): { mode: InterviewIntentMode; reason: string } {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return { mode: "AUTO", reason: "ручной вопрос не задан" };
+  }
+
+  if (
+    /\b(review|code review)\b|ревью|проверь|проверить|найди баг|найти баг|найди ошибки|найти ошибки|оцени код/.test(
+      normalized,
+    )
+  ) {
+    return { mode: "CODE_REVIEW", reason: "ручная просьба просит проверить код" };
+  }
+
+  if (
+    /допиш|напиши код|напиши функцию|написать функцию|реализу|реализовать|реши|решить|добавь|добавить|\b(implement|complete|solve|fix)\b/.test(
+      normalized,
+    )
+  ) {
+    return { mode: "LIVE_CODING", reason: "ручная просьба просит написать или дописать код" };
+  }
+
+  if (
+    /почему|не работает|падает|ошибк|stack|trace|exception|traceback|debug|отлад|failing test|compiler error/.test(
+      normalized,
+    )
+  ) {
+    return { mode: "DEBUG", reason: "ручная просьба описывает ошибку или поломку" };
+  }
+
+  return { mode: "AUTO", reason: "явного режима в ручном вопросе нет" };
+}
+
 function buildInterviewPrompt({
   transcript,
   interviewContext,
   screenshotMode = false,
+  manualQuestion = "",
 }: {
   transcript: string;
   interviewContext: string;
   screenshotMode?: boolean;
+  manualQuestion?: string;
 }): string {
   const normalizedContext = interviewContext.trim();
   const contextBlock = normalizedContext
     ? `Контекст интервью:\n${normalizedContext}\n\n`
     : "Контекст интервью:\nТехническое собеседование по разработке программного обеспечения.\n\n";
-  const screenshotBlock = screenshotMode
-    ? "Режим скриншота:\n- сначала определи намерение по тексту на скриншоте и ручному вопросу;\n- если есть явная формулировка дописать/implement/complete/solve/fix/написать функцию - реши задачу и дай минимальный код;\n- если виден stack trace, ошибка или failing test - помоги отладить и назови причину;\n- если есть только код без явной задачи - сделай code review: баги, риски, edge cases и конкретные правки;\n- если это не код, реши задачу на скриншоте как практическую подсказку для собеседования.\n\n"
+  const manualIntent = inferManualIntentMode(manualQuestion);
+  const manualBlock = manualQuestion.trim()
+    ? `Ручная просьба пользователя:\n${manualQuestion.trim()}\n\nПредварительный routing по ручной просьбе: ${manualIntent.mode} (${manualIntent.reason}). Если это не AUTO, считай его приоритетнее OCR и изображения.\n\n`
     : "";
-  const finalInstruction = screenshotMode
-    ? "Проанализируй скриншот и текущий контекст. Сначала выбери режим: live coding, debug, code review или теория; затем дай короткий конкретный ответ."
-    : "Дай короткую и практичную подсказку по текущему вопросу.";
 
-  return `${contextBlock}Важно:\n- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;\n- если слово распознано неточно, интерпретируй его в пользу технического смысла;\n- не пиши академические определения и длинные теоретические абзацы;\n- ответ должен быть прикладным и пригодным для устного ответа на собеседовании.\n\n${screenshotBlock}Формат ответа строго:\n1) Суть (1-2 короткие фразы).\n2) Что сказать вслух (готовая формулировка до 2 предложений).\n3) Если это live coding - минимальное решение или недостающий фрагмент кода.\n4) Если это debug - причина ошибки и конкретная правка.\n5) Если это code review - баги/риски, что исправить, минимальный патч или пример.\n\nТранскрипт интервью:\n${transcript}\n\n${finalInstruction}`;
+  const intentRules = `Routing перед ответом:
+1. Сначала выбери ровно один режим: LIVE_CODING, DEBUG, CODE_REVIEW или THEORY.
+2. Приоритет источников: ручная просьба пользователя > явная формулировка на скриншоте/OCR > ошибка/stack trace > просто видимый код > общий разговор.
+3. LIVE_CODING: пользователь просит написать, дописать, implement, complete, solve, fix, реализовать метод, добавить фрагмент, решить алгоритмическую задачу. В этом режиме не делай ревью, сразу дай решение.
+4. DEBUG: виден stack trace, exception, failing test, compiler/runtime error, "почему не работает", "падает", "разберись с ошибкой". Дай причину и конкретную правку.
+5. CODE_REVIEW: пользователь просит ревью/проверку/найти баги или на скриншоте только код без явной задачи и без ошибки. Дай риски и минимальный патч.
+6. THEORY: вопрос без кода: концепция, архитектура, технология, trade-offs, устная формулировка.
+7. Если на скриншоте есть код и слова "implement/complete/solve/fix/дописать/написать функцию", это LIVE_CODING даже если код выглядит как кандидат для ревью.
+8. Если ручная просьба противоречит скриншоту, выполняй ручную просьбу.
+
+Примеры routing:
+- "допиши функцию twoSum" + код => LIVE_CODING.
+- "почему падает этот тест?" + stack trace => DEBUG.
+- "проверь этот код" + код => CODE_REVIEW.
+- только код без задачи => CODE_REVIEW.
+- "что такое индексы в БД?" => THEORY.`;
+
+  const screenshotBlock = screenshotMode
+    ? `Режим скриншота:
+- Используй изображение/OCR как главный источник задачи.
+- Не делай code review, если на скриншоте или в ручном вопросе просят дописать, исправить или решить.
+- Если OCR и изображение расходятся, доверься смыслу видимого интерфейса и формулировке пользователя.
+- Если задача неоднозначна, назови выбранный режим в первой строке и дай самое полезное действие.\n\n`
+    : "";
+
+  return `${contextBlock}${manualBlock}Важно:
+- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;
+- если слово распознано неточно, интерпретируй его в пользу технического смысла;
+- не пиши академические определения и длинные теоретические абзацы;
+- ответ должен быть прикладным и пригодным для устного ответа на собеседовании;
+- отвечай кратко, но с конкретикой: код, причина, патч или готовая формулировка.\n\n${intentRules}\n\n${screenshotBlock}Формат ответа строго:
+1) Режим: LIVE_CODING / DEBUG / CODE_REVIEW / THEORY.
+2) Суть: 1-2 короткие фразы.
+3) Что сказать вслух: готовая формулировка до 2 предложений.
+4) Если LIVE_CODING: минимальное решение или недостающий фрагмент кода.
+5) Если DEBUG: причина ошибки и конкретная правка.
+6) Если CODE_REVIEW: баги/риски и минимальный патч.
+7) Если THEORY: короткое объяснение и практический пример.\n\nТранскрипт интервью:\n${transcript}\n\nДай ответ по выбранному режиму.`;
 }
 
 async function captureScreenshotAsBase64Png(): Promise<string> {

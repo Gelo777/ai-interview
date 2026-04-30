@@ -16,10 +16,10 @@ mod whisper_stt_runtime;
 
 use tauri::{Emitter, Manager};
 
-fn app_window_url(app: &tauri::AppHandle) -> tauri::WebviewUrl {
+fn app_window_url(_app: &tauri::AppHandle) -> tauri::WebviewUrl {
     #[cfg(debug_assertions)]
     {
-        if let Some(dev_url) = &app.config().build.dev_url {
+        if let Some(dev_url) = &_app.config().build.dev_url {
             return tauri::WebviewUrl::External(dev_url.clone());
         }
     }
