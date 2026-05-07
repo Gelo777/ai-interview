@@ -125,7 +125,7 @@ pub async fn activate_license(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(LICENSE_PROXY_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("Failed to initialize proxy client: {}", e))?;
+        .map_err(|e| format!("Не удалось подготовить подключение к сервису: {}", e))?;
 
     let response = client
         .post(proxy_url.clone())
@@ -134,23 +134,23 @@ pub async fn activate_license(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Failed to contact license proxy: {}", e))?;
+        .map_err(|e| format!("Не удалось подключиться к сервису лицензий: {}", e))?;
 
     let status_code = response.status();
     let body = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read proxy response: {}", e))?;
+        .map_err(|e| format!("Не удалось прочитать ответ сервиса: {}", e))?;
 
     if !status_code.is_success() {
         let message = extract_message_from_text(&body)
-            .unwrap_or_else(|| format!("Proxy returned HTTP {}", status_code.as_u16()));
+            .unwrap_or_else(|| format!("Сервис вернул HTTP {}", status_code.as_u16()));
         persist_error_state(app, &proxy_url, &message)?;
         return Err(message);
     }
 
     let parsed: ProxyActivationEnvelope = serde_json::from_str(&body)
-        .map_err(|e| format!("License proxy returned invalid JSON: {}", e))?;
+        .map_err(|e| format!("Сервис лицензий вернул некорректный ответ: {}", e))?;
 
     let normalized_status = parsed
         .status
@@ -170,13 +170,13 @@ pub async fn activate_license(
 
     let access_token = parsed.access_token.unwrap_or_default();
     if access_token.trim().is_empty() {
-        let message = "License proxy did not return an access token.".to_string();
+        let message = "Сервис лицензий не вернул токен доступа.".to_string();
         persist_error_state(app, &proxy_url, &message)?;
         return Err(message);
     }
 
     let proxy = merge_proxy_config(parsed.proxy, parsed.llm)
-        .ok_or_else(|| "License proxy did not return LLM proxy configuration.".to_string())?;
+        .ok_or_else(|| "Сервис лицензий не вернул конфигурацию подключения.".to_string())?;
 
     let now = Utc::now().to_rfc3339();
     let state = LicenseState {
@@ -352,10 +352,10 @@ fn merge_proxy_config(
 fn normalize_proxy_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        return Err("Proxy URL is required.".to_string());
+        return Err("Нужен адрес сервиса.".to_string());
     }
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err("Proxy URL must start with http:// or https://".to_string());
+        return Err("Адрес сервиса должен начинаться с http:// или https://".to_string());
     }
     Ok(trimmed.to_string())
 }

@@ -33,6 +33,7 @@ const NETWORK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const MODEL_INDEX_REQUEST_TIMEOUT_SECS: u64 = 4;
 const MODEL_DOWNLOAD_REQUEST_TIMEOUT_SECS: u64 = 7_200;
 const STT_STARTUP_COMMAND_TIMEOUT_SECS: u64 = 90;
+const VOSK_STT_STARTUP_COMMAND_TIMEOUT_SECS: u64 = 360;
 const STT_STOP_COMMAND_TIMEOUT_SECS: u64 = 70;
 const WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD: f32 = 0.010;
 const WHISPER_CHUNK_SILENCE_RMS_THRESHOLD: f32 = 0.0035;
@@ -766,7 +767,7 @@ fn capture_audio_sample_blocking(
     let app_data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
     let base_output_dir = app_data_dir.join("diagnostics").join("audio-capture");
     std::fs::create_dir_all(&base_output_dir)
-        .map_err(|err| format!("Failed to create diagnostics directory: {}", err))?;
+        .map_err(|err| format!("Не удалось создать папку для аудио-теста: {}", err))?;
     let captured_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -885,7 +886,7 @@ fn capture_audio_sample_blocking(
     {
         let _ = system_audio_device_id;
         system_audio_track.detail =
-            "System audio capture diagnostics are currently supported only on Windows.".to_string();
+            "Тест системного звука сейчас доступен только на Windows.".to_string();
     }
 
     if stream_handles.is_empty() {
@@ -980,7 +981,7 @@ pub async fn capture_audio_sample(
 ) -> Result<CaptureAudioSampleResult, String> {
     if stt_runtime::is_global_session_running() {
         return Err(
-            "Stop the active interview first, then run audio capture diagnostics.".to_string(),
+            "Сначала завершите активное интервью, затем запустите тест аудио.".to_string(),
         );
     }
 
@@ -1377,7 +1378,7 @@ fn transcribe_captured_audio_blocking(
 ) -> Result<TranscribeCapturedAudioResult, String> {
     if stt_runtime::is_global_session_running() {
         return Err(
-            "Stop the active interview first, then run WAV transcription diagnostics.".to_string(),
+            "Сначала завершите активное интервью, затем запустите проверку WAV.".to_string(),
         );
     }
 
@@ -1389,7 +1390,7 @@ fn transcribe_captured_audio_blocking(
     } else {
         find_latest_capture_dir(&capture_root).ok_or_else(|| {
             format!(
-                "No captured audio folder found in '{}'. Run diagnostic recording first.",
+                "Папка с тестовой записью не найдена: '{}'. Сначала запишите тест аудио.",
                 capture_root.display()
             )
         })?
@@ -1493,7 +1494,7 @@ pub async fn transcribe_captured_audio(
         Ok(join_result) => join_result
             .map_err(|join_err| format!("Failed to join WAV transcription task: {}", join_err))?,
         Err(_) => Err(
-            "WAV transcription timed out. Try a shorter capture or use Whisper Small model."
+            "WAV transcription timed out. Try a shorter capture."
                 .to_string(),
         ),
     }
@@ -1620,7 +1621,7 @@ pub async fn get_proxy_license_status(
 
     let base_url = request.base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
-        return Err("Укажите адрес прокси.".to_string());
+        return Err("Укажите адрес сервиса.".to_string());
     }
 
     let url = format!("{}/api/v1/license/status", base_url);
@@ -1636,22 +1637,22 @@ pub async fn get_proxy_license_status(
         .header("X-Device-Name", device_identity.name)
         .send()
         .await
-        .map_err(|e| format!("Не удалось подключиться к прокси: {}", e))?;
+        .map_err(|e| format!("Не удалось подключиться к сервису: {}", e))?;
 
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|e| format!("Не удалось прочитать ответ прокси: {}", e))?;
+        .map_err(|e| format!("Не удалось прочитать ответ сервиса: {}", e))?;
 
     if !status.is_success() {
         let detail = extract_proxy_error_message(&body)
-            .unwrap_or_else(|| format!("Прокси вернул HTTP {}", status.as_u16()));
+            .unwrap_or_else(|| format!("Сервис вернул HTTP {}", status.as_u16()));
         return Err(detail);
     }
 
     serde_json::from_str::<ProxyLicenseStatusResponse>(&body)
-        .map_err(|e| format!("Прокси вернул некорректный JSON: {}", e))
+        .map_err(|e| format!("Сервис вернул некорректный ответ: {}", e))
 }
 
 fn extract_proxy_error_message(body: &str) -> Option<String> {
@@ -1857,7 +1858,7 @@ pub async fn start_stt_session(
         Ok(join_result) => join_result
             .map_err(|join_err| format!("Failed to join STT startup task: {}", join_err))?,
         Err(_) => Err(
-            "STT startup timed out. Проверьте аудиоустройства и перезапустите приложение."
+            "Запуск распознавания занял слишком много времени. Проверьте аудиоустройства и перезапустите приложение."
                 .to_string(),
         ),
     }
@@ -1875,7 +1876,7 @@ pub async fn stop_stt_session() -> Result<(), String> {
         Ok(join_result) => {
             join_result.map_err(|join_err| format!("Failed to join STT stop task: {}", join_err))?
         }
-        Err(_) => Err("Timed out while stopping STT session.".to_string()),
+        Err(_) => Err("Остановка распознавания заняла слишком много времени.".to_string()),
     }
 }
 
@@ -1890,11 +1891,11 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
     let base_dir = models_base_dir(&app).ok();
     let active_model_id = base_dir
         .as_deref()
-        .and_then(read_active_model_id)
+        .and_then(read_active_release_model_id)
         .or_else(|| {
             base_dir
                 .as_deref()
-                .and_then(|dir| installed_model_ids(dir).into_iter().next())
+                .and_then(|dir| installed_release_model_ids(dir).into_iter().next())
         });
     let model_path = active_model_id
         .as_ref()
@@ -1911,15 +1912,15 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
     let detail = match (&runtime.available, &model_path_string, &active_model_id, &model_layout_error) {
         (_, Some(_), Some(_), Some(error)) => {
             format!(
-                "Vosk model is incomplete or corrupted. Reinstall the Russian model in Speech settings. {}",
+                "Русский профиль распознавания поврежден или установлен не полностью. Переустановите его в настройках. {}",
                 error
             )
         }
         (true, Some(_), Some(model_id), None) => {
-            format!("Vosk is ready. Active model: {}.", model_id)
+            format!("Распознавание готово. Активный профиль: {}.", model_id)
         }
         (false, _, _, _) => runtime.detail.clone(),
-        (_, None, _, _) => "Vosk model is not installed. Prepare a Vosk model first.".to_string(),
+        (_, None, _, _) => "Русский профиль распознавания не установлен. Установите его в настройках.".to_string(),
         _ => "Vosk is not ready.".to_string(),
     };
 
@@ -1936,13 +1937,13 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
 
 fn resolve_vosk_model_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let base_dir = models_base_dir(app)?;
-    let model_id = read_active_model_id(&base_dir)
-        .or_else(|| installed_model_ids(&base_dir).into_iter().next())
-        .ok_or_else(|| "Vosk model is not installed. Prepare a Vosk model first.".to_string())?;
+    let model_id = read_active_release_model_id(&base_dir)
+        .or_else(|| installed_release_model_ids(&base_dir).into_iter().next())
+        .ok_or_else(|| "Русский профиль распознавания не установлен. Установите его в настройках.".to_string())?;
     let model_path = base_dir.join(&model_id);
     if !model_path.is_dir() {
         return Err(format!(
-            "Vosk model '{}' is not installed. Prepare a Vosk model first.",
+            "Профиль распознавания '{}' не установлен. Установите его в настройках.",
             model_id
         ));
     }
@@ -1976,14 +1977,16 @@ pub async fn start_vosk_stt_session(
     });
 
     match tokio::time::timeout(
-        Duration::from_secs(STT_STARTUP_COMMAND_TIMEOUT_SECS),
+        Duration::from_secs(VOSK_STT_STARTUP_COMMAND_TIMEOUT_SECS),
         startup_handle,
     )
     .await
     {
         Ok(join_result) => join_result
             .map_err(|join_err| format!("Failed to join Vosk STT startup task: {}", join_err))?,
-        Err(_) => Err("Vosk STT startup timed out.".to_string()),
+        Err(_) => {
+            Err("Загрузка точного профиля распознавания заняла слишком много времени.".to_string())
+        }
     }
 }
 
@@ -1998,7 +2001,7 @@ pub async fn stop_vosk_stt_session() -> Result<(), String> {
     {
         Ok(join_result) => join_result
             .map_err(|join_err| format!("Failed to join Vosk STT stop task: {}", join_err))?,
-        Err(_) => Err("Timed out while stopping Vosk STT session.".to_string()),
+        Err(_) => Err("Остановка распознавания заняла слишком много времени.".to_string()),
     }
 }
 
@@ -2156,19 +2159,19 @@ fn friendly_stt_detail(detail: &str) -> String {
     if lowered.contains("runtime library and model are missing")
         || (lowered.contains("runtime") && lowered.contains("model") && lowered.contains("missing"))
     {
-        return "Vosk runtime and language model are missing. Install latest stable runtime, then install language models in Language settings.".to_string();
+        return "Компоненты распознавания не установлены. Установите их в настройках распознавания.".to_string();
     }
     if lowered.contains("failed to load") {
         if lowered.contains("model") {
-            return "Vosk language model could not be loaded. Reinstall the Russian model in Speech settings.".to_string();
+            return "Русский профиль распознавания не загрузился. Переустановите его в настройках.".to_string();
         }
-        return "Vosk runtime was found, but failed to load. Reinstall latest stable runtime in Speech settings.".to_string();
+        return "Компоненты распознавания найдены, но не загрузились. Переустановите их в настройках.".to_string();
     }
     if (lowered.contains("model") && lowered.contains("missing"))
         || (lowered.contains("model") && lowered.contains("not found"))
         || lowered.contains("download a model")
     {
-        return "Vosk language model is not available. Install the Russian Small model in Speech settings."
+        return "Русский профиль распознавания недоступен. Установите точный профиль Large в настройках."
             .to_string();
     }
     if (lowered.contains("runtime") || lowered.contains("libvosk"))
@@ -2176,7 +2179,7 @@ fn friendly_stt_detail(detail: &str) -> String {
             || lowered.contains("missing")
             || lowered.contains("unloadable"))
     {
-        return "Vosk runtime is not available. Install latest stable runtime in Speech settings.".to_string();
+        return "Компоненты распознавания недоступны. Установите их в настройках.".to_string();
     }
     normalized
         .split(';')
@@ -2364,14 +2367,6 @@ struct VoskModelCatalogEntry {
 
 const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)] = &[
     (
-        "vosk-model-small-ru-0.22",
-        "Russian (Small)",
-        "ru-RU",
-        VoskModelVariant::Small,
-        45,
-        "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-small-ru-0.22.zip",
-    ),
-    (
         "vosk-model-ru-0.42",
         "Russian (Large)",
         "ru-RU",
@@ -2380,7 +2375,7 @@ const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)]
         "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-ru-0.42.zip",
     ),
 ];
-const RUSSIAN_SMALL_MODEL_ID: &str = "vosk-model-small-ru-0.22";
+const RUSSIAN_LARGE_MODEL_ID: &str = "vosk-model-ru-0.42";
 const LEGACY_NON_RUSSIAN_MODEL_IDS: &[&str] = &["vosk-model-small-en-us-0.15"];
 
 struct VoskCatalogData {
@@ -2461,6 +2456,21 @@ fn installed_model_ids(base_dir: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     models.sort();
     models
+}
+
+fn is_release_vosk_model_id(model_id: &str) -> bool {
+    !model_id.contains("-small-")
+}
+
+fn installed_release_model_ids(base_dir: &Path) -> Vec<String> {
+    installed_model_ids(base_dir)
+        .into_iter()
+        .filter(|model_id| is_release_vosk_model_id(model_id))
+        .collect()
+}
+
+fn read_active_release_model_id(base_dir: &Path) -> Option<String> {
+    read_active_model_id(base_dir).filter(|model_id| is_release_vosk_model_id(model_id))
 }
 
 fn cleanup_models_outside_languages(
@@ -2646,6 +2656,9 @@ fn model_entry_from_index(
     }
 
     let variant = VoskModelVariant::from_remote_type(&raw.model_type, &id);
+    if variant == VoskModelVariant::Small {
+        return None;
+    }
     let language = normalize_catalog_language(&raw.lang);
     let family_key = format!("{}|{}", language, variant.as_str());
     let size_mb = ((raw.size as f64) / (1024.0 * 1024.0)).ceil() as u32;
@@ -2678,7 +2691,7 @@ fn model_entry_from_index(
             size_mb,
             download_url: raw.url.trim().to_string(),
             family_key,
-            default_baseline: variant == VoskModelVariant::Small
+            default_baseline: variant == VoskModelVariant::Large
                 && is_default_baseline_language(&language),
         },
         obsolete,
@@ -2747,7 +2760,7 @@ fn fallback_catalog() -> VoskCatalogData {
             size_mb: *size_mb,
             download_url: (*download_url).to_string(),
             family_key: family_key.clone(),
-            default_baseline: *variant == VoskModelVariant::Small
+            default_baseline: *variant == VoskModelVariant::Large
                 && is_default_baseline_language(language),
         });
         id_to_family.insert((*id).to_string(), family_key);
@@ -2803,12 +2816,12 @@ async fn fetch_remote_model_index() -> Result<Vec<VoskModelIndexEntry>, String> 
         .get(VOSK_MODEL_INDEX_URL)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch Vosk model index: {}", e))?
+        .map_err(|e| format!("Не удалось получить список профилей распознавания: {}", e))?
         .error_for_status()
-        .map_err(|e| format!("Vosk model index request failed: {}", e))?
+        .map_err(|e| format!("Не удалось загрузить список профилей распознавания: {}", e))?
         .json::<Vec<VoskModelIndexEntry>>()
         .await
-        .map_err(|e| format!("Failed to parse Vosk model index: {}", e))
+        .map_err(|e| format!("Не удалось прочитать список профилей распознавания: {}", e))
 }
 
 async fn load_vosk_catalog(app: &tauri::AppHandle) -> Result<VoskCatalogData, String> {
@@ -2838,14 +2851,14 @@ fn default_small_model_for_language<'a>(
 ) -> Option<&'a VoskModelCatalogEntry> {
     catalog
         .iter()
-        .find(|entry| entry.language == language && entry.variant == VoskModelVariant::Small)
+        .find(|entry| entry.language == language && entry.variant == VoskModelVariant::Large)
 }
 
 #[tauri::command]
 pub async fn list_vosk_models(app: tauri::AppHandle) -> Result<Vec<VoskModelOption>, String> {
     let base_dir = models_base_dir(&app)?;
-    let active_model_id = read_active_model_id(&base_dir);
-    let installed_ids = installed_model_ids(&base_dir);
+    let active_model_id = read_active_release_model_id(&base_dir);
+    let installed_ids = installed_release_model_ids(&base_dir);
     let catalog = load_vosk_catalog(&app).await?;
 
     let mut installed_by_family: HashMap<String, Vec<String>> = HashMap::new();
@@ -2896,25 +2909,32 @@ pub async fn list_vosk_models(app: tauri::AppHandle) -> Result<Vec<VoskModelOpti
 #[tauri::command]
 pub fn set_active_vosk_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = models_base_dir(&app)?;
-    let model_dir = base_dir.join(model_id.trim());
+    let normalized_model_id = model_id.trim();
+    if !is_release_vosk_model_id(normalized_model_id) {
+        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+    }
+    let model_dir = base_dir.join(normalized_model_id);
     if !model_dir.is_dir() {
         return Err(format!(
-            "Model '{}' is not installed. Download it first.",
-            model_id
+            "Профиль '{}' не установлен. Сначала установите его.",
+            normalized_model_id
         ));
     }
 
-    write_active_model_id(&base_dir, model_id.trim())
+    write_active_model_id(&base_dir, normalized_model_id)
 }
 
 #[tauri::command]
 pub fn switch_stt_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = models_base_dir(&app)?;
     let normalized = model_id.trim();
+    if !is_release_vosk_model_id(normalized) {
+        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+    }
     let model_dir = base_dir.join(normalized);
     if !model_dir.is_dir() {
         return Err(format!(
-            "Model '{}' is not installed. Download it first.",
+            "Профиль '{}' не установлен. Сначала установите его.",
             normalized
         ));
     }
@@ -2937,7 +2957,7 @@ pub async fn preload_stt_model(app: tauri::AppHandle, model_id: String) -> Resul
         let model_path = whisper_model_path(&base_dir, normalized);
         if !model_path.is_file() {
             return Err(format!(
-                "Model '{}' is not installed. Download it first.",
+                "Профиль '{}' не установлен. Сначала установите его.",
                 normalized
             ));
         }
@@ -2961,7 +2981,7 @@ pub fn remove_vosk_model(app: tauri::AppHandle, model_id: String) -> Result<(), 
     let base_dir = models_base_dir(&app)?;
     let target_dir = base_dir.join(model_id.trim());
     if !target_dir.is_dir() {
-        return Err(format!("Model '{}' is not installed.", model_id.trim()));
+        return Err(format!("Профиль '{}' не установлен.", model_id.trim()));
     }
     std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove model: {}", e))?;
 
@@ -3005,7 +3025,7 @@ pub async fn download_whisper_model(
         .connect_timeout(Duration::from_secs(NETWORK_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(MODEL_DOWNLOAD_REQUEST_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client for model download: {}", e))?;
+        .map_err(|e| format!("Не удалось подготовить загрузку: {}", e))?;
 
     let response = client
         .get(&url)
@@ -3079,6 +3099,9 @@ pub async fn download_vosk_model(
     cleanup_model_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     install_control::reset_cancel();
+    if !is_release_vosk_model_id(model_id.trim()) {
+        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+    }
     let cleanup_model_ids = cleanup_model_ids.unwrap_or_default();
     download_vosk_model_internal(&app, &url, &model_id, true, &cleanup_model_ids).await
 }
@@ -3091,6 +3114,9 @@ pub async fn install_vosk_model_from_zip(
     cleanup_model_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     install_control::reset_cancel();
+    if !is_release_vosk_model_id(model_id.trim()) {
+        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+    }
     let cleanup_model_ids = cleanup_model_ids.unwrap_or_default();
     let archive_path = PathBuf::from(archive_path.trim());
     if archive_path.as_os_str().is_empty() {
@@ -3193,14 +3219,14 @@ async fn download_vosk_model_internal(
         .connect_timeout(Duration::from_secs(NETWORK_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(MODEL_DOWNLOAD_REQUEST_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client for model download: {}", e))?;
+        .map_err(|e| format!("Не удалось подготовить загрузку: {}", e))?;
     let res = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Failed to download Vosk model: {}", e))?
+        .map_err(|e| format!("Не удалось скачать профиль распознавания: {}", e))?
         .error_for_status()
-        .map_err(|e| format!("Vosk model download failed: {}", e))?;
+        .map_err(|e| format!("Загрузка профиля распознавания не удалась: {}", e))?;
 
     let models_dir = models_base_dir(app)?;
     let temp_archive_path = models_dir.join(format!(".{}.download.zip", model_id));
@@ -3222,13 +3248,13 @@ async fn download_vosk_model_internal(
     while let Some(chunk) = stream.next().await {
         if install_control::is_cancelled() {
             let _ = std::fs::remove_file(&temp_archive_path);
-            return Err("Vosk installation cancelled by user.".to_string());
+            return Err("Установка отменена.".to_string());
         }
         let chunk = chunk.map_err(|e: reqwest::Error| e.to_string())?;
         downloaded += chunk.len() as u64;
         archive_file
             .write_all(&chunk)
-            .map_err(|e| format!("Failed to write Vosk model archive: {}", e))?;
+            .map_err(|e| format!("Не удалось сохранить архив профиля: {}", e))?;
 
         let percent = total_size
             .map(|t| (downloaded as f32 / t as f32) * 100.0)
@@ -3295,7 +3321,7 @@ fn install_vosk_model_archive(
 ) -> Result<String, String> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return Err("Vosk model id is empty.".to_string());
+        return Err("Не выбран профиль распознавания.".to_string());
     }
     let progress_bytes = archive_size.unwrap_or(0);
     if emit_progress {
@@ -3315,19 +3341,19 @@ fn install_vosk_model_archive(
 
     let archive_file = std::fs::File::open(archive_path).map_err(|e| {
         format!(
-            "Failed to open Vosk model archive '{}': {}",
+            "Не удалось открыть ZIP-файл '{}': {}",
             archive_path.display(),
             e
         )
     })?;
     let mut archive =
-        zip::ZipArchive::new(archive_file).map_err(|e| format!("Invalid Vosk model ZIP: {}", e))?;
+        zip::ZipArchive::new(archive_file).map_err(|e| format!("Некорректный ZIP-файл профиля: {}", e))?;
     let archive_len = archive.len().max(1);
 
     for i in 0..archive.len() {
         if install_control::is_cancelled() {
             let _ = std::fs::remove_dir_all(&extract_dir);
-            return Err("Vosk installation cancelled by user.".to_string());
+            return Err("Установка отменена.".to_string());
         }
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = file.name().replace('\\', "/");
@@ -3406,7 +3432,7 @@ fn validate_vosk_model_layout(model_dir: &Path) -> Result<(), String> {
     }
 
     Err(
-        "Selected ZIP does not look like a Vosk model archive. Download the model ZIP from the links shown in AI Interview and select that file without unpacking it.".to_string(),
+        "Выбранный ZIP не похож на пакет распознавания. Скачайте ZIP по ссылке из приложения и выберите его без распаковки.".to_string(),
     )
 }
 
@@ -3436,11 +3462,11 @@ fn cleanup_legacy_non_russian_models(models_dir: &Path) -> Result<(), String> {
         }
     }
 
-    let active_model_is_legacy = read_active_model_id(models_dir)
+    let active_model_is_not_release = read_active_model_id(models_dir)
         .as_deref()
-        .is_some_and(|active| LEGACY_NON_RUSSIAN_MODEL_IDS.contains(&active));
-    if active_model_is_legacy && models_dir.join(RUSSIAN_SMALL_MODEL_ID).is_dir() {
-        let _ = write_active_model_id(models_dir, RUSSIAN_SMALL_MODEL_ID);
+        .is_some_and(|active| !is_release_vosk_model_id(active));
+    if active_model_is_not_release && models_dir.join(RUSSIAN_LARGE_MODEL_ID).is_dir() {
+        let _ = write_active_model_id(models_dir, RUSSIAN_LARGE_MODEL_ID);
     }
 
     Ok(())
@@ -3460,7 +3486,7 @@ fn seed_bundled_models_if_needed(app: &tauri::AppHandle, models_dir: &Path) -> R
             let active_model = std::fs::read_to_string(&bundled_active)
                 .map_err(|e| format!("Failed to read bundled active model marker: {}", e))?;
             let trimmed = active_model.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && is_release_vosk_model_id(trimmed) {
                 let _ = write_active_model_id(models_dir, trimmed);
             }
         }
@@ -3555,13 +3581,13 @@ fn read_active_model_id(base_dir: &Path) -> Option<String> {
 
 fn write_active_model_id(base_dir: &Path, model_id: &str) -> Result<(), String> {
     std::fs::write(active_model_marker_path(base_dir), model_id)
-        .map_err(|e| format!("Failed to set active Vosk model: {}", e))
+        .map_err(|e| format!("Не удалось выбрать активный профиль: {}", e))
 }
 
 fn clear_active_model_id(base_dir: &Path) -> Result<(), String> {
     let marker = active_model_marker_path(base_dir);
     if marker.exists() {
-        std::fs::remove_file(marker).map_err(|e| format!("Failed to clear active model: {}", e))?;
+        std::fs::remove_file(marker).map_err(|e| format!("Не удалось сбросить активный профиль: {}", e))?;
     }
     Ok(())
 }
@@ -3719,7 +3745,7 @@ fn resolve_startup_whisper_model_path(
             code: "model_realtime_warning".to_string(),
             level: "warn".to_string(),
             message:
-                "Whisper Large is active without a Small/Medium fallback. Live text can appear with long delays. Install Whisper Small in Settings for stable real-time capture."
+                "The selected speech profile is heavy, so live text can appear with longer delays."
                     .to_string(),
             source: None,
         };

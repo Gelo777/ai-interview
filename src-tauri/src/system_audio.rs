@@ -79,9 +79,9 @@ pub fn get_system_audio_status(selected_output_device_id: Option<&str>) -> Syste
             supported: true,
             available: swift_available,
             detail: if swift_available {
-                "ScreenCaptureKit runtime path is enabled. macOS may still prompt for Screen Recording permission on first use.".to_string()
+                "Захват системного звука на macOS включен. При первом запуске macOS может запросить доступ к записи экрана.".to_string()
             } else {
-                "ScreenCaptureKit runtime path is enabled, but `swift` was not found in PATH. Install Xcode Command Line Tools.".to_string()
+                "Захват системного звука на macOS включен, но системный инструмент swift не найден. Установите Xcode Command Line Tools.".to_string()
             },
         }
     }

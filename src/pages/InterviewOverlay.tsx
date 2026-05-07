@@ -25,6 +25,8 @@ import {
   HARDCODED_PROXY_BASE_URL,
   formatProxyHintResponse,
   requestProxyHint,
+  submitAiFeedback,
+  type AiFeedbackRating,
 } from "@/lib/proxy";
 import { getLanguageLabel } from "@/lib/languages";
 import { logError, logInfo, logWarn } from "@/lib/diagnostics";
@@ -59,13 +61,14 @@ type PersistStoreLike = {
 
 const VOSK_MODEL_LOOKUP_TIMEOUT_MS = 6000;
 const STT_STARTUP_TIMEOUT_MS = 240000;
-const STT_START_REQUEST_TIMEOUT_MS = 70000;
+const STT_START_REQUEST_TIMEOUT_MS = 240000;
 const STT_STOP_TIMEOUT_MS = 12000;
-const STT_STOP_SETTLE_TIMEOUT_MS = 30000;
+const STT_STOP_SETTLE_TIMEOUT_MS = 90000;
 const STT_STOP_POLL_INTERVAL_MS = 250;
 const END_INTERVIEW_STT_STOP_BUDGET_MS = 5000;
 const LARGE_MODEL_WARMUP_TIMEOUT_MS = 240000;
 const LARGE_MODEL_WARMUP_ESTIMATE_MS = 150000;
+const LIVE_MODEL_LOADING_ESTIMATE_MS = 180000;
 const STT_NO_SIGNAL_TIMEOUT_MS = 6000;
 const STT_NO_TRANSCRIPT_HINT_TIMEOUT_MS = 18000;
 const STT_AUTO_RECOVERY_COOLDOWN_MS = 30000;
@@ -78,6 +81,28 @@ type InterviewOverlayMode = "embedded" | "detached";
 
 type InterviewOverlayProps = {
   mode?: InterviewOverlayMode;
+};
+
+type InterviewIntentMode = "LIVE_CODING" | "DEBUG" | "CODE_REVIEW" | "THEORY" | "AUTO";
+
+type InterviewIntent = {
+  mode: InterviewIntentMode;
+  reason: string;
+};
+
+type LastHintMeta = {
+  hintId: string | null;
+  taskType: string | null;
+  question: string;
+  hadScreenshot: boolean;
+  intent: InterviewIntent;
+};
+
+type FeedbackUiState = {
+  sending: AiFeedbackRating | null;
+  sentRating: AiFeedbackRating | null;
+  отзываId: string | null;
+  error: string | null;
 };
 
 type ResolvedSttStartSelection = {
@@ -102,6 +127,44 @@ type SttWarmupUiState = {
   hint: string;
 };
 
+const INTERVIEW_INTENT_OPTIONS: Array<{
+  mode: InterviewIntentMode;
+  label: string;
+  shortLabel: string;
+  hint: string;
+}> = [
+  {
+    mode: "AUTO",
+    label: "Авто",
+    shortLabel: "Авто",
+    hint: "Режим выберется автоматически по тексту и скриншоту.",
+  },
+  {
+    mode: "LIVE_CODING",
+    label: "Дописать код",
+    shortLabel: "Код",
+    hint: "Писать решение или недостающий фрагмент, а не ревьюить.",
+  },
+  {
+    mode: "DEBUG",
+    label: "Дебаг",
+    shortLabel: "Дебаг",
+    hint: "Найти причину ошибки, stack trace или падающего теста.",
+  },
+  {
+    mode: "CODE_REVIEW",
+    label: "Ревью",
+    shortLabel: "Ревью",
+    hint: "Найти баги, риски и минимальный патч.",
+  },
+  {
+    mode: "THEORY",
+    label: "Теория",
+    shortLabel: "Теория",
+    hint: "Дать короткое объяснение для устного ответа.",
+  },
+];
+
 function isKnownSubtitleCreditNoise(text: string): boolean {
   const lower = text.toLowerCase();
   return (
@@ -119,7 +182,7 @@ function buildWarmupUiState(snapshot: SttWarmupSnapshot): SttWarmupUiState | nul
   if (snapshot.state === "ready") {
     return {
       progressPercent: 100,
-      title: "Большая модель готова",
+      title: "Точный профиль готов",
       hint: "Переходим к запуску захвата микрофона и системного звука.",
     };
   }
@@ -127,10 +190,10 @@ function buildWarmupUiState(snapshot: SttWarmupSnapshot): SttWarmupUiState | nul
   if (snapshot.state === "failed") {
     return {
       progressPercent: 100,
-      title: "Не удалось подготовить большую модель",
+      title: "Не удалось подготовить точный профиль",
       hint:
         snapshot.errorMessage ??
-        "Прогрев модели завершился ошибкой. Можно повторить запуск или временно переключиться на Small.",
+        "Подготовка завершилась ошибкой. Можно повторить запуск или переустановить точный профиль в настройках.",
     };
   }
 
@@ -141,7 +204,7 @@ function buildWarmupUiState(snapshot: SttWarmupSnapshot): SttWarmupUiState | nul
 
   return {
     progressPercent: Math.min(easedProgress, 92),
-    title: "Подготавливаем большую языковую модель",
+    title: "Подготавливаем точный профиль",
     hint: `Первый запуск обычно занимает 1-3 минуты. Прошло: ${elapsedSeconds} с.`,
   };
 }
@@ -180,10 +243,17 @@ function toErrorDetail(error: unknown): string {
 function isSttStopInProgressDetail(detail: string): boolean {
   return (
     detail.includes("previous stt session is still stopping") ||
+    detail.includes("previous stop is still") ||
+    detail.includes("still stopping after") ||
     detail.includes("stt stop is still in progress") ||
     detail.includes("timed out while stopping stt session") ||
     detail.includes("предыдущая stt-сессия") ||
-    detail.includes("еще завершается")
+    detail.includes("еще завершается") ||
+    detail.includes("еще выполняется") ||
+    (detail.includes("остановка распознавания") &&
+      (detail.includes("выполняется") ||
+        detail.includes("завершается") ||
+        detail.includes("не завершилась")))
   );
 }
 
@@ -207,19 +277,36 @@ function isVoskModelStartupDetail(detail: string): boolean {
 function isVoskRuntimeStartupDetail(detail: string): boolean {
   const normalized = detail.toLowerCase();
   return (
-    normalized.includes("failed to load vosk runtime") ||
-    normalized.includes("vosk runtime") ||
+    (normalized.includes("failed to load") &&
+      normalized.includes("vosk") &&
+      normalized.includes("runtime")) ||
+    (normalized.includes("vosk") && normalized.includes("runtime")) ||
     normalized.includes("libvosk")
+  );
+}
+
+function isSttStartupTimeoutDetail(detail: string): boolean {
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("stt startup timed out") ||
+    normalized.includes("timed out while waiting for stt manager startup") ||
+    normalized.includes("timed out while starting recognition worker") ||
+    normalized.includes("запуск распознавания занял слишком много времени") ||
+    normalized.includes("загрузка точного профиля распознавания заняла слишком много времени")
   );
 }
 
 function strictStartupActionHint(detail: string): string {
   if (isVoskModelStartupDetail(detail)) {
-    return "Откройте Настройки -> Распознавание, выберите профиль Small и переустановите русскую модель. Если модель уже отмечена как установленная, удалите ее и установите заново.";
+    return "Откройте Настройки -> Распознавание и переустановите точный русский профиль. Если пакет уже отмечен как установленный, установите его заново из ZIP или через загрузку.";
   }
 
   if (isVoskRuntimeStartupDetail(detail)) {
-    return "Откройте Настройки -> Распознавание и нажмите установку Vosk runtime, затем перезапустите аудио.";
+    return "Откройте Настройки -> Распознавание и установите голосовой модуль, затем перезапустите аудио.";
+  }
+
+  if (isSttStartupTimeoutDetail(detail)) {
+    return "Точный профиль Large еще загружается. Подождите окончания первого запуска или перезапустите приложение и не нажимайте перезапуск аудио во время загрузки.";
   }
 
   return "Исправьте выбранные микрофон и системный звук в настройках.";
@@ -251,26 +338,26 @@ function toFriendlySttStartupError(error: unknown): string {
     return "Выбранный динамик или устройство вывода недоступно. Проверьте настройки аудио.";
   }
   if (normalized.includes("vosk model is not installed")) {
-    return "Языковая модель Vosk не установлена. Откройте Настройки -> Распознавание и установите русскую модель Small.";
+    return "Русский пакет распознавания не установлен. Откройте Настройки -> Распознавание и установите точный профиль.";
   }
-  if (normalized.includes("failed to load vosk runtime")) {
-    return "Не удалось загрузить Vosk runtime. Переустановите его в настройках распознавания.";
+  if (
+    normalized.includes("failed to load") &&
+    normalized.includes("vosk") &&
+    normalized.includes("runtime")
+  ) {
+    return "Не удалось загрузить голосовой модуль. Переустановите его в настройках распознавания.";
   }
   if (normalized.includes("vosk failed to load model")) {
-    return "Не удалось загрузить языковую модель Vosk. Переустановите русскую модель в настройках распознавания.";
+    return "Не удалось загрузить русский пакет распознавания. Переустановите его в настройках.";
   }
   if (normalized.includes("stt session is already running")) {
     return "Сессия распознавания уже запущена.";
   }
   if (isSttStopInProgressDetail(normalized)) {
-    return "Предыдущая STT-сессия еще завершается. Подождите несколько секунд и повторите запуск.";
+    return "Предыдущий запуск распознавания еще завершается. Подождите несколько секунд и повторите запуск.";
   }
-  if (
-    normalized.includes("stt startup timed out") ||
-    normalized.includes("timed out while waiting for stt manager startup") ||
-    normalized.includes("timed out while starting recognition worker")
-  ) {
-    return "Запуск распознавания занял слишком много времени. Проверьте выбранные аудиоустройства, модель речи и права Windows на микрофон.";
+  if (isSttStartupTimeoutDetail(normalized)) {
+    return "Загрузка точного профиля заняла слишком много времени. Large тяжелый: первый запуск может длиться несколько минут.";
   }
 
   return detail;
@@ -306,10 +393,12 @@ function toFriendlyScreenshotError(error: unknown): string {
 export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const session = useSessionStore();
   const settings = useSettingsStore();
-  const { setView, setInterviewActive } = useAppStore();
+  const { setView, setInterviewActive, setSettingsTab, setSettingsFocus } = useAppStore();
   const addSessionToHistory = useHistoryStore((s) => s.addSession);
   const {
     isActive,
+    mode: sessionMode,
+    safeModeReason,
     startedAt,
     elapsedMs,
     messages,
@@ -321,6 +410,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     userChars,
     isLlmLoading,
     startSession,
+    setSafeMode,
+    setLiveMode,
     tick,
     endSession,
     addMessage,
@@ -354,6 +445,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
   const [sttWarmupModelId, setSttWarmupModelId] = useState<string | null>(null);
   const [sttWarmupUi, setSttWarmupUi] = useState<SttWarmupUiState | null>(null);
+  const [isSttStarting, setIsSttStarting] = useState(false);
+  const [sttStartupStartedAt, setSttStartupStartedAt] = useState<number | null>(null);
+  const [sttStartupElapsedMs, setSttStartupElapsedMs] = useState(0);
   const [isSttRecovering, setIsSttRecovering] = useState(false);
   const [manualQuestion, setManualQuestion] = useState("");
   const [cropDialogImageBase64, setCropDialogImageBase64] = useState<string | null>(
@@ -361,6 +455,17 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
   const [cropDragging, setCropDragging] = useState(false);
+  const [intentModeOverride, setIntentModeOverride] =
+    useState<InterviewIntentMode>("AUTO");
+  const [lastRequestIntent, setLastRequestIntent] = useState<InterviewIntent | null>(null);
+  const [lastHintMeta, setLastHintMeta] = useState<LastHintMeta | null>(null);
+  const [отзываUi, setFeedbackUi] = useState<FeedbackUiState>({
+    sending: null,
+    sentRating: null,
+    отзываId: null,
+    error: null,
+  });
+  const safeModeNoticeShownRef = useRef(false);
   const aiPanelRef = useRef<HTMLDivElement>(null);
   const cropContainerRef = useRef<HTMLDivElement | null>(null);
   const cropImageRef = useRef<HTMLImageElement | null>(null);
@@ -390,6 +495,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     system: false,
   });
   const sttRecoveryInProgressRef = useRef(false);
+  const sttStartupInProgressRef = useRef(false);
+  const sttStopPromiseRef = useRef<Promise<void> | null>(null);
   const activeSttLanguageRef = useRef<PrimaryLanguage>(activeSttLanguage);
   const sttAcceptingResultsRef = useRef(true);
 
@@ -420,6 +527,23 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       window.clearInterval(timer);
     };
   }, [sttWarmupModelId]);
+
+  useEffect(() => {
+    if (!isSttStarting || !sttStartupStartedAt) {
+      setSttStartupElapsedMs(0);
+      return;
+    }
+
+    const updateElapsed = () => {
+      setSttStartupElapsedMs(Math.max(0, Date.now() - sttStartupStartedAt));
+    };
+
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isSttStarting, sttStartupStartedAt]);
 
   useEffect(() => {
     const store = useSettingsStore as unknown as PersistStoreLike;
@@ -561,7 +685,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           );
         }
       } catch (error) {
-        logWarn("stt.session", "Failed to resolve concrete audio devices before STT start", {
+        logWarn("speech.session", "Failed to resolve selected audio devices before speech start", {
           microphoneDeviceId,
           systemAudioDeviceId,
           error,
@@ -594,7 +718,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     }) => {
       const resolvedSelection = await resolveConcreteAudioSelection(request);
       const { startVoskSttSession } = await import("@/lib/tauri");
-      logInfo("stt.session", "Starting STT session", {
+      logInfo("speech.session", "Starting speech session", {
         microphoneDeviceId: resolvedSelection.microphoneDeviceId || "(default)",
         microphoneLabel: resolvedSelection.microphoneLabel,
         systemAudioDeviceId: resolvedSelection.systemAudioDeviceId || "(default)",
@@ -603,17 +727,32 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         usedWindowsDefaultSystem: resolvedSelection.usedWindowsDefaultSystem,
         strictAudioMode: STT_STRICT_AUDIO_MODE,
       });
-      await withTimeout(
-        startVoskSttSession({
-          microphoneDeviceId: resolvedSelection.microphoneDeviceId,
-          systemAudioDeviceId: resolvedSelection.systemAudioDeviceId,
-          language: request?.language,
-        }),
-        STT_START_REQUEST_TIMEOUT_MS,
-        "STT startup timed out. Проверьте аудиоустройства и повторите запуск.",
+      sttStartupInProgressRef.current = true;
+      const startupStartedAt = Date.now();
+      setSttStartupStartedAt(startupStartedAt);
+      setSttStartupElapsedMs(0);
+      setIsSttStarting(true);
+      setSttStatusText(
+        "Загружаем точный профиль распознавания. Первый запуск Large может занять 1-3 минуты...",
       );
+      try {
+        await withTimeout(
+          startVoskSttSession({
+            microphoneDeviceId: resolvedSelection.microphoneDeviceId,
+            systemAudioDeviceId: resolvedSelection.systemAudioDeviceId,
+            language: request?.language,
+          }),
+          STT_START_REQUEST_TIMEOUT_MS,
+          "Запуск распознавания занял слишком много времени. Проверьте аудиоустройства и повторите запуск.",
+        );
+      } finally {
+        sttStartupInProgressRef.current = false;
+        setIsSttStarting(false);
+        setSttStartupStartedAt(null);
+        setSttStartupElapsedMs(0);
+      }
       sttAcceptingResultsRef.current = true;
-      logInfo("stt.session", "STT session started", {
+      logInfo("speech.session", "Speech session started", {
         microphoneLabel: resolvedSelection.microphoneLabel,
         systemAudioLabel: resolvedSelection.systemAudioLabel,
       });
@@ -623,54 +762,71 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   const stopSttSessionGracefully = useCallback(
     async (reason: "restart" | "language_switch" | "cleanup") => {
-      const { isTauri, stopSttSession, stopVoskSttSession } = await import("@/lib/tauri");
-      if (!isTauri()) {
+      if (sttStopPromiseRef.current) {
+        logInfo("speech.stop", "Waiting for already running speech stop", { reason });
+        await sttStopPromiseRef.current;
         return;
       }
-      sttAcceptingResultsRef.current = false;
-      await stopSttSession().catch(() => {
-        // Best effort cleanup for the older live path.
-      });
 
-      const deadline = Date.now() + STT_STOP_SETTLE_TIMEOUT_MS;
-      let attempt = 0;
-      let lastError: unknown = null;
-
-      while (Date.now() < deadline) {
-        attempt += 1;
-        try {
-          await withTimeout(
-            stopVoskSttSession(),
-            STT_STOP_TIMEOUT_MS,
-            "Timed out while stopping STT session.",
-          );
-          if (attempt > 1) {
-            logInfo("stt.stop", "STT stop completed after retry", { reason, attempt });
-          }
+      const stopPromise = (async () => {
+        const { isTauri, stopSttSession, stopVoskSttSession } = await import("@/lib/tauri");
+        if (!isTauri()) {
           return;
-        } catch (error) {
-          lastError = error;
-          const detail = toErrorDetail(error);
-          const normalized = detail.toLowerCase();
-          if (isSttAlreadyStoppedDetail(normalized)) {
+        }
+        sttAcceptingResultsRef.current = false;
+        await stopSttSession().catch(() => {
+          // Best effort cleanup for the older live path.
+        });
+
+        const deadline = Date.now() + STT_STOP_SETTLE_TIMEOUT_MS;
+        let attempt = 0;
+        let lastError: unknown = null;
+
+        while (Date.now() < deadline) {
+          attempt += 1;
+          try {
+            await withTimeout(
+              stopVoskSttSession(),
+              STT_STOP_TIMEOUT_MS,
+              "Timed out while stopping STT session.",
+            );
+            if (attempt > 1) {
+              logInfo("speech.stop", "Speech stop completed after retry", { reason, attempt });
+            }
             return;
+          } catch (error) {
+            lastError = error;
+            const detail = toErrorDetail(error);
+            const normalized = detail.toLowerCase();
+            if (isSttAlreadyStoppedDetail(normalized)) {
+              return;
+            }
+            if (!isSttStopInProgressDetail(normalized)) {
+              throw error;
+            }
+            if (attempt === 1 || attempt % 5 === 0) {
+              logWarn("speech.stop", "Speech stop still in progress; waiting before retry", {
+                reason,
+                attempt,
+                detail,
+              });
+            }
+            await sleep(STT_STOP_POLL_INTERVAL_MS);
           }
-          if (!isSttStopInProgressDetail(normalized)) {
-            throw error;
-          }
-          if (attempt === 1 || attempt % 5 === 0) {
-            logWarn("stt.stop", "STT stop still in progress; waiting before retry", {
-              reason,
-              attempt,
-              detail,
-            });
-          }
-          await sleep(STT_STOP_POLL_INTERVAL_MS);
+        }
+
+        const detail = toFriendlySttStartupError(lastError);
+        throw new Error(`Остановка распознавания не завершилась вовремя: ${detail}`);
+      })();
+
+      sttStopPromiseRef.current = stopPromise;
+      try {
+        await stopPromise;
+      } finally {
+        if (sttStopPromiseRef.current === stopPromise) {
+          sttStopPromiseRef.current = null;
         }
       }
-
-      const detail = toFriendlySttStartupError(lastError);
-      throw new Error(`Остановка STT не завершилась вовремя: ${detail}`);
     },
     [],
   );
@@ -690,14 +846,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       const isStopInProgress = isSttStopInProgressDetail(firstAttemptDetail.toLowerCase());
 
       if (isStopInProgress) {
-        logWarn("stt.session", "STT startup hit pending stop; waiting and retrying", {
+        logWarn("speech.session", "Speech startup hit pending stop; waiting and retrying", {
           detail: firstAttemptDetail,
         });
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: "Предыдущая STT-сессия еще завершается. Ждем и повторяем запуск...",
+          text: "Предыдущий запуск распознавания еще завершается. Ждем и повторяем запуск...",
           isFinal: true,
         });
         await stopSttSessionGracefully("restart");
@@ -707,7 +863,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
 
       if (STT_STRICT_AUDIO_MODE) {
-        logWarn("stt.session", "Strict audio mode: startup aborted without fallback", {
+        logWarn("speech.session", "Strict audio mode: startup aborted without fallback", {
           detail: firstAttemptDetail,
           microphoneDeviceId: currentSettings.microphoneDeviceId,
           systemAudioDeviceId: currentSettings.systemAudioDeviceId,
@@ -723,7 +879,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         throw error;
       }
       if (hasCustomSelection) {
-        logWarn("stt.session", "STT startup failed with selected devices", {
+        logWarn("speech.session", "Speech startup failed with selected devices", {
           detail: firstAttemptDetail,
           microphoneDeviceId: currentSettings.microphoneDeviceId,
           systemAudioDeviceId: currentSettings.systemAudioDeviceId,
@@ -753,10 +909,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           setSttStatusText(
             "Выбранные устройства не стартовали, переключились на текущие Windows default.",
           );
-          logWarn("stt.session", "Recovered STT startup by falling back to Windows defaults");
+          logWarn("speech.session", "Recovered speech startup by falling back to Windows defaults");
           return;
         } catch (fallbackError) {
-          logError("stt.session", "Fallback to Windows default devices failed", {
+          logError("speech.session", "Fallback to Windows default devices failed", {
             firstAttemptDetail,
             fallbackDetail: toFriendlySttStartupError(fallbackError),
             fallbackError,
@@ -767,9 +923,81 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     }
   }, [addMessage, startConfiguredSttSession, stopSttSessionGracefully]);
 
+  const activateSafeMode = useCallback(
+    async (reason: string, options: { stopAudio?: boolean } = {}) => {
+      const normalizedReason =
+        reason.trim() ||
+        "Распознавание отключено, ручной ввод и ножницы остаются доступны.";
+
+      sttAcceptingResultsRef.current = false;
+      safeModeNoticeShownRef.current = true;
+      setSttWarmupModelId(null);
+      setSttWarmupUi(null);
+      setSttStatusText(
+        "Режим без аудио: распознавание отключено. Используйте ручной вопрос и ножницы.",
+      );
+      setSafeMode(normalizedReason);
+      logWarn("speech.audio_free", "Session switched to audio-free mode", {
+        reason: normalizedReason,
+        stopAudio: options.stopAudio !== false,
+      });
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: `${normalizedReason} Ручной ввод, ножницы и ответы помощника остаются доступны.`,
+        isFinal: true,
+      });
+
+      if (options.stopAudio === false) {
+        return;
+      }
+
+      await stopSttSessionGracefully("cleanup").catch((error) => {
+        logWarn("speech.audio_free", "Audio cleanup failed for audio-free mode", { error });
+      });
+    },
+    [addMessage, setSafeMode, stopSttSessionGracefully],
+  );
+
+  const resumeLiveMode = useCallback(() => {
+    safeModeNoticeShownRef.current = false;
+    sttSignalSeenRef.current = { mic: false, system: false };
+    sttTranscriptSeenRef.current = { mic: false, system: false };
+    setSttStatusText("Пробуем вернуть распознавание...");
+    setLiveMode();
+    logInfo("speech.audio_free", "User requested audio capture resume");
+    addMessage({
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      source: "ai_marker",
+      text: "Пробуем вернуть распознавание без перезапуска сессии.",
+      isFinal: true,
+    });
+  }, [addMessage, setLiveMode]);
+
   const restartSttSession = useCallback(
     async (reason: "manual" | "no_signal"): Promise<boolean> => {
       if (sttRecoveryInProgressRef.current) {
+        return false;
+      }
+      if (sttStartupInProgressRef.current) {
+        setSttStatusText(
+          "Точный профиль уже загружается. Дождитесь окончания первого запуска, перезапуск сейчас не нужен.",
+        );
+        if (reason === "manual") {
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text:
+              "Точный профиль уже загружается. Первый запуск Large может занять 1-3 минуты, перезапуск сейчас не нужен.",
+            isFinal: true,
+          });
+        }
+        logInfo("speech.recovery", "Ignored restart while speech startup is in progress", {
+          reason,
+        });
         return false;
       }
       sttRecoveryInProgressRef.current = true;
@@ -781,7 +1009,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return false;
         }
 
-        logWarn("stt.recovery", "Restarting STT session", { reason });
+        logWarn("speech.recovery", "Restarting speech session", { reason });
         setSttStatusText("Перезапускаем распознавание речи...");
         if (reason === "manual") {
           addMessage({
@@ -813,8 +1041,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         return true;
       } catch (error) {
         const detail = toFriendlySttStartupError(error);
-        logError("stt.recovery", "Failed to restart STT session", { reason, detail, error });
-        setSttStatusText(`Перезапуск STT не удался: ${detail}`);
+        logError("speech.recovery", "Failed to restart speech session", { reason, detail, error });
+        setSttStatusText(`Перезапуск распознавания не удался: ${detail}`);
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
@@ -822,13 +1050,16 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           text: `Не удалось перезапустить распознавание: ${detail}`,
           isFinal: true,
         });
+        await activateSafeMode(
+          `Аудиозахват не восстановился после перезапуска: ${detail}. Приложение продолжит работу без распознавания.`,
+        );
         return false;
       } finally {
         sttRecoveryInProgressRef.current = false;
         setIsSttRecovering(false);
       }
     },
-    [addMessage, startSttSessionWithRecovery, stopSttSessionGracefully],
+    [activateSafeMode, addMessage, startSttSessionWithRecovery, stopSttSessionGracefully],
   );
 
   const ensureActiveSttLanguage = useCallback(
@@ -840,7 +1071,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         setActiveVoskModel,
       } = await import("@/lib/tauri");
       if (!isTauri()) {
-        logInfo("stt.language", "Skipping Vosk language switch in non-Tauri mode", {
+        logInfo("speech.language", "Skipping speech profile switch in non-desktop mode", {
           language,
         });
         setActiveSttLanguage(language);
@@ -856,7 +1087,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             ? currentSettings.secondarySttVariant
             : currentSettings.primarySttVariant;
 
-      logInfo("stt.language", "Resolving active Vosk model", {
+      logInfo("speech.language", "Resolving active speech profile", {
         language,
         preferredVariant,
         restartSession,
@@ -865,22 +1096,25 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       const models = await withTimeout(
         listVoskModels(),
         VOSK_MODEL_LOOKUP_TIMEOUT_MS,
-        "Не удалось быстро получить список Vosk-моделей. Проверьте Настройки -> Язык.",
+        "Не удалось быстро получить список профилей. Проверьте настройки распознавания.",
       );
       const selectedModel =
         models.find(
           (model: VoskModelOption) =>
-            model.language === language && model.variant === preferredVariant,
+            model.installed &&
+            model.language === language &&
+            model.variant === preferredVariant,
         ) ??
         models.find(
           (model: VoskModelOption) =>
-            model.language === language && model.variant === "small",
+            model.installed &&
+            model.language === language,
         ) ??
         models.find((model: VoskModelOption) => model.installed) ??
         null;
 
       if (!selectedModel || !selectedModel.installed) {
-        logWarn("stt.language", "No installed Vosk model was found", {
+        logWarn("speech.language", "No installed speech profile was found", {
           language,
           preferredVariant,
           selectedModelId: selectedModel?.id ?? null,
@@ -889,14 +1123,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: "Не найдена установленная модель Vosk. Откройте Настройки -> Язык и установите модель распознавания.",
+          text: "Не найден точный профиль распознавания. Откройте настройки и установите Large.",
           isFinal: true,
         });
         return false;
       }
 
       if (selectedModel.variant !== preferredVariant) {
-        logWarn("stt.language", "Preferred Vosk variant is unavailable, using fallback", {
+        logWarn("speech.language", "Preferred speech profile is unavailable, using fallback", {
           language,
           preferredVariant,
           selectedModelId: selectedModel.id,
@@ -906,17 +1140,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: `Выбран профиль ${selectedModel.name}, потому что предпочитаемая Vosk-модель сейчас недоступна.`,
+          text: `Выбран доступный профиль распознавания, потому что предпочитаемый профиль сейчас недоступен.`,
           isFinal: true,
         });
       }
 
       if (!selectedModel.active) {
-        setSttStatusText(
-          selectedModel.variant === "large"
-            ? "Активируем точную Vosk-модель. Первый старт может быть дольше обычного..."
-            : "Активируем быструю Vosk-модель...",
-        );
+        setSttStatusText("Активируем точный профиль. Первый старт может быть дольше обычного...");
         await setActiveVoskModel(selectedModel.id);
       }
 
@@ -926,14 +1156,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           await stopSttSessionGracefully("language_switch");
         }
         await startSttSessionWithRecovery(language);
-        logInfo("stt.language", "Restarted Vosk STT with selected model", {
+        logInfo("speech.language", "Restarted speech capture with selected profile", {
           language,
           modelId: selectedModel.id,
         });
       }
 
       setActiveSttLanguage(language);
-      logInfo("stt.language", "Vosk STT language is active", {
+      logInfo("speech.language", "Speech profile is active", {
         language,
         modelId: selectedModel.id,
         variant: selectedModel.variant,
@@ -944,12 +1174,12 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
   const toggleSttLanguage = useCallback(async () => {
     if (settings.secondaryLanguage === "none") {
-      logWarn("stt.language", "Language switch skipped: secondary language is not configured");
+      logWarn("speech.language", "Language switch skipped: secondary language is not configured");
       addMessage({
         id: crypto.randomUUID(),
         timestamp: Date.now(),
         source: "ai_marker",
-        text: "Secondary STT language is not configured.",
+        text: "Дополнительный язык не настроен.",
         isFinal: true,
       });
       return;
@@ -964,7 +1194,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         id: crypto.randomUUID(),
         timestamp: Date.now(),
         source: "ai_marker",
-        text: "Primary and secondary STT languages are identical. Pick a different secondary language in Settings.",
+        text: "Основной и дополнительный языки совпадают. Выберите другой дополнительный язык в настройках.",
         isFinal: true,
       });
       return;
@@ -977,16 +1207,16 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
     const switched = await ensureActiveSttLanguage(nextLanguage, true);
     if (!switched) {
-      logWarn("stt.language", "Language switch failed", { nextLanguage });
+      logWarn("speech.language", "Language switch failed", { nextLanguage });
       return;
     }
 
-    logInfo("stt.language", "Language switched", { nextLanguage });
+    logInfo("speech.language", "Language switched", { nextLanguage });
     addMessage({
       id: crypto.randomUUID(),
       timestamp: Date.now(),
       source: "ai_marker",
-      text: `STT switched to ${getLanguageLabel(nextLanguage)}.`,
+      text: `Язык распознавания переключен: ${getLanguageLabel(nextLanguage)}.`,
       isFinal: true,
     });
   }, [
@@ -1007,13 +1237,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         // Recovery path: keep rendering live transcripts if the guard flag lags behind
         // while the session is still active.
         sttAcceptingResultsRef.current = true;
-        logWarn("stt.result", "Recovered STT result processing guard during active session");
+        logWarn("speech.result", "Recovered speech result processing guard during active session");
       }
       const sourceKey = payload.source === "system" ? "system" : "mic";
       const firstSignal = !sttSignalSeenRef.current[sourceKey];
       sttSignalSeenRef.current[sourceKey] = true;
       if (firstSignal) {
-        logInfo("stt.audio", "First live audio signal received", {
+        logInfo("speech.audio", "First live audio signal received", {
           source: sourceKey,
           isFinal: payload.is_final,
         });
@@ -1024,7 +1254,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         return;
       }
       if (isKnownSubtitleCreditNoise(text)) {
-        logWarn("stt.result", "Filtered known subtitle-credit hallucination", {
+        logWarn("speech.result", "Filtered known subtitle-credit phrase", {
           source: sourceKey,
         });
         return;
@@ -1175,11 +1405,35 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
 
   useEffect(() => {
-    if (!isActive) {
+      if (!isActive) {
+        return;
+      }
+      if (sessionMode === "safe") {
+        sttAcceptingResultsRef.current = false;
+      setSttWarmupModelId(null);
+      setSttWarmupUi(null);
+      setSttStatusText(
+        "Режим без аудио: распознавание отключено. Используйте ручной вопрос и ножницы.",
+      );
+      if (!safeModeNoticeShownRef.current) {
+        safeModeNoticeShownRef.current = true;
+        logWarn("speech.setup", "Skipping speech startup because session is audio-free", {
+          reason: safeModeReason,
+        });
+        addMessage({
+          id: crypto.randomUUID(),
+          timestamp: Date.now(),
+          source: "ai_marker",
+          text:
+            safeModeReason ||
+            "Режим без аудио включен: приложение работает без распознавания, но ручной ввод и отправка скриншота доступны.",
+          isFinal: true,
+        });
+      }
       return;
     }
     if (!settingsHydrated) {
-      logInfo("stt.setup", "Waiting for settings hydration before STT startup");
+      logInfo("speech.setup", "Waiting for settings hydration before speech startup");
       setSttStatusText("Подготавливаем настройки перед запуском распознавания...");
       return;
     }
@@ -1191,13 +1445,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         "STT autostart is disabled. Running overlay in stable manual mode.",
       );
       setSttStatusText(
-        "Стабильный ручной режим: введите вопрос внизу и отправьте в AI. Локальное распознавание временно отключено.",
+        "Ручной режим: введите вопрос внизу и отправьте. Распознавание временно отключено.",
       );
       addMessage({
         id: crypto.randomUUID(),
         timestamp: Date.now(),
         source: "ai_marker",
-        text: "Стабильный режим включен: автозапуск распознавания речи отключен, используйте ручной ввод + скриншот.",
+        text: "Ручной режим включен: автозапуск распознавания отключен, используйте ручной ввод и скриншот.",
         isFinal: true,
       });
       return;
@@ -1210,7 +1464,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     sttNoSignalRecoveryAttemptedRef.current = false;
     sttLastAutoRecoveryAtRef.current = 0;
     sttNoTranscriptHintShownRef.current = { mic: false, system: false };
-    setSttStatusText("Подготавливаем языковую модель...");
+    setSttStatusText("Подготавливаем распознавание...");
 
     let unlistenResult: (() => void) | null = null;
     let unlistenDiagnostic: (() => void) | null = null;
@@ -1221,7 +1475,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     async function setupStt() {
       const activeSettings = useSettingsStore.getState();
       const primaryLanguage = activeSettings.primaryLanguage;
-      logInfo("stt.setup", "STT setup started", {
+      logInfo("speech.setup", "Speech setup started", {
         primaryLanguage,
         microphoneDeviceId: activeSettings.microphoneDeviceId || "(default)",
         systemAudioDeviceId: activeSettings.systemAudioDeviceId || "(default)",
@@ -1231,7 +1485,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         return;
       }
       if (!isTauri()) {
-        logInfo("stt.setup", "Skipping STT setup in non-Tauri mode");
+        logInfo("speech.setup", "Skipping speech setup in non-desktop mode");
         return;
       }
 
@@ -1250,19 +1504,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         unlistenDiagnostic?.();
         return;
       }
-      logInfo("stt.setup", "STT event listeners attached");
+      logInfo("speech.setup", "Speech event listeners attached");
 
       try {
         const ready = await withTimeout(
           ensureActiveSttLanguage(primaryLanguage, false),
           STT_STARTUP_TIMEOUT_MS,
-          "Подготовка языковой модели заняла слишком много времени.",
+          "Подготовка распознавания заняла слишком много времени.",
         );
         if (disposed) {
           return;
         }
         if (!ready) {
-          logWarn("stt.setup", "STT setup stopped: language was not prepared");
+          logWarn("speech.setup", "Speech setup stopped: language was not prepared");
           return;
         }
         setSttStatusText("Запускаем захват микрофона и системного звука...");
@@ -1276,11 +1530,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             return;
           }
         } else {
-          logWarn("stt.setup", "STT session already running, reusing existing session");
+          logWarn("speech.setup", "Speech session already running, reusing existing session");
         }
         sttAcceptingResultsRef.current = true;
         setActiveSttLanguage(primaryLanguage);
-        logInfo("stt.setup", "STT capture pipeline started", {
+        logInfo("speech.setup", "Speech capture pipeline started", {
           language: primaryLanguage,
         });
         setSttWarmupModelId(null);
@@ -1297,7 +1551,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           }
 
           sttNoSignalNoticeShownRef.current = true;
-          logWarn("stt.audio", "No live audio detected after STT startup", {
+          logWarn("speech.audio", "No live audio detected after speech startup", {
             timeoutMs: 6000,
           });
           setSttStatusText(
@@ -1341,10 +1595,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               timestamp: Date.now(),
               source: "ai_marker",
               text:
-                "Микрофон слышит сигнал, но пока не распознает слова. Частые причины: неверный язык STT, слишком тихий голос или не тот активный микрофон.",
+                "Микрофон слышит сигнал, но пока не распознает слова. Частые причины: неверный язык распознавания, слишком тихий голос или не тот активный микрофон.",
               isFinal: true,
             });
-            logWarn("stt.audio", "Microphone has signal but no transcript yet", {
+            logWarn("speech.audio", "Microphone has signal but no transcript yet", {
               activeLanguage: activeSttLanguageRef.current,
             });
           }
@@ -1360,10 +1614,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               timestamp: Date.now(),
               source: "ai_marker",
               text:
-                "Системный звук слышен, но текст пока не появился. Проверьте язык STT и что речь реально идет в выбранный канал вывода.",
+                "Системный звук слышен, но текст пока не появился. Проверьте язык распознавания и что речь реально идет в выбранный канал вывода.",
               isFinal: true,
             });
-            logWarn("stt.audio", "System audio has signal but no transcript yet", {
+            logWarn("speech.audio", "System audio has signal but no transcript yet", {
               activeLanguage: activeSttLanguageRef.current,
             });
           }
@@ -1374,7 +1628,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         }
         setSttWarmupModelId(null);
         const detail = toFriendlySttStartupError(err);
-        logError("stt.setup", "STT setup failed", { detail, error: err });
+        logError("speech.setup", "Speech setup failed", { detail, error: err });
         setSttStatusText(`Ошибка запуска: ${detail}`);
         addMessage({
           id: crypto.randomUUID(),
@@ -1383,6 +1637,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           text: `Не удалось запустить распознавание речи: ${detail}`,
           isFinal: true,
         });
+        await activateSafeMode(
+          `Распознавание не запустилось: ${detail}. Приложение переведено в Режим без аудио, чтобы не зависать на аудио.`,
+        );
       }
     }
 
@@ -1391,7 +1648,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     return () => {
       disposed = true;
       sttAcceptingResultsRef.current = false;
-      logInfo("stt.setup", "Cleaning up STT listeners/session");
+      logInfo("speech.setup", "Cleaning up speech listeners/session");
       if (noSignalTimer !== null) {
         window.clearTimeout(noSignalTimer);
       }
@@ -1406,7 +1663,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return;
         }
         if (endingRef.current) {
-          logInfo("stt.setup", "Skipping cleanup stop while explicit interview shutdown is running");
+          logInfo("speech.setup", "Skipping cleanup stop while explicit interview shutdown is running");
           return;
         }
         const { isTauri } = await import("@/lib/tauri");
@@ -1420,11 +1677,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     };
   }, [
     addMessage,
+    activateSafeMode,
     ensureActiveSttLanguage,
     handleSttDiagnostic,
     handleSttResult,
     isActive,
     settingsHydrated,
+    sessionMode,
+    safeModeReason,
     stopSttSessionGracefully,
     startSttSessionWithRecovery,
     restartSttSession,
@@ -1529,7 +1789,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: "Лицензионный ключ не задан. Укажи его в настройках.",
+          text: "Лицензионный ключ не задан. Укажите его в настройках.",
           isFinal: true,
         });
         setLastLlmError("Лицензионный ключ не задан.");
@@ -1540,6 +1800,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
       const contextMessages = contextBuffer;
       const manualQuestionText = manualQuestion.trim();
+      const intentSourceText =
+        manualQuestionText || contextMessages.map((message) => message.text).join("\n");
+      const requestIntent = resolveRequestIntentMode(
+        manualQuestionText,
+        intentSourceText,
+        withScreenshot,
+        intentModeOverride,
+      );
       const hasTextQuestion = contextMessages.length > 0 || manualQuestionText.length > 0;
       if (!hasTextQuestion && !withScreenshot) {
         logWarn(
@@ -1566,11 +1834,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         isStreaming: true,
       };
       setLlmResponse(resp);
+      setLastRequestIntent(requestIntent);
+      setLastHintMeta(null);
+      setFeedbackUi({
+        sending: null,
+        sentRating: null,
+        отзываId: null,
+        error: null,
+      });
       addMessage({
         id: crypto.randomUUID(),
         timestamp: Date.now(),
         source: "ai_marker",
-        text: "Запрос отправлен. Ответ появится ниже.",
+        text: `Запрос отправлен. Режим: ${getIntentModeLabel(requestIntent.mode)}.`,
         isFinal: true,
       });
       if (manualQuestionText) {
@@ -1603,11 +1879,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         interviewContext: settings.interviewContext,
         screenshotMode: withScreenshot,
         manualQuestion: manualQuestionText,
+        forcedIntent: requestIntent.mode !== "AUTO" ? requestIntent : undefined,
       });
       let imageBase64Png: string | undefined;
 
       logInfo("llm.request", "Prepared request payload", {
         withScreenshot,
+        intentMode: requestIntent.mode,
+        intentReason: requestIntent.reason,
         transcriptMessages: contextMessages.length,
         transcriptChars: transcript.length,
         manualQuestionChars: manualQuestionText.length,
@@ -1647,7 +1926,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
           if (screenshotBase64 !== null) {
             userPrompt +=
-              "\n\nЗадача по скриншоту: обязательно выполни routing перед ответом. Ручная просьба пользователя важнее OCR/изображения. Если в ручном вопросе или на скриншоте просят дописать/implement/complete/solve/fix/написать функцию/реализовать метод - режим LIVE_CODING, не CODE_REVIEW. Если виден stack trace, failing test или ошибка - DEBUG. Если только код без явной задачи - CODE_REVIEW. Если это не код - THEORY.";
+              "\n\nЗадача по скриншоту: обязательно выполни routing перед ответом. Ручная просьба важнее OCR/изображения. Если в ручном вопросе или на скриншоте просят дописать/implement/complete/solve/fix/написать функцию/реализовать метод - режим LIVE_CODING, не CODE_REVIEW. Если виден stack trace, failing test или ошибка - DEBUG. Если только код без явной задачи - CODE_REVIEW. Если это не код - THEORY.";
             if (settings.imageHandlingMode === "send_image") {
               imageBase64Png = screenshotBase64;
               userPrompt += "\n\nК запросу приложен скриншот экрана с кодом или задачей.";
@@ -1685,11 +1964,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       const requestController = new AbortController();
       abortRef.current = requestController;
       const proxyUiTimeoutMs = withScreenshot ? 25_000 : 15_000;
-      const proxyUiTimeoutMessage = `Прокси отвечает слишком долго (>${Math.round(proxyUiTimeoutMs / 1000)} сек). Проверьте сервер и сеть.`;
+      const proxyUiTimeoutMessage = `Сервис отвечает слишком долго (>${Math.round(proxyUiTimeoutMs / 1000)} сек). Проверьте сеть и повторите попытку.`;
 
       try {
         const startedAtMs = performance.now();
-        logInfo("llm.request", "Sending request to proxy", {
+        logInfo("assistant.request", "Sending request to service", {
           withScreenshot,
           hasImage: Boolean(imageBase64Png),
           baseUrl: HARDCODED_PROXY_BASE_URL,
@@ -1708,9 +1987,18 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           proxyUiTimeoutMs + 1000,
           proxyUiTimeoutMessage,
         );
-        const formatted = formatProxyHintResponse(response);
+        const formatted = formatProxyHintResponse(response, {
+          expectedIntentMode: requestIntent.mode,
+        });
+        setLastHintMeta({
+          hintId: response.hintId ?? null,
+          taskType: response.taskType ?? null,
+          question: userPrompt,
+          hadScreenshot: withScreenshot,
+          intent: requestIntent,
+        });
         const totalMs = performance.now() - startedAtMs;
-        logInfo("llm.request", "Received proxy response", {
+        logInfo("assistant.request", "Received service response", {
           latencyMs: Math.round(totalMs),
           responseChars: formatted.length,
         });
@@ -1724,10 +2012,22 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 firstTokenLatencyMs: totalMs,
               }
             : null,
+          llmResponses: s.lastLlmResponse
+            ? s.llmResponses.map((response) =>
+                response.id === s.lastLlmResponse?.id
+                  ? {
+                      ...response,
+                      text: formatted,
+                      isStreaming: false,
+                      firstTokenLatencyMs: totalMs,
+                    }
+                  : response,
+              )
+            : s.llmResponses,
         }));
 
         if (!formatted.trim()) {
-          const message = "Прокси вернул пустой ответ.";
+          const message = "Сервис вернул пустой ответ.";
           logWarn("llm.request", message);
           setLastLlmError(message);
           addMessage({
@@ -1750,7 +2050,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           finishLlmResponse(0);
           return;
         }
-        logError("llm.request", "Proxy request failed", { message, error: err });
+        logError("assistant.request", "Service request failed", { message, error: err });
         setLastLlmError(message);
         addMessage({
           id: crypto.randomUUID(),
@@ -1773,12 +2073,75 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       contextBuffer,
       finishLlmResponse,
       flushContextBuffer,
+      intentModeOverride,
       isLlmLoading,
       manualQuestion,
       openCropDialog,
       setLlmResponse,
       settings,
     ],
+  );
+
+  const sendAiFeedback = useCallback(
+    async (rating: AiFeedbackRating) => {
+      if (!lastLlmResponse || !lastHintMeta) {
+        setFeedbackUi({
+          sending: null,
+          sentRating: null,
+          отзываId: null,
+          error: "Сначала дождитесь ответа.",
+        });
+        return;
+      }
+
+      setFeedbackUi({
+        sending: rating,
+        sentRating: null,
+        отзываId: null,
+        error: null,
+      });
+
+      try {
+        const response = await submitAiFeedback({
+          licenseKey: settings.apiKey,
+          rating,
+          reason:
+            rating === "wrong_mode"
+              ? "Отмечен неверный режим ответа."
+              : undefined,
+          hintId: lastHintMeta.hintId,
+          intentMode: lastHintMeta.intent.mode,
+          taskType: lastHintMeta.taskType,
+          hadScreenshot: lastHintMeta.hadScreenshot,
+          question: lastHintMeta.question,
+          response: lastLlmResponse.text,
+          appVersion: __APP_VERSION__,
+        });
+
+        setFeedbackUi({
+          sending: null,
+          sentRating: rating,
+          отзываId: response.отзываId,
+          error: null,
+        });
+        logInfo("llm.отзыва", "AI отзыва sent", {
+          rating,
+          отзываId: response.отзываId,
+          hintId: lastHintMeta.hintId,
+        });
+      } catch (error) {
+        const detail =
+          error instanceof Error ? error.message : "Не удалось отправить отзыва.";
+        setFeedbackUi({
+          sending: null,
+          sentRating: null,
+          отзываId: null,
+          error: detail,
+        });
+        logWarn("llm.отзыва", "Failed to send AI отзыва", { rating, error });
+      }
+    },
+    [lastHintMeta, lastLlmResponse, settings.apiKey],
   );
 
   const persistSessionToHistory = useCallback(
@@ -1830,7 +2193,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         endedAt,
         model: settings.selectedModel?.id ?? "proxy",
         provider: "custom",
+        mode: snapshot.mode,
+        safeModeReason: snapshot.safeModeReason,
         metrics: metricsSnapshot,
+        transcript: snapshot.messages.slice(-120),
+        aiResponses: snapshot.llmResponses.slice(-30),
         finalReport: undefined,
       };
 
@@ -1846,7 +2213,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   const closeOverlayWindow = useCallback(async (): Promise<boolean> => {
     if (isEmbeddedMode) {
-      logInfo("helper.window", "Embedded helper close handled by returning to dashboard");
+      logInfo("приложение.window", "Embedded приложение close handled by returning to dashboard");
       return false;
     }
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
@@ -1884,7 +2251,17 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     setIsEndingInterview(true);
     logInfo("interview.end", "Ending interview");
     abortRef.current?.abort();
-    let helperDismissed = false;
+    let приложениеDismissed = false;
+    const endWatchdogId = window.setTimeout(() => {
+      logWarn("interview.end", "End interview is taking longer than expected");
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: "Завершение занимает дольше обычного. Приложение продолжит закрытие в безопасном режиме.",
+        isFinal: true,
+      });
+    }, 3500);
 
     try {
       const endedAt = Date.now();
@@ -1911,9 +2288,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
 
       if (isEmbeddedMode) {
-        helperDismissed = true;
+        приложениеDismissed = true;
         setView("dashboard");
-        logInfo("interview.end", "Embedded helper returned to dashboard");
+        logInfo("interview.end", "Embedded приложение returned to dashboard");
       } else {
         const closedOverlay = await withTimeout(
           closeOverlayWindow(),
@@ -1925,7 +2302,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return false;
         });
         if (closedOverlay) {
-          helperDismissed = true;
+          приложениеDismissed = true;
         } else {
           logWarn("interview.end", "Overlay stayed open, returning to dashboard view");
           setView("dashboard");
@@ -1939,10 +2316,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       endSession();
       setView("dashboard");
       if (isEmbeddedMode) {
-        helperDismissed = true;
+        приложениеDismissed = true;
       }
     } finally {
-      if (!helperDismissed) {
+      window.clearTimeout(endWatchdogId);
+      if (!приложениеDismissed) {
         endingRef.current = false;
         setIsEndingInterview(false);
       }
@@ -1952,6 +2330,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     endSession,
     isEmbeddedMode,
     persistSessionToHistory,
+    addMessage,
     setInterviewActive,
     setIsEndingInterview,
     setView,
@@ -2062,7 +2441,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         e.preventDefault();
         endInterview();
       } else if (matchHotkey(pressed, switchLanguageHk?.keys ?? [])) {
-        logInfo("shortcuts.trigger", "Window shortcut action triggered", { action: "switch_stt_language" });
+    logInfo("shortcuts.trigger", "Window shortcut action triggered", {
+      action: "switch_speech_language",
+    });
         e.preventDefault();
         void toggleSttLanguage();
       }
@@ -2105,7 +2486,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const hasQuestionToSend =
     contextBuffer.length > 0 || manualQuestion.trim().length > 0;
   const visibleMessages = showFullTranscript ? messages : messages.slice(-4);
-  const helperRootClassName = isEmbeddedMode
+  const приложениеRootClassName = isEmbeddedMode
     ? "flex h-full min-h-0 w-full flex-col bg-black/20 text-zinc-100"
     : "h-screen w-screen flex flex-col bg-black/35 text-zinc-100 backdrop-blur-[1px]";
   const newMessagesButtonClassName = isEmbeddedMode
@@ -2115,9 +2496,43 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     lastLlmResponse && !showFullTranscript
       ? "max-h-36 overflow-y-auto px-3 py-2 space-y-2 relative shrink-0 border-b border-zinc-800/70 bg-black/10"
       : "flex-1 overflow-y-auto px-3 py-3 space-y-2.5 relative";
+  const isSafeMode = sessionMode === "safe";
+  const sttNeedsAttention =
+    !isSafeMode &&
+    /ошибка|не поступает|не удалось|жёсткий|аудиосигнал пока|перезапуск stt не удался/i.test(
+      sttStatusText,
+    );
+  const startupProgressRatio = Math.min(
+    sttStartupElapsedMs / LIVE_MODEL_LOADING_ESTIMATE_MS,
+    1,
+  );
+  const startupProgressPercent = isSttStarting
+    ? Math.min(96, 8 + Math.round(startupProgressRatio * 86))
+    : 0;
+  const modelLoadingBannerVisible = !isSafeMode && (isSttStarting || Boolean(sttWarmupUi));
+  const modelLoadingTitle = isSttStarting
+    ? "Загружаем точный профиль распознавания"
+    : sttWarmupUi?.title ?? "Подготавливаем распознавание";
+  const modelLoadingProgressPercent = isSttStarting
+    ? startupProgressPercent
+    : sttWarmupUi?.progressPercent ?? 0;
+  const modelLoadingElapsedLabel = isSttStarting
+    ? `Прошло ${formatElapsed(sttStartupElapsedMs)}`
+    : null;
+  const modelLoadingHint = isSttStarting
+    ? sttStartupElapsedMs > LIVE_MODEL_LOADING_ESTIMATE_MS
+      ? "Large почти загружен или Windows продолжает читать большой языковой граф. Это не зависание: дождитесь статуса готовности."
+      : "Large весит около 3.5 ГБ и загружается в память. Во время загрузки не нажимайте перезапуск аудио."
+    : sttWarmupUi?.hint ?? sttStatusText;
+
+  const openAudioSettings = () => {
+    setSettingsTab("audio");
+    setSettingsFocus("audio-devices");
+    setView("settings");
+  };
 
   return (
-    <div className={helperRootClassName}>
+    <div className={приложениеRootClassName}>
       {/* Header */}
       <div
         className="flex items-center justify-between px-3 py-2 border-b border-zinc-700/60 bg-black/35 shrink-0"
@@ -2137,6 +2552,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               {getLanguageLabel(activeSttLanguage)}
             </span>
           </div>
+          {isSafeMode && (
+            <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-100">
+              Режим без аудио
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 text-zinc-300">
@@ -2159,10 +2579,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               void restartSttSession("manual");
             }}
             disabled={
-              !STT_AUTOSTART_ENABLED || isSttRecovering
+              isSafeMode || !STT_AUTOSTART_ENABLED || isSttRecovering || isSttStarting
             }
             icon={
-              isSttRecovering ? (
+              isSttRecovering || isSttStarting ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
               ) : (
                 <RotateCcw className="w-3 h-3" />
@@ -2170,7 +2590,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             }
             className="min-w-[135px]"
           >
-            Перезапуск аудио
+            {isSafeMode ? "Аудио выкл." : isSttStarting ? "Загрузка..." : "Перезапуск аудио"}
           </Button>
           <Button
             variant="danger"
@@ -2191,6 +2611,129 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         </div>
       </div>
 
+      {modelLoadingBannerVisible && (
+        <div className="mx-3 mt-2 overflow-hidden rounded-xl border border-cyan-300/30 bg-cyan-950/45 shadow-[0_0_30px_rgba(34,211,238,0.12)]">
+          <div className="flex flex-col gap-3 px-3 py-3 md:flex-row md:items-center md:justify-between">
+            <div className="flex min-w-0 items-start gap-3">
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-300/30 bg-cyan-300/10">
+                <Loader2 className="h-4 w-4 animate-spin text-cyan-100" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-cyan-50">
+                    {modelLoadingTitle}
+                  </span>
+                  <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-100">
+                    Не зависло
+                  </span>
+                  {modelLoadingElapsedLabel && (
+                    <span className="font-mono text-[11px] text-cyan-200/80">
+                      {modelLoadingElapsedLabel}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-cyan-100/80">
+                  {modelLoadingHint}
+                </p>
+              </div>
+            </div>
+
+            <div className="w-full shrink-0 md:w-64">
+              <div className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-100/75">
+                <span>Подготовка</span>
+                <span>{modelLoadingProgressPercent}%</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-cyan-950">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-sky-300 to-emerald-300 transition-[width] duration-500 ease-out"
+                  style={{ width: `${modelLoadingProgressPercent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isSafeMode && (
+        <div className="mx-3 mt-2 rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-50">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div className="leading-relaxed">
+              Режим без аудио активен: распознавание не запускается.
+              Доступны ручной вопрос, ножницы и ответы помощника.
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={openAudioSettings}
+                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
+              >
+                Настроить звук
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("dashboard")}
+                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
+              >
+                WAV-тест
+              </button>
+              <button
+                type="button"
+                onClick={resumeLiveMode}
+                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
+              >
+                Вернуть звук
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {sttNeedsAttention && (
+        <div className="mx-3 mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div className="leading-relaxed">
+              Аудио требует внимания: можно перезапустить захват, открыть устройства или перейти
+              на главную и записать WAV-тест.
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void restartSttSession("manual")}
+                disabled={isSttRecovering || isSttStarting}
+                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10 disabled:opacity-50"
+              >
+                {isSttStarting ? "Загрузка..." : "Перезапустить"}
+              </button>
+              <button
+                type="button"
+                onClick={openAudioSettings}
+                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
+              >
+                Устройства
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("dashboard")}
+                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
+              >
+                WAV-тест
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void activateSafeMode(
+                    "Распознавание отключено вручную из панели восстановления.",
+                  )
+                }
+                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
+              >
+                Без аудио
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chat area */}
       <div
         ref={chatContainerRef}
@@ -2200,7 +2743,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full">
             <div className="w-full max-w-xl px-4">
-              {sttWarmupUi && (
+              {sttWarmupUi && !modelLoadingBannerVisible && (
                 <div className="mb-4 rounded-md border border-zinc-700/70 bg-zinc-950/80 px-4 py-3">
                   <div className="flex items-center justify-between gap-3 text-xs text-zinc-300">
                     <span className="font-medium text-zinc-100">{sttWarmupUi.title}</span>
@@ -2254,7 +2797,15 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         <div className="mx-3 mb-2 bg-black/50 border border-zinc-700/80 rounded-lg overflow-hidden shrink-0">
           <div className="flex items-center gap-2 px-3 py-1.5 border-b border-zinc-700/70 bg-zinc-900/55">
             <Bot className="w-3.5 h-3.5 text-zinc-200" />
-            <span className="text-xs font-medium text-zinc-300">Подсказка AI</span>
+            <span className="text-xs font-medium text-zinc-300">Подсказка</span>
+            {lastRequestIntent && (
+              <span
+                className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-100"
+                title={lastRequestIntent.reason}
+              >
+                {getIntentModeLabel(lastRequestIntent.mode)}
+              </span>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -2281,6 +2832,28 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               <Copy className="h-3 w-3" />
               {copiedResponse ? "Скопировано" : "Копировать"}
             </button>
+            {!lastLlmResponse.isStreaming && (
+              <div className="flex items-center gap-1">
+                <FeedbackButton
+                  label="Хорошо"
+                  active={отзываUi.sentRating === "good"}
+                  loading={отзываUi.sending === "good"}
+                  onClick={() => void sendAiFeedback("good")}
+                />
+                <FeedbackButton
+                  label="Плохо"
+                  active={отзываUi.sentRating === "bad"}
+                  loading={отзываUi.sending === "bad"}
+                  onClick={() => void sendAiFeedback("bad")}
+                />
+                <FeedbackButton
+                  label="Не тот режим"
+                  active={отзываUi.sentRating === "wrong_mode"}
+                  loading={отзываUi.sending === "wrong_mode"}
+                  onClick={() => void sendAiFeedback("wrong_mode")}
+                />
+              </div>
+            )}
             {lastLlmResponse.isStreaming && (
               <Loader2 className="w-3 h-3 text-zinc-300 animate-spin" />
             )}
@@ -2300,6 +2873,16 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 <span className="text-zinc-500">Ждем ответ...</span>
               )}
             </p>
+            {отзываUi.отзываId && (
+              <div className="mt-2 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-100">
+                Оценка отправлена: {отзываUi.отзываId}
+              </div>
+            )}
+            {отзываUi.error && (
+              <div className="mt-2 rounded-md border border-red-500/25 bg-red-500/10 px-2 py-1 text-[10px] text-red-100">
+                {отзываUi.error}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2307,13 +2890,33 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       {lastLlmError && (
         <div className="mx-3 mb-2 rounded-lg border border-red-900/70 bg-black/55 px-3 py-2 shrink-0">
           <p className="text-[11px] text-red-200 leading-relaxed">
-            Ошибка AI: {lastLlmError}
+            Ошибка сервиса: {lastLlmError}
           </p>
         </div>
       )}
 
       {/* Manual question input */}
       <div className="px-3 pb-2 shrink-0">
+        <div className="mb-1.5 flex items-center gap-1 overflow-x-auto rounded-lg border border-zinc-800/70 bg-black/25 px-1.5 py-1">
+          {INTERVIEW_INTENT_OPTIONS.map((option) => {
+            const active = intentModeOverride === option.mode;
+            return (
+              <button
+                key={option.mode}
+                type="button"
+                onClick={() => setIntentModeOverride(option.mode)}
+                title={option.hint}
+                className={`shrink-0 rounded-md px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] transition-colors ${
+                  active
+                    ? "border border-cyan-400/35 bg-cyan-400/15 text-cyan-100"
+                    : "border border-transparent text-zinc-500 hover:border-zinc-700 hover:text-zinc-200"
+                }`}
+              >
+                {option.shortLabel}
+              </button>
+            );
+          })}
+        </div>
         <div className="flex items-center gap-2 rounded-lg border border-zinc-700/70 bg-black/40 px-2 py-1.5">
           <input
             type="text"
@@ -2519,6 +3122,34 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
+function FeedbackButton({
+  label,
+  active,
+  loading,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  loading: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={loading}
+      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors ${
+        active
+          ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-100"
+          : "border-zinc-700 text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200"
+      } disabled:cursor-not-allowed disabled:opacity-60`}
+    >
+      {loading && <Loader2 className="h-3 w-3 animate-spin" />}
+      {label}
+    </button>
+  );
+}
+
 function matchHotkey(pressedKeys: string[], keys: string[]): boolean {
   if (keys.length === 0) return false;
   const pressed = new Set(normalizeHotkeyKeys(pressedKeys));
@@ -2535,9 +3166,13 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${pad(h)}:${pad(m % 60)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
 }
 
-type InterviewIntentMode = "LIVE_CODING" | "DEBUG" | "CODE_REVIEW" | "THEORY" | "AUTO";
+function getIntentModeLabel(mode: InterviewIntentMode): string {
+  return (
+    INTERVIEW_INTENT_OPTIONS.find((option) => option.mode === mode)?.label ?? mode
+  );
+}
 
-function inferManualIntentMode(text: string): { mode: InterviewIntentMode; reason: string } {
+function inferManualIntentMode(text: string): InterviewIntent {
   const normalized = text.trim().toLowerCase();
   if (!normalized) {
     return { mode: "AUTO", reason: "ручной вопрос не задан" };
@@ -2560,7 +3195,7 @@ function inferManualIntentMode(text: string): { mode: InterviewIntentMode; reaso
   }
 
   if (
-    /почему|не работает|падает|ошибк|stack|trace|exception|traceback|debug|отлад|failing test|compiler error/.test(
+    /не работает|не запускается|падает|ошибк|stack|trace|exception|traceback|debug|отлад|failing test|compiler error|runtime error|crash|краш|сломал|сломалось|почему.{0,48}(не работает|падает|ошибк|краш|слом)/.test(
       normalized,
     )
   ) {
@@ -2570,16 +3205,112 @@ function inferManualIntentMode(text: string): { mode: InterviewIntentMode; reaso
   return { mode: "AUTO", reason: "явного режима в ручном вопросе нет" };
 }
 
+function inferTextOnlyIntentMode(text: string): InterviewIntent {
+  const explicitIntent = inferManualIntentMode(text);
+  if (explicitIntent.mode !== "AUTO") {
+    return explicitIntent;
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return { mode: "AUTO", reason: "текст вопроса не задан" };
+  }
+
+  if (looksLikeCodeOrStackTrace(trimmed)) {
+    return {
+      mode: "CODE_REVIEW",
+      reason: "текст похож на фрагмент кода без явной задачи",
+    };
+  }
+
+  return {
+    mode: "THEORY",
+    reason: "текстовый вопрос без кода и скриншота",
+  };
+}
+
+function looksLikeCodeOrStackTrace(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const codePatterns = [
+    /```/,
+    /^\s*(import|export|function|class|interface|type|enum|const|let|var|public|private|protected|static|def|async|await)\b/im,
+    /\b(return|throw|try|catch|finally|extends|implements|lambda)\b/i,
+    /=>|===|!==|==|!=|;\s*$/m,
+    /[{}]\s*$/m,
+    /<\/?[a-z][\w-]*(\s+[^>]*)?>/i,
+    /^\s*(select|insert|update|delete|with)\b[\s\S]+\b(from|set|values|where|join)\b/im,
+    /\bat\s+[\w.$]+\([^)]*:\d+:\d+\)/i,
+    /\b(nullpointerexception|syntaxerror|typeerror|referenceerror|traceback|stack trace)\b/i,
+  ];
+
+  return codePatterns.some((pattern) => pattern.test(normalized));
+}
+
+function looksLikeTheoryQuestion(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized || looksLikeCodeOrStackTrace(normalized)) {
+    return false;
+  }
+
+  return (
+    /\?$/.test(normalized) ||
+    /(^|[\s.,:;!?()[\]{}"'«»])(что такое|объясни|расскажи|зачем|как работает|какие|какой|какая|какое|уровни|виды|типы|отличие|разница|принципы|концепц|архитектур|транзакц|изоляц|индекс|postgres|postgresql|постгрес|постгрей|пас грей|пасгрей|база данных|бд)(?=$|[\s.,:;!?()[\]{}"'«»])/.test(
+      normalized,
+    )
+  );
+}
+
+function resolveRequestIntentMode(
+  manualQuestion: string,
+  requestText: string,
+  screenshotMode: boolean,
+  overrideMode: InterviewIntentMode,
+): InterviewIntent {
+  if (overrideMode !== "AUTO") {
+    return {
+      mode: overrideMode,
+      reason: `режим выбран вручную: ${getIntentModeLabel(overrideMode)}`,
+    };
+  }
+
+  const manualIntent = inferManualIntentMode(manualQuestion);
+  if (manualIntent.mode !== "AUTO") {
+    return manualIntent;
+  }
+
+  if (manualQuestion.trim() && screenshotMode && looksLikeTheoryQuestion(manualQuestion)) {
+    return {
+      mode: "THEORY",
+      reason: "ручной вопрос выглядит как устная теория без кода",
+    };
+  }
+
+  if (screenshotMode) {
+    return {
+      mode: "AUTO",
+      reason: "режим будет выбран по скриншоту/OCR",
+    };
+  }
+
+  return inferTextOnlyIntentMode(requestText);
+}
+
 function buildInterviewPrompt({
   transcript,
   interviewContext,
   screenshotMode = false,
   manualQuestion = "",
+  forcedIntent,
 }: {
   transcript: string;
   interviewContext: string;
   screenshotMode?: boolean;
   manualQuestion?: string;
+  forcedIntent?: InterviewIntent;
 }): string {
   const normalizedContext = interviewContext.trim();
   const contextBlock = normalizedContext
@@ -2587,16 +3318,20 @@ function buildInterviewPrompt({
     : "Контекст интервью:\nТехническое собеседование по разработке программного обеспечения.\n\n";
   const manualIntent = inferManualIntentMode(manualQuestion);
   const manualBlock = manualQuestion.trim()
-    ? `Ручная просьба пользователя:\n${manualQuestion.trim()}\n\nПредварительный routing по ручной просьбе: ${manualIntent.mode} (${manualIntent.reason}). Если это не AUTO, считай его приоритетнее OCR и изображения.\n\n`
+    ? `Ручная просьба:\n${manualQuestion.trim()}\n\nПредварительный routing по ручной просьбе: ${manualIntent.mode} (${manualIntent.reason}). Если это не AUTO, считай его приоритетнее OCR и изображения.\n\n`
     : "";
+  const forcedIntentBlock =
+    forcedIntent && forcedIntent.mode !== "AUTO"
+      ? `Режим уже определен приложением: ${forcedIntent.mode} (${forcedIntent.reason}). Это жесткое указание. Не меняй режим на другой, даже если вокруг есть слова про routing, патч или ревью.\n\n`
+      : "";
 
   const intentRules = `Routing перед ответом:
 1. Сначала выбери ровно один режим: LIVE_CODING, DEBUG, CODE_REVIEW или THEORY.
-2. Приоритет источников: ручная просьба пользователя > явная формулировка на скриншоте/OCR > ошибка/stack trace > просто видимый код > общий разговор.
+2. Приоритет источников: ручная просьба > явная формулировка на скриншоте/OCR > ошибка/stack trace > просто видимый код > общий разговор.
 3. LIVE_CODING: пользователь просит написать, дописать, implement, complete, solve, fix, реализовать метод, добавить фрагмент, решить алгоритмическую задачу. В этом режиме не делай ревью, сразу дай решение.
 4. DEBUG: виден stack trace, exception, failing test, compiler/runtime error, "почему не работает", "падает", "разберись с ошибкой". Дай причину и конкретную правку.
 5. CODE_REVIEW: пользователь просит ревью/проверку/найти баги или на скриншоте только код без явной задачи и без ошибки. Дай риски и минимальный патч.
-6. THEORY: вопрос без кода: концепция, архитектура, технология, trade-offs, устная формулировка.
+6. THEORY: вопрос без кода: концепция, архитектура, технология, trade-offs, устная формулировка. Если запрос текстовый и в нем нет кода/stack trace/скриншота, это THEORY, а не CODE_REVIEW.
 7. Если на скриншоте есть код и слова "implement/complete/solve/fix/дописать/написать функцию", это LIVE_CODING даже если код выглядит как кандидат для ревью.
 8. Если ручная просьба противоречит скриншоту, выполняй ручную просьбу.
 
@@ -2605,19 +3340,27 @@ function buildInterviewPrompt({
 - "почему падает этот тест?" + stack trace => DEBUG.
 - "проверь этот код" + код => CODE_REVIEW.
 - только код без задачи => CODE_REVIEW.
-- "что такое индексы в БД?" => THEORY.`;
+- "что такое индексы в БД?" => THEORY.
+- "уровни изоляции транзакций в PostgreSQL" => THEORY.
+- "уровни изоляции транзакций в пас грейся" => THEORY, распознай как PostgreSQL.`;
 
   const screenshotBlock = screenshotMode
     ? `Режим скриншота:
 - Используй изображение/OCR как главный источник задачи.
 - Не делай code review, если на скриншоте или в ручном вопросе просят дописать, исправить или решить.
-- Если OCR и изображение расходятся, доверься смыслу видимого интерфейса и формулировке пользователя.
+- Если OCR и изображение расходятся, доверься смыслу видимого интерфейса и формулировке на экране.
 - Если задача неоднозначна, назови выбранный режим в первой строке и дай самое полезное действие.\n\n`
     : "";
+  const finalIntentReminder =
+    forcedIntent && forcedIntent.mode !== "AUTO"
+      ? `\n\nФинальное обязательное решение routing для этого запроса: ${forcedIntent.mode}. Ответь именно в этом режиме. Не выводи одно только название режима; дай полезный ответ по сути.`
+      : !screenshotMode
+        ? "\n\nФинальное правило для текстового запроса: если в транскрипте нет кода, stack trace или явной просьбы о ревью, выбери THEORY и дай устный ответ по теме."
+        : "";
 
-  return `${contextBlock}${manualBlock}Важно:
+  return `${contextBlock}${manualBlock}${forcedIntentBlock}Важно:
 - в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;
-- если слово распознано неточно, интерпретируй его в пользу технического смысла;
+- если слово распознано неточно, интерпретируй его в пользу технического смысла: например "пас грейся", "постгрей" или "постгрес" = PostgreSQL;
 - не пиши академические определения и длинные теоретические абзацы;
 - ответ должен быть прикладным и пригодным для устного ответа на собеседовании;
 - отвечай кратко, но с конкретикой: код, причина, патч или готовая формулировка.\n\n${intentRules}\n\n${screenshotBlock}Формат ответа строго:
@@ -2627,7 +3370,7 @@ function buildInterviewPrompt({
 4) Если LIVE_CODING: минимальное решение или недостающий фрагмент кода.
 5) Если DEBUG: причина ошибки и конкретная правка.
 6) Если CODE_REVIEW: баги/риски и минимальный патч.
-7) Если THEORY: короткое объяснение и практический пример.\n\nТранскрипт интервью:\n${transcript}\n\nДай ответ по выбранному режиму.`;
+7) Если THEORY: короткое объяснение и практический пример. Не предлагай патч, code review или "следующие шаги".\n\nТранскрипт интервью:\n${transcript}${finalIntentReminder}\n\nДай ответ по выбранному режиму.`;
 }
 
 async function captureScreenshotAsBase64Png(): Promise<string> {

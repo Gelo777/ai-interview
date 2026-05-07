@@ -80,27 +80,27 @@ export function logError(scope: string, message: string, details?: unknown): voi
 function buildEnvironmentSection(): string {
   const lines: string[] = [];
   const nowIso = new Date().toISOString();
-  lines.push(`Generated at: ${nowIso}`);
-  lines.push(`Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
-  lines.push(`User agent: ${navigator.userAgent}`);
+  lines.push(`Сформировано: ${nowIso}`);
+  lines.push(`Часовой пояс: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
+  lines.push(`Среда: ${navigator.userAgent}`);
   if (typeof window !== "undefined") {
-    lines.push(`Location: ${window.location.href}`);
+    lines.push(`Окно: ${window.location.href}`);
   }
   return lines.join("\n");
 }
 
 export function buildDiagnosticsReport(entries: DiagnosticEntry[]): string {
   const header = [
-    "AI Interview Diagnostics Report",
-    "================================",
+    "Отчет приложения AI Interview",
+    "============================",
     buildEnvironmentSection(),
     "",
-    `Entries: ${entries.length}`,
+    `Записей: ${entries.length}`,
     "",
   ].join("\n");
 
   if (entries.length === 0) {
-    return `${header}\nNo diagnostic entries recorded yet.`;
+    return `${header}\nЗаписей пока нет.`;
   }
 
   const body = entries
@@ -159,4 +159,3 @@ export function installGlobalErrorDiagnostics(): () => void {
     window.removeEventListener("unhandledrejection", onUnhandledRejection);
   };
 }
-

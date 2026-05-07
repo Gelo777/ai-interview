@@ -20,7 +20,7 @@ export async function refreshLocalReadinessNow() {
     vosk: local.voskStatus,
     voskDetail:
       installingVosk && local.voskStatus !== "granted"
-        ? installDetail || "Устанавливаем компоненты Vosk..."
+        ? installDetail || "Устанавливаем компоненты распознавания..."
         : local.voskDetail,
     voskRuntimeLoaded: local.voskRuntimeLoaded,
     voskRuntimePath: local.voskRuntimePath,

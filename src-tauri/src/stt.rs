@@ -85,13 +85,12 @@ impl SttEngine {
             runtime_library_loaded: runtime_library_available,
             runtime_library_path: self.config.runtime_library_path.clone(),
             detail: match (runtime_library_available, model_exists) {
-                (true, true) => "Vosk runtime and model found. Ready to start.".to_string(),
+                (true, true) => "Компоненты распознавания найдены. Можно запускать.".to_string(),
                 (false, true) => {
-                    "Vosk model found, but runtime library is missing/unloadable.".to_string()
+                    "Русский профиль найден, но компоненты распознавания не загрузились.".to_string()
                 }
                 (true, false) => format!(
-                    "Vosk runtime found, but model is missing. Download a model to: {} \
-                     (https://e-rd.ru/downloads/ai-interview/vosk/model-list.json)",
+                    "Компоненты распознавания найдены, но русский профиль не установлен. Установите его в настройках. Папка: {}",
                     if self.config.model_path.is_empty() {
                         "<app_data>/models/vosk/"
                     } else {
@@ -99,8 +98,7 @@ impl SttEngine {
                     }
                 ),
                 (false, false) => format!(
-                    "Vosk runtime library and model are missing. Model path: {}. \
-                     Runtime is expected in app resources or VOSK_LIB_DIR.",
+                    "Компоненты распознавания и русский профиль не установлены. Папка профиля: {}.",
                     if self.config.model_path.is_empty() {
                         "<app_data>/models/vosk/"
                     } else {

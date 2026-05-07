@@ -36,6 +36,9 @@ const HEAVY_MODEL_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(210);
 const SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(70);
 const HEAVY_MODEL_SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
 const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+const STT_TARGET_RMS: f64 = 4200.0;
+const STT_MIN_RMS_FOR_GAIN: f64 = 280.0;
+const STT_MAX_GAIN: f64 = 3.0;
 
 fn is_heavy_vosk_model_path(model_path: &Path) -> bool {
     let lower = model_path.to_string_lossy().to_lowercase();
@@ -111,7 +114,7 @@ pub fn start_global_session(app: AppHandle, config: SttRuntimeConfig) -> Result<
         cleanup_finished_session_locked(&mut guard);
 
         if guard.is_some() {
-            return Err("STT session is already running".to_string());
+            return Err("Распознавание уже запущено".to_string());
         }
     }
 
@@ -173,7 +176,7 @@ pub fn start_global_session(app: AppHandle, config: SttRuntimeConfig) -> Result<
         if guard.is_some() {
             let _ = control_tx.send(ControlMessage::Stop);
             let _ = handle.join();
-            return Err("STT session is already running".to_string());
+            return Err("Распознавание уже запущено".to_string());
         }
         *guard = Some(SessionController {
             tx: control_tx.clone(),
@@ -215,7 +218,7 @@ pub fn stop_global_session() -> Result<(), String> {
         if session_stopping_flag().load(Ordering::Relaxed) {
             log::info!("STT stop requested while previous stop is still completing");
             return Err(
-                "STT stop is still in progress. Please retry in a few seconds.".to_string(),
+                "Остановка распознавания еще выполняется. Повторите через несколько секунд.".to_string(),
             );
         }
 
@@ -255,7 +258,7 @@ pub fn stop_global_session() -> Result<(), String> {
                 STOP_JOIN_GRACE_PERIOD
             );
             return Err(
-                "STT stop is still in progress. Please retry in a few seconds.".to_string(),
+                "Остановка распознавания еще выполняется. Повторите через несколько секунд.".to_string(),
             );
         }
 
@@ -273,7 +276,7 @@ pub fn switch_global_model(model_path: PathBuf) -> Result<(), String> {
 
     let controller = guard
         .as_ref()
-        .ok_or_else(|| "STT session is not running".to_string())?;
+        .ok_or_else(|| "Распознавание не запущено".to_string())?;
 
     let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
     controller
@@ -287,7 +290,7 @@ pub fn switch_global_model(model_path: PathBuf) -> Result<(), String> {
     match reply_rx.recv_timeout(MODEL_SWITCH_MANAGER_TIMEOUT) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err("Timed out while switching STT model".to_string())
+            Err("Переключение профиля заняло слишком много времени".to_string())
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err("STT model switch channel disconnected".to_string())
@@ -303,7 +306,7 @@ pub fn preload_global_model(model_path: PathBuf) -> Result<(), String> {
 
     let controller = guard
         .as_ref()
-        .ok_or_else(|| "STT session is not running".to_string())?;
+        .ok_or_else(|| "Распознавание не запущено".to_string())?;
 
     let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
     controller
@@ -317,7 +320,7 @@ pub fn preload_global_model(model_path: PathBuf) -> Result<(), String> {
     match reply_rx.recv_timeout(MODEL_PRELOAD_MANAGER_TIMEOUT) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err("Timed out while preloading STT model".to_string())
+            Err("Подготовка профиля заняла слишком много времени".to_string())
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err("STT model preload channel disconnected".to_string())
@@ -536,12 +539,6 @@ impl SttSession {
             if let Some(warning) = maybe_system_selector_warning {
                 source_warnings.push(warning);
             }
-            if !can_start_system_audio {
-                source_warnings.push(
-                    "Системный звук в помощнике временно отключен для тяжелой модели речи. Переключите STT-модель на Small, если нужен одновременный захват микрофона и системного звука."
-                        .to_string(),
-                );
-            }
             if can_start_system_audio {
                 let system_audio_status = system_audio::get_system_audio_status(
                     resolved_system_audio_selector.as_deref(),
@@ -598,13 +595,7 @@ impl SttSession {
         let system_audio_process = {
             const MACOS_SYSTEM_AUDIO_SAMPLE_RATE: u32 = 16000;
 
-            if false && heavy_model && started_sources > 0 {
-                source_warnings.push(
-                    "System audio capture was skipped because the selected STT model is heavy; use a small model for dual-source capture."
-                        .to_string(),
-                );
-                None
-            } else {
+            {
                 if heavy_model && started_sources > 0 {
                     log::info!(
                     "Starting dual-source STT with a heavy model on macOS; startup time and CPU usage may increase"
@@ -658,12 +649,12 @@ impl SttSession {
             } else {
                 source_warnings.join(" ")
             };
-            return Err(format!("STT could not start. {}", detail));
+            return Err(format!("Распознавание не запустилось. {}", detail));
         }
 
         if !source_warnings.is_empty() {
             log::warn!(
-                "STT started with limited audio capture: {}",
+                "Распознавание запущено с ограниченным захватом аудио: {}",
                 source_warnings.join(" | ")
             );
             for warning in source_warnings {
@@ -813,7 +804,7 @@ fn build_capture_stream(
                         let mono = downmix_f32_to_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         log::warn!("{} capture stream error: {}", error_label, err);
@@ -832,7 +823,7 @@ fn build_capture_stream(
                         let mono = downmix_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         log::warn!("{} capture stream error: {}", error_label, err);
@@ -851,7 +842,7 @@ fn build_capture_stream(
                         let mono = downmix_u16_to_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         log::warn!("{} capture stream error: {}", error_label, err);
@@ -1049,7 +1040,7 @@ fn build_windows_loopback_stream(
                         let mono = downmix_f32_to_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         let message = format!("Loopback stream '{}' error: {}", label, err);
@@ -1071,7 +1062,7 @@ fn build_windows_loopback_stream(
                         let mono = downmix_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         let message = format!("Loopback stream '{}' error: {}", label, err);
@@ -1093,7 +1084,7 @@ fn build_windows_loopback_stream(
                         let mono = downmix_u16_to_i16(data, channels);
                         let samples =
                             resample_mono_i16(&mono, source_sample_rate, target_sample_rate);
-                        enqueue_audio_chunk(&tx, samples);
+                        enqueue_audio_chunk(&tx, condition_audio_for_stt(&samples));
                     },
                     move |err| {
                         let message = format!("Loopback stream '{}' error: {}", label, err);
@@ -1707,6 +1698,10 @@ fn resample_mono_i16(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<
         return samples.to_vec();
     }
 
+    if output_rate < input_rate {
+        return downsample_mono_i16_area(samples, input_rate, output_rate);
+    }
+
     let ratio = output_rate as f64 / input_rate as f64;
     let output_len = ((samples.len() as f64) * ratio).round() as usize;
     if output_len == 0 {
@@ -1731,6 +1726,82 @@ fn resample_mono_i16(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<
     }
 
     output
+}
+
+fn condition_audio_for_stt(samples: &[i16]) -> Vec<i16> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mean = samples.iter().map(|sample| *sample as f64).sum::<f64>() / samples.len() as f64;
+    let rms = (samples
+        .iter()
+        .map(|sample| {
+            let centered = *sample as f64 - mean;
+            centered * centered
+        })
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+
+    if rms < STT_MIN_RMS_FOR_GAIN {
+        return samples
+            .iter()
+            .map(|sample| clamp_i16_from_f64(*sample as f64 - mean))
+            .collect();
+    }
+
+    let gain = (STT_TARGET_RMS / rms).clamp(1.0, STT_MAX_GAIN);
+    samples
+        .iter()
+        .map(|sample| {
+            let centered = *sample as f64 - mean;
+            clamp_i16_from_f64(centered * gain)
+        })
+        .collect()
+}
+
+fn downsample_mono_i16_area(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16> {
+    let ratio = input_rate as f64 / output_rate as f64;
+    let output_len = ((samples.len() as f64) / ratio).round() as usize;
+    if output_len == 0 {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(output_len);
+    for output_index in 0..output_len {
+        let source_start = output_index as f64 * ratio;
+        let source_end = ((output_index + 1) as f64 * ratio).min(samples.len() as f64);
+        let mut cursor = source_start;
+        let mut weighted_sum = 0.0_f64;
+        let mut total_weight = 0.0_f64;
+
+        while cursor < source_end {
+            let sample_index = cursor.floor() as usize;
+            let next_boundary = ((sample_index + 1) as f64).min(source_end);
+            let weight = next_boundary - cursor;
+            if let Some(sample) = samples.get(sample_index) {
+                weighted_sum += *sample as f64 * weight;
+                total_weight += weight;
+            }
+            cursor = next_boundary;
+        }
+
+        let averaged = if total_weight > 0.0 {
+            weighted_sum / total_weight
+        } else {
+            *samples.last().unwrap_or(&0) as f64
+        };
+        output.push(clamp_i16_from_f64(averaged));
+    }
+
+    output
+}
+
+fn clamp_i16_from_f64(value: f64) -> i16 {
+    value
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 #[cfg(target_os = "macos")]
@@ -1882,7 +1953,7 @@ impl VoskApi {
             crate::vosk_runtime::ensure_runtime_dir_on_path(runtime_library_path);
             let lib = Library::new(runtime_library_path).map_err(|e| {
                 format!(
-                    "Failed to load Vosk runtime '{}': {}",
+                    "Не удалось загрузить голосовой модуль '{}': {}",
                     runtime_library_path.display(),
                     e
                 )
@@ -2068,7 +2139,7 @@ fn get_or_load_vosk_api(runtime_library_path: &Path) -> Result<Arc<VoskApi>, Str
     {
         let guard = runtime_api_cache()
             .lock()
-            .map_err(|_| "Failed to lock Vosk runtime cache".to_string())?;
+            .map_err(|_| "Не удалось подготовить голосовой модуль".to_string())?;
         if let Some(api) = guard.get(&runtime_library_path) {
             return Ok(api.clone());
         }
@@ -2077,7 +2148,7 @@ fn get_or_load_vosk_api(runtime_library_path: &Path) -> Result<Arc<VoskApi>, Str
     let api = Arc::new(VoskApi::load(&runtime_library_path)?);
     let mut guard = runtime_api_cache()
         .lock()
-        .map_err(|_| "Failed to lock Vosk runtime cache".to_string())?;
+        .map_err(|_| "Не удалось подготовить голосовой модуль".to_string())?;
     let entry = guard
         .entry(runtime_library_path)
         .or_insert_with(|| api.clone());
@@ -2256,12 +2327,12 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn strip_windows_verbatim_prefix_restores_regular_drive_path() {
-        let original = Path::new(r"\\?\C:\Users\Dmitry\models\vosk-model-small-ru-0.22");
+        let original = Path::new(r"\\?\C:\Users\Dmitry\models\vosk-model-ru-0.42");
         let stripped = strip_windows_verbatim_prefix(original);
 
         assert_eq!(
             stripped,
-            PathBuf::from(r"C:\Users\Dmitry\models\vosk-model-small-ru-0.22")
+            PathBuf::from(r"C:\Users\Dmitry\models\vosk-model-ru-0.42")
         );
     }
 }

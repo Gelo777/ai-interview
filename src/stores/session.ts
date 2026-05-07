@@ -3,18 +3,23 @@ import type { ChatMessage, LlmResponse } from "@/lib/types";
 
 interface SessionState {
   isActive: boolean;
+  mode: "live" | "safe";
+  safeModeReason: string | null;
   startedAt: number | null;
   elapsedMs: number;
   messages: ChatMessage[];
   contextBuffer: ChatMessage[];
   lastLlmResponse: LlmResponse | null;
+  llmResponses: LlmResponse[];
   llmRequestCount: number;
   llmLatencies: { firstToken: number; total: number }[];
   interviewerChars: number;
   userChars: number;
   isLlmLoading: boolean;
 
-  startSession: () => void;
+  startSession: (options?: { mode?: "live" | "safe"; safeModeReason?: string | null }) => void;
+  setSafeMode: (reason: string) => void;
+  setLiveMode: () => void;
   endSession: () => void;
   tick: () => void;
   addMessage: (msg: ChatMessage) => void;
@@ -35,25 +40,31 @@ function estimateMessageBytes(msg: ChatMessage): number {
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   isActive: false,
+  mode: "live",
+  safeModeReason: null,
   startedAt: null,
   elapsedMs: 0,
   messages: [],
   contextBuffer: [],
   lastLlmResponse: null,
+  llmResponses: [],
   llmRequestCount: 0,
   llmLatencies: [],
   interviewerChars: 0,
   userChars: 0,
   isLlmLoading: false,
 
-  startSession: () =>
+  startSession: (options) =>
     set({
       isActive: true,
+      mode: options?.mode ?? "live",
+      safeModeReason: options?.safeModeReason ?? null,
       startedAt: Date.now(),
       elapsedMs: 0,
       messages: [],
       contextBuffer: [],
       lastLlmResponse: null,
+      llmResponses: [],
       llmRequestCount: 0,
       llmLatencies: [],
       interviewerChars: 0,
@@ -61,14 +72,29 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isLlmLoading: false,
     }),
 
+  setSafeMode: (reason) =>
+    set({
+      mode: "safe",
+      safeModeReason: reason,
+    }),
+
+  setLiveMode: () =>
+    set({
+      mode: "live",
+      safeModeReason: null,
+    }),
+
   endSession: () =>
     set({
       isActive: false,
+      mode: "live",
+      safeModeReason: null,
       startedAt: null,
       elapsedMs: 0,
       messages: [],
       contextBuffer: [],
       lastLlmResponse: null,
+      llmResponses: [],
       llmRequestCount: 0,
       llmLatencies: [],
       interviewerChars: 0,
@@ -128,17 +154,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }),
 
   setLlmResponse: (resp) =>
-    set({
+    set((s) => ({
       lastLlmResponse: resp,
+      llmResponses: [...s.llmResponses, resp],
       isLlmLoading: true,
-      llmRequestCount: get().llmRequestCount + 1,
-    }),
+      llmRequestCount: s.llmRequestCount + 1,
+    })),
 
   appendLlmText: (text) =>
     set((s) => ({
       lastLlmResponse: s.lastLlmResponse
         ? { ...s.lastLlmResponse, text: s.lastLlmResponse.text + text }
         : null,
+      llmResponses: s.lastLlmResponse
+        ? s.llmResponses.map((response) =>
+            response.id === s.lastLlmResponse?.id
+              ? { ...response, text: response.text + text }
+              : response,
+          )
+        : s.llmResponses,
     })),
 
   finishLlmResponse: (totalLatencyMs) =>
@@ -146,6 +180,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       lastLlmResponse: s.lastLlmResponse
         ? { ...s.lastLlmResponse, isStreaming: false, totalLatencyMs }
         : null,
+      llmResponses: s.lastLlmResponse
+        ? s.llmResponses.map((response) =>
+            response.id === s.lastLlmResponse?.id
+              ? { ...response, isStreaming: false, totalLatencyMs }
+              : response,
+          )
+        : s.llmResponses,
       isLlmLoading: false,
       llmLatencies: [
         ...s.llmLatencies,

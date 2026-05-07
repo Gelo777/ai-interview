@@ -13,18 +13,10 @@ export type SttQualityProfile = {
 
 export const STT_QUALITY_PROFILES: readonly SttQualityProfile[] = [
   {
-    id: "small",
-    label: "Small",
-    shortLabel: "Small",
-    description: "Быстрый старт и минимальная нагрузка. Хороший стабильный live-режим.",
-    primaryVariant: "small",
-    secondaryVariant: "small",
-  },
-  {
     id: "large",
     label: "Large",
     shortLabel: "Large",
-    description: "Более точное распознавание Vosk, но модель тяжелее и запускается дольше.",
+    description: "Основной точный профиль для русского распознавания.",
     primaryVariant: "large",
     secondaryVariant: "large",
   },
@@ -77,5 +69,5 @@ export function resolvePreferredSttVariantForLanguage(params: {
     return secondaryVariant;
   }
 
-  return primaryVariant;
+  return "large";
 }

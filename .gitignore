@@ -24,6 +24,14 @@ src-tauri/resources/models/vosk/vosk-model-ru-0.42/
 # Logs
 *.log
 npm-debug.log*
+*.pid
+
+# Local debug artifacts
+.chrome-debug-profile*/
+chrome-dump.html
+chrome-localhost.png
+ai-window-printwindow*.png
+desktop-screenshot-debug*.png
 
 # Env
 .env

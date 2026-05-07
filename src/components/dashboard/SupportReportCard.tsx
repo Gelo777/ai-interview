@@ -5,10 +5,12 @@ import { Card } from "@/components/ui/Card";
 import { useAppStore } from "@/stores/app";
 import { useDiagnosticsStore } from "@/stores/diagnostics";
 import { useSettingsStore } from "@/stores/settings";
-import { buildDiagnosticsReport, copyDiagnosticsReportToClipboard } from "@/lib/diagnostics";
+import { copyDiagnosticsReportToClipboard } from "@/lib/diagnostics";
+import { submitSupportReport } from "@/lib/proxy";
+import { buildRedactedDiagnosticsReport } from "@/lib/supportReporting";
 
 function maskDevice(value: string): string {
-  return value.trim() ? "custom selected" : "system default";
+  return value.trim() ? "выбрано вручную" : "по умолчанию";
 }
 
 export function SupportReportCard() {
@@ -24,42 +26,46 @@ export function SupportReportCard() {
   const imageHandlingMode = useSettingsStore((state) => state.imageHandlingMode);
   const protectOverlay = useSettingsStore((state) => state.protectOverlay);
   const chatMemoryLimitMb = useSettingsStore((state) => state.chatMemoryLimitMb);
+  const apiKey = useSettingsStore((state) => state.apiKey);
   const [copied, setCopied] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sentReportId, setSentReportId] = useState<string | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   const report = useMemo(() => {
     const safeSnapshot = [
-      "AI Interview Support Snapshot",
-      "=============================",
-      `App version: ${__APP_VERSION__}`,
-      `Update status: ${appUpdate.available ? `available ${appUpdate.version}` : "up to date or unknown"}`,
+      "Отчет поддержки AI Interview",
+      "============================",
+      `Версия приложения: ${__APP_VERSION__}`,
+      `Обновление: ${appUpdate.available ? `доступно ${appUpdate.version}` : "актуально или не проверено"}`,
       "",
-      "Readiness",
-      "---------",
-      `License: ${readiness.apiKey} (${readiness.apiKeyDetail})`,
-      `Proxy/model: ${readiness.model} (${readiness.modelDetail})`,
-      `Vosk: ${readiness.vosk} (${readiness.voskDetail})`,
-      `Vosk runtime loaded: ${readiness.voskRuntimeLoaded}`,
-      `Vosk model loaded: ${readiness.voskModelLoaded}`,
+      "Готовность",
+      "----------",
+      `Лицензия: ${readiness.apiKey} (${readiness.apiKeyDetail})`,
+      `Сервис: ${readiness.model} (${readiness.modelDetail})`,
+      `Распознавание: ${readiness.vosk} (${readiness.voskDetail})`,
+      `Компоненты распознавания: ${readiness.voskRuntimeLoaded}`,
+      `Русский профиль: ${readiness.voskModelLoaded}`,
       "",
-      "Permissions",
-      "-----------",
-      `Microphone: ${permissions.microphone}`,
-      `System audio: ${permissions.systemAudio}`,
-      `Screen capture: ${permissions.screenCapture}`,
+      "Доступы",
+      "-------",
+      `Микрофон: ${permissions.microphone}`,
+      `Системный звук: ${permissions.systemAudio}`,
+      `Скриншот: ${permissions.screenCapture}`,
       "",
-      "Settings without secrets",
-      "------------------------",
-      `Language: ${primaryLanguage}`,
-      `STT profile: ${primarySttVariant}`,
-      `Microphone device: ${maskDevice(microphoneDeviceId)}`,
-      `System audio device: ${maskDevice(systemAudioDeviceId)}`,
-      `Image handling: ${imageHandlingMode}`,
-      `Capture protection toggle: ${protectOverlay}`,
-      `Chat memory limit: ${chatMemoryLimitMb} MB`,
+      "Настройки без секретов",
+      "---------------------",
+      `Язык: ${primaryLanguage}`,
+      `Профиль речи: ${primarySttVariant}`,
+      `Микрофон: ${maskDevice(microphoneDeviceId)}`,
+      `Системный звук: ${maskDevice(systemAudioDeviceId)}`,
+      `Скриншоты: ${imageHandlingMode}`,
+      `Скрытие при шаринге: ${protectOverlay}`,
+      `Лимит истории: ${chatMemoryLimitMb} MB`,
       "",
     ].join("\n");
 
-    return `${safeSnapshot}\n${buildDiagnosticsReport(entries.slice(0, 120))}`;
+    return `${safeSnapshot}\n${buildRedactedDiagnosticsReport(entries.slice(0, 120))}`;
   }, [
     appUpdate.available,
     appUpdate.version,
@@ -83,32 +89,70 @@ export function SupportReportCard() {
     }
   }, [report]);
 
+  const sendReport = useCallback(async () => {
+    setSending(true);
+    setSentReportId(null);
+    setSendError(null);
+
+    try {
+      const response = await submitSupportReport({
+        licenseKey: apiKey,
+        report,
+        appVersion: __APP_VERSION__,
+        category: "desktop-support-report",
+      });
+      setSentReportId(response.reportId);
+    } catch (error) {
+      setSendError(
+        error instanceof Error
+          ? error.message
+          : "Не удалось отправить сообщение.",
+      );
+    } finally {
+      setSending(false);
+    }
+  }, [apiKey, report]);
+
   return (
     <Card
-      title="Отчет поддержки"
-      description="Один текстовый отчет без лицензии и без секретов: версия, готовность, аудио, последние ошибки."
+      title="Помощь и обращение"
+      description="Короткое сообщение для поддержки: версия приложения, готовность, аудио и последние ошибки."
     >
       <div className="space-y-4">
         <div className="rounded-2xl border border-white/10 bg-white/[0.035] p-4 text-sm leading-relaxed text-text-secondary">
-          Если у пользователя что-то не работает, попросите нажать эту кнопку и отправить отчет.
-          Так будет видно состояние Vosk, аудио, лицензии и последние диагностические события.
+          Если что-то не работает, отправьте сообщение. Оно поможет быстрее понять состояние лицензии, аудио и запуска.
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
+          <Button onClick={sendReport} disabled={sending} icon={<FileText className="h-4 w-4" />}>
+            {sending ? "Отправляем..." : "Отправить сообщение"}
+          </Button>
           <Button onClick={copyReport} icon={<FileText className="h-4 w-4" />}>
-            {copied ? "Отчет скопирован" : "Скопировать отчет"}
+            {copied ? "Сообщение скопировано" : "Скопировать сообщение"}
           </Button>
           <Button
             variant="secondary"
             onClick={clearEntries}
             icon={<Trash2 className="h-4 w-4" />}
           >
-            Очистить логи
+            Очистить журнал
           </Button>
         </div>
 
+        {sentReportId && (
+          <div className="rounded-2xl border border-success/25 bg-success-muted/60 px-4 py-3 text-sm text-success">
+            Сообщение отправлено. ID обращения: {sentReportId}
+          </div>
+        )}
+
+        {sendError && (
+          <div className="rounded-2xl border border-danger/35 bg-danger/10 px-4 py-3 text-sm leading-relaxed text-danger">
+            {sendError}
+          </div>
+        )}
+
         <div className="text-xs text-text-muted">
-          В журнале сейчас {entries.length} событий. В отчет попадут последние 120.
+          В журнале сейчас {entries.length} событий. В сообщение попадут последние 120.
         </div>
       </div>
     </Card>

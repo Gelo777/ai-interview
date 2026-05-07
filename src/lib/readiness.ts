@@ -35,27 +35,27 @@ function toPermissionStatus(value: string): PermissionStatus {
 export function toFriendlyVoskDetail(detail: string): string {
   const normalized = detail.replace(/\s+/g, " ").trim();
   if (!normalized) {
-    return "Vosk недоступен.";
+    return "Распознавание речи недоступно.";
   }
 
   const lowered = normalized.toLowerCase();
   if (lowered.includes("failed to load")) {
     if (lowered.includes("model")) {
-      return "Не удалось загрузить языковую модель Vosk. Переустановите русскую модель в настройках распознавания.";
+      return "Не удалось загрузить русский профиль распознавания. Переустановите его в настройках.";
     }
-    return "Не удалось загрузить Vosk runtime. Переустановите его в настройках распознавания.";
+    return "Не удалось загрузить голосовой модуль. Переустановите его в настройках распознавания.";
   }
   if (lowered.includes("model") && lowered.includes("missing")) {
-    return "Не найдена языковая модель Vosk. Установите русскую модель Small в настройках распознавания.";
+    return "Не найден русский профиль распознавания. Установите точный профиль Large в настройках.";
   }
   if (
     lowered.includes("runtime") &&
     (lowered.includes("not found") || lowered.includes("missing"))
   ) {
-    return "Не найден Vosk runtime. Установите его в настройках распознавания.";
+    return "Не найден голосовой модуль. Установите его в настройках распознавания.";
   }
 
-  return normalized.split(/[.;]/)[0] ?? "Vosk недоступен.";
+  return normalized.split(/[.;]/)[0] ?? "Распознавание речи недоступно.";
 }
 
 export async function checkLocalReadiness(): Promise<LocalReadiness> {
@@ -72,7 +72,7 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
         systemAudio: "granted",
         screenCapture: "granted",
         voskStatus: "granted",
-        voskDetail: "Проверка runtime доступна только в режиме Tauri.",
+        voskDetail: "Проверка распознавания доступна только в приложении.",
         voskReady: true,
         voskRuntimeLoaded: true,
         voskRuntimePath: null,
@@ -134,7 +134,7 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
       systemAudio: "unknown",
       screenCapture: "unknown",
       voskStatus: "unknown",
-      voskDetail: "Не удалось проверить состояние Vosk.",
+      voskDetail: "Не удалось проверить распознавание речи.",
       voskReady: false,
       voskRuntimeLoaded: false,
       voskRuntimePath: null,
@@ -154,9 +154,9 @@ export async function checkCloudReadiness(
   if (!endpoint.baseUrl) {
     return {
       apiKeyStatus: "denied",
-      apiKeyDetail: "Сначала укажите адрес прокси",
+      apiKeyDetail: "Сервис временно недоступен",
       modelStatus: "denied",
-      modelDetail: "Подключение к сервису недоступно, пока не задан адрес прокси",
+      modelDetail: "Подключение к сервису временно недоступно",
       apiReady: false,
       modelReady: false,
     };
@@ -193,13 +193,13 @@ export async function checkCloudReadiness(
         ? `Лицензия активна до ${new Date(status.expiresAt).toLocaleString("ru-RU")}`
         : "Лицензия активна",
       modelStatus: "granted",
-      modelDetail: status.plan ? `План: ${status.plan}` : "Прокси готов к работе",
+      modelDetail: status.plan ? `План: ${status.plan}` : "Сервис готов к работе",
       apiReady: true,
       modelReady: true,
     };
   } catch (error) {
     const detail =
-      error instanceof Error ? error.message : "Сервер лицензий недоступен";
+      error instanceof Error ? error.message : "Сервис лицензий недоступен";
     return {
       apiKeyStatus: "denied",
       apiKeyDetail: detail,

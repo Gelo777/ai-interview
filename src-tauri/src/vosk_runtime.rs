@@ -20,7 +20,7 @@ pub fn probe_runtime(app: &tauri::AppHandle) -> VoskRuntimeProbe {
         return VoskRuntimeProbe {
             available: false,
             library_path: None,
-            detail: "Vosk runtime is only supported on macOS/Windows in this app.".to_string(),
+            detail: "Компоненты распознавания поддерживаются только на macOS и Windows.".to_string(),
         };
     }
 
@@ -47,7 +47,7 @@ pub fn probe_runtime(app: &tauri::AppHandle) -> VoskRuntimeProbe {
                     available: true,
                     library_path: Some(path_to_string(&candidate)),
                     detail: format!(
-                        "Vosk runtime library loaded: {}",
+                        "Компоненты распознавания загружены: {}",
                         path_to_string(&candidate)
                     ),
                 };
@@ -63,7 +63,7 @@ pub fn probe_runtime(app: &tauri::AppHandle) -> VoskRuntimeProbe {
             available: false,
             library_path: None,
             detail: format!(
-                "Vosk runtime library found but failed to load. {}",
+                "Компоненты распознавания найдены, но не загрузились. {}",
                 load_errors.join("; ")
             ),
         };
@@ -80,7 +80,7 @@ pub fn probe_runtime(app: &tauri::AppHandle) -> VoskRuntimeProbe {
         available: false,
         library_path: None,
         detail: format!(
-            "Vosk runtime library ({}) not found. Checked: {}",
+            "Компоненты распознавания ({}) не найдены. Проверено: {}",
             expected_names, checked
         ),
     }

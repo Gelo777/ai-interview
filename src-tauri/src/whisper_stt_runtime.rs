@@ -552,12 +552,6 @@ impl SttSession {
             if let Some(warning) = maybe_system_selector_warning {
                 source_warnings.push(warning);
             }
-            if !can_start_system_audio {
-                source_warnings.push(
-                    "Системный звук в помощнике временно отключен для тяжелой модели речи. Переключите STT-модель на Small, если нужен одновременный захват микрофона и системного звука."
-                        .to_string(),
-                );
-            }
             if can_start_system_audio {
                 let system_audio_status = system_audio::get_system_audio_status(
                     resolved_system_audio_selector.as_deref(),
@@ -614,13 +608,7 @@ impl SttSession {
         let system_audio_process = {
             const MACOS_SYSTEM_AUDIO_SAMPLE_RATE: u32 = 16000;
 
-            if false && heavy_model && started_sources > 0 {
-                source_warnings.push(
-                    "System audio capture was skipped because the selected STT model is heavy; use a small model for dual-source capture."
-                        .to_string(),
-                );
-                None
-            } else {
+            {
                 if heavy_model && started_sources > 0 {
                     log::info!(
                     "Starting dual-source STT with a heavy model on macOS; startup time and CPU usage may increase"
@@ -2402,12 +2390,12 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn strip_windows_verbatim_prefix_restores_regular_drive_path() {
-        let original = Path::new(r"\\?\C:\Users\Dmitry\models\vosk-model-small-ru-0.22");
+        let original = Path::new(r"\\?\C:\Users\Dmitry\models\vosk-model-ru-0.42");
         let stripped = strip_windows_verbatim_prefix(original);
 
         assert_eq!(
             stripped,
-            PathBuf::from(r"C:\Users\Dmitry\models\vosk-model-small-ru-0.22")
+            PathBuf::from(r"C:\Users\Dmitry\models\vosk-model-ru-0.42")
         );
     }
 }

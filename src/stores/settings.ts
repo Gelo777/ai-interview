@@ -208,8 +208,8 @@ export const useSettingsStore = create<SettingsState>()(
       customBaseUrl: HARDCODED_PROXY_BASE_URL,
       primaryLanguage: defaultPrimaryLanguage,
       secondaryLanguage: "none",
-      primarySttVariant: "small",
-      secondarySttVariant: "small",
+      primarySttVariant: "large",
+      secondarySttVariant: "large",
       microphoneDeviceId: "",
       systemAudioDeviceId: "",
       apiKey: "",
@@ -327,12 +327,8 @@ export const useSettingsStore = create<SettingsState>()(
         state.primaryLanguage = defaultPrimaryLanguage;
         state.secondaryLanguage = "none";
 
-        const rawPrimaryVariant = (state as unknown as { primarySttVariant?: unknown })
-          .primarySttVariant;
-        state.primarySttVariant = rawPrimaryVariant === "small" ? "small" : "large";
-        const rawSecondaryVariant = (state as unknown as { secondarySttVariant?: unknown })
-          .secondarySttVariant;
-        state.secondarySttVariant = rawSecondaryVariant === "large" ? "large" : "small";
+        state.primarySttVariant = "large";
+        state.secondarySttVariant = "large";
         const rawMicrophoneDeviceId = (state as unknown as { microphoneDeviceId?: unknown })
           .microphoneDeviceId;
         state.microphoneDeviceId =

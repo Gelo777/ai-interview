@@ -84,21 +84,18 @@ src-tauri/                    # Rust backend
 
 Semi-transparent dark overlay with:
 
-- **Chat feed**: interviewer (left), user (right), AI markers (center)
-- **AI Response panel**: last answer only, scrollable, auto-replaced
+- **Chat feed**: interviewer (left), user (right), service notes (center)
+- **Assistant panel**: last answer only, scrollable, auto-replaced
 - **Action bar**: "Send" and "Send + Screenshot" buttons with hotkey labels
 - **Header**: mic/audio indicators, session timer
 - **Rolling buffer**: memory-limited (1-256 MB), batch eviction, "N new messages" pill
 - **Capture protection**: OS-level window protection badge
 
-### Settings (6 tabs)
+### Settings (3 release tabs)
 
-- **LLM**: API key (validated), model selection, summary/report toggles, max tokens
-- **Language**: Vosk runtime status + latest stable check, install/update runtime, per-language small/large model selection, queued installs, cancel installation
-- **Images/OCR**: OCR-to-text vs send-image mode
-- **Privacy**: Capture protection toggle + platform compatibility status
-- **Storage**: Chat memory limit slider, history retention by custom days or forever
-- **Hotkeys**: Click-to-rebind shortcuts (up to 4 keys), conflict detection, reset to defaults
+- **Key**: license key validation and interview context
+- **Audio**: microphone, system audio, live device check, short WAV test
+- **Speech recognition**: Russian Large profile, automatic install, manual ZIP install, queued installs, cancel installation
 
 ### History
 
@@ -119,16 +116,16 @@ Native dependencies used by the app and target platform APIs:
 
 | Component          | macOS                               | Windows                             |
 |--------------------|-------------------------------------|-------------------------------------|
-| STT (Vosk)         | `libvosk.dylib` bundled             | `vosk.dll` bundled                  |
-| STT models         | Downloaded on demand (small baseline + optional large) | Downloaded on demand (small baseline + optional large) |
+| Speech runtime     | `libvosk.dylib` bundled             | `vosk.dll` bundled                  |
+| Speech profiles    | Downloaded on demand (Russian Large) | Downloaded on demand (Russian Large) |
 | System audio       | ScreenCaptureKit (built-in API)     | WASAPI loopback (built-in API)      |
 | OCR                | Apple Vision (built-in API)         | Windows.Media.Ocr (built-in API)    |
 | Capture protection | NSWindow API (built-in)             | SetWindowDisplayAffinity (built-in) |
 | Global hotkeys     | tauri-plugin-global-shortcut        | tauri-plugin-global-shortcut        |
 
-### Vosk Runtime Library Placement
+### Speech Runtime Library Placement
 
-The app expects Vosk runtime libraries in deterministic platform folders:
+The app expects speech runtime libraries in deterministic platform folders:
 
 - `src-tauri/resources/vosk/macos/` (`libvosk.dylib`)
 - `src-tauri/resources/vosk/windows/` (`vosk.dll` or `libvosk.dll` + dependent DLLs if needed)

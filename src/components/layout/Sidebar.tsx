@@ -39,12 +39,10 @@ export function Sidebar() {
       : `${Math.max(0, Math.min(100, Math.round(sttInstall.percent)))}%`;
   const installPhaseLabel =
     sttInstall.phase === "runtime"
-      ? "Vosk runtime"
-      : sttInstall.variant === "large"
-        ? "Large model"
-        : sttInstall.variant === "small"
-          ? "Small model"
-          : "Vosk";
+      ? "голосовой модуль"
+      : sttInstall.variant
+        ? "Точный профиль"
+        : "Распознавание";
 
   const handleCancelInstall = async () => {
     clearSttInstallQueue();
@@ -63,7 +61,7 @@ export function Sidebar() {
         await cancelVoskInstall();
       }
     } catch (error) {
-      console.warn("Failed to request Vosk install cancellation:", error);
+      console.warn("Failed to request speech install cancellation:", error);
     } finally {
       setCancelingInstall(false);
     }
@@ -79,7 +77,7 @@ export function Sidebar() {
           </div>
           <div>
             <div className="text-sm font-bold uppercase tracking-[0.08em] text-text-primary">
-              Interview Helper
+              AI Interview
             </div>
             <div className="text-[11px] text-text-muted">
               Умный помощник для собеседований
@@ -140,10 +138,10 @@ export function Sidebar() {
         {sttInstall.active && (
           <div className="mb-3 space-y-2 rounded-2xl border border-warning/30 bg-warning-muted/70 p-4">
             <div className="text-[11px] font-medium uppercase tracking-[0.18em] text-warning">
-              Установка Vosk
+              Подготовка распознавания
             </div>
             <div className="text-[10px] leading-relaxed text-warning">
-              {sttInstall.detail || "Устанавливаем компоненты Vosk..."}
+              {sttInstall.detail || "Подготавливаем распознавание..."}
             </div>
             <div className="flex items-center justify-between gap-2 rounded-xl bg-black/15 px-2.5 py-1.5 text-[10px] text-warning/90">
               <span>{installPhaseLabel}</span>
@@ -165,12 +163,12 @@ export function Sidebar() {
             )}
             {sttInstall.percent !== null && sttInstall.percent <= 0 && (
               <div className="text-[10px] text-warning/90">
-                При большой модели некоторое время может быть 0% — это нормально.
+                При точном профиле некоторое время может быть 0% — это нормально.
               </div>
             )}
             <div className="text-[10px] leading-relaxed text-warning/90">
-              Если загрузка большой модели идет слишком медленно, откройте Настройки / Распознавание
-              и используйте “Скачать ZIP вручную”.
+              Если точный профиль загружается слишком медленно, откройте Настройки / Распознавание
+              и используйте “Скачать вручную”.
             </div>
             {sttInstallQueue.length > 0 && (
               <div className="text-[10px] text-warning/90">
@@ -198,7 +196,7 @@ export function Sidebar() {
             </span>
           </div>
           <p className="text-[11px] leading-relaxed text-text-muted">
-            Введите лицензионный ключ, проверьте готовность и запускайте помощника.
+            Введите лицензионный ключ, проверьте готовность и начинайте работу.
           </p>
         </div>
       </div>

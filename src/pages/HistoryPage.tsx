@@ -9,6 +9,8 @@ import {
   Star,
   FileText,
   X,
+  Copy,
+  Download,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -17,7 +19,6 @@ import { useHistoryStore } from "@/stores/history";
 import { useAppStore } from "@/stores/app";
 import { useSettingsStore } from "@/stores/settings";
 import { formatHistoryRetentionLabel } from "@/lib/historyRetention";
-import { providerLabel } from "@/lib/llm";
 import type { SessionRecord, FinalReport } from "@/lib/types";
 
 export function HistoryPage() {
@@ -173,6 +174,29 @@ function SessionCard({
 function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: () => void }) {
   const date = new Date(session.startedAt);
   const { metrics, finalReport } = session;
+  const [copiedMarkdown, setCopiedMarkdown] = useState(false);
+
+  const markdown = buildSessionMarkdown(session);
+
+  const copyMarkdown = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(markdown);
+      setCopiedMarkdown(true);
+      window.setTimeout(() => setCopiedMarkdown(false), 1800);
+    } catch {
+      setCopiedMarkdown(false);
+    }
+  }, [markdown]);
+
+  const downloadMarkdown = useCallback(() => {
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `ai-interview-${new Date(session.startedAt).toISOString().slice(0, 10)}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [markdown, session.startedAt]);
 
   return (
     <div className="space-y-5">
@@ -209,12 +233,12 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
           />
           <MetricItem
             icon={<Brain className="w-4 h-4" />}
-            label="Запросы к AI"
+            label="Запросы"
             value={metrics.llmRequestCount.toString()}
           />
           <MetricItem
             icon={<Activity className="w-4 h-4" />}
-            label="До 1-го токена"
+            label="Старт ответа"
             value={`${Math.round(metrics.avgFirstTokenLatencyMs)}ms`}
           />
           <MetricItem
@@ -237,9 +261,92 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
 
       <Card>
         <div className="flex items-center gap-2 text-xs text-text-muted">
-          <span>Модель: <span className="text-text-secondary">{session.model}</span></span>
-          <span>·</span>
-          <span>Провайдер: <span className="text-text-secondary">{providerLabel(session.provider)}</span></span>
+          <span>
+            Режим:{" "}
+            <span className={session.mode === "safe" ? "text-warning" : "text-success"}>
+              {session.mode === "safe" ? "Без аудио" : "С распознаванием"}
+            </span>
+          </span>
+        </div>
+        {session.safeModeReason && (
+          <div className="mt-2 text-xs leading-relaxed text-text-muted">
+            {session.safeModeReason}
+          </div>
+        )}
+      </Card>
+
+      <Card title="Материалы сессии">
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs leading-relaxed text-text-muted">
+              Сохраняем последние фразы и ответы помощника, чтобы можно было разобрать интервью после завершения.
+            </p>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={copyMarkdown}
+              icon={<Copy className="h-3.5 w-3.5" />}
+            >
+              {copiedMarkdown ? "Скопировано" : "Скопировать Markdown"}
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={downloadMarkdown}
+              icon={<Download className="h-3.5 w-3.5" />}
+            >
+              Скачать Markdown
+            </Button>
+          </div>
+
+          {session.aiResponses && session.aiResponses.length > 0 && (
+            <div>
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-text-muted">
+                Ответы помощника
+              </h4>
+              <div className="space-y-2">
+                {session.aiResponses.slice(-5).map((response) => (
+                  <div
+                    key={response.id}
+                    className="rounded-lg border border-border bg-bg-secondary p-3 text-xs leading-relaxed text-text-secondary"
+                  >
+                    <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-text-muted">
+                      {new Date(response.timestamp).toLocaleTimeString("ru-RU", {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                    <div className="max-h-44 overflow-y-auto whitespace-pre-wrap">
+                      {response.text || "Пустой ответ"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {session.transcript && session.transcript.length > 0 && (
+            <div>
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-text-muted">
+                Последние фразы
+              </h4>
+              <div className="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-3">
+                {session.transcript.slice(-30).map((message) => (
+                  <div key={message.id} className="text-xs leading-relaxed text-text-secondary">
+                    <span className="text-text-muted">
+                      {message.source === "interviewer"
+                        ? "Интервьюер"
+                        : message.source === "user"
+                          ? "Вы"
+                          : "Система"}
+                      :
+                    </span>{" "}
+                    {message.text}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </Card>
 
@@ -256,6 +363,49 @@ function SessionDetail({ session, onClose }: { session: SessionRecord; onClose: 
       )}
     </div>
   );
+}
+
+function buildSessionMarkdown(session: SessionRecord): string {
+  const started = new Date(session.startedAt).toLocaleString("ru-RU");
+  const lines = [
+    `# Interview session`,
+    "",
+    `Старт: ${started}`,
+    `Длительность: ${formatDuration(session.metrics.durationMs)}`,
+    `Режим: ${session.mode === "safe" ? "Без аудио" : "С распознаванием"}`,
+    session.safeModeReason ? `Причина режима без аудио: ${session.safeModeReason}` : null,
+    `Запросов: ${session.metrics.llmRequestCount}`,
+    "",
+    "## Ответы помощника",
+    "",
+  ].filter((line): line is string => line !== null);
+
+  const responses = session.aiResponses ?? [];
+  if (responses.length === 0) {
+    lines.push("_Ответы не сохранены._", "");
+  } else {
+    responses.forEach((response, index) => {
+      lines.push(`### Ответ ${index + 1}`, "", response.text || "_Пустой ответ_", "");
+    });
+  }
+
+  lines.push("## Транскрипт", "");
+  const transcript = session.transcript ?? [];
+  if (transcript.length === 0) {
+    lines.push("_Транскрипт не сохранен._", "");
+  } else {
+    transcript.forEach((message) => {
+      const speaker =
+        message.source === "interviewer"
+          ? "Собеседник"
+          : message.source === "user"
+            ? "Вы"
+            : "Система";
+      lines.push(`- **${speaker}:** ${message.text}`);
+    });
+  }
+
+  return lines.join("\n");
 }
 
 function ReportCard({ report }: { report: FinalReport }) {

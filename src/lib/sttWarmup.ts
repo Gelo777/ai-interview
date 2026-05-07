@@ -106,7 +106,7 @@ export async function ensureSttModelWarm(modelId: string): Promise<void> {
         finishedAt: Date.now(),
         errorMessage: null,
       });
-      logInfo("stt.preload", "STT model warmup completed", {
+      logInfo("speech.preload", "Speech profile warmup completed", {
         modelId: trimmed,
         durationMs: Date.now() - startedAt,
       });
@@ -119,7 +119,7 @@ export async function ensureSttModelWarm(modelId: string): Promise<void> {
         finishedAt: Date.now(),
         errorMessage,
       });
-      logWarn("stt.preload", "STT model warmup failed", {
+      logWarn("speech.preload", "Speech profile warmup failed", {
         modelId: trimmed,
         durationMs: Date.now() - startedAt,
         error,
@@ -131,6 +131,6 @@ export async function ensureSttModelWarm(modelId: string): Promise<void> {
     });
 
   inflightWarmups.set(trimmed, warmupPromise);
-  logInfo("stt.preload", "STT model warmup started", { modelId: trimmed });
+  logInfo("speech.preload", "Speech profile warmup started", { modelId: trimmed });
   await warmupPromise;
 }

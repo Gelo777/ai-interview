@@ -123,7 +123,7 @@ export function SettingsPage() {
   } = useAppStore();
   const [tab, setTab] = useState<SettingsTab>(settingsTab);
   const [activeFocus, setActiveFocus] = useState<SettingsFocusTarget | null>(null);
-  const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : "unknown";
+  const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : "неизвестно";
 
   useEffect(() => {
     const availableTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "speech";
@@ -159,7 +159,7 @@ export function SettingsPage() {
       <div className="mb-6">
         <h1 className="text-3xl font-bold tracking-tight text-text-primary">Настройки</h1>
         <p className="mt-2 text-sm leading-7 text-text-muted">
-          Только основные настройки для обычного пользователя.
+          Основные настройки перед запуском интервью.
           {isInterviewActive && (
             <span className="text-warning ml-2">
               Во время собеседования настройки заблокированы.
@@ -237,12 +237,11 @@ function LlmSettings({
       <div id="llm-api-key" className={getFocusSectionClass(focusTarget === "llm-api-key")}>
         <Card
           title="Лицензионный ключ"
-          description="Пользовательский сценарий: вводите ключ, а подключение к сервису будет происходить через ваш прокси."
+          description="Введите лицензионный ключ из бота. Остальное приложение настроит автоматически."
         >
           <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-            Пользователь не должен выбирать модель, провайдера или base URL.
-            В рабочей схеме приложение отправляет лицензионный ключ на ваш сервер,
-            а сервер сам возвращает рабочую конфигурацию.
+            Не нужно выбирать провайдера, режим или адрес сервиса.
+            Приложение проверит ключ и подключится к рабочей конфигурации.
           </div>
 
           <div className="relative mt-4">
@@ -301,7 +300,7 @@ function LlmSettings({
             <span className="text-text-primary">
               Go backend, goroutines, channels, mutex, PostgreSQL, Docker
             </span>
-            . Тогда сервис будет понимать, что речь идет о разработке, и осторожнее интерпретировать спорные STT-слова вроде{" "}
+            . Тогда сервис будет понимать, что речь идет о разработке, и осторожнее интерпретировать спорные слова вроде{" "}
             <span className="text-text-primary">Go / goroutine / routine</span>.
           </div>
 
@@ -326,29 +325,11 @@ function LlmSettings({
         <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
           <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
           <p className="text-xs text-warning leading-relaxed">
-            Пока нет лицензионного ключа. Для запуска пользователю нужен только ключ.
+            Пока нет лицензионного ключа. Для запуска нужен только ключ из бота.
           </p>
         </div>
       )}
 
-      <Card
-        title="Подключение к сервису"
-        description="Адрес прокси зафиксирован в приложении."
-      >
-        <div className="space-y-2">
-          <label className="block text-xs text-text-muted">Адрес прокси</label>
-          <input
-            type="text"
-            value={HARDCODED_PROXY_BASE_URL}
-            readOnly
-            disabled
-            className="w-full bg-bg-input border border-border rounded-lg px-3 py-2.5
-            text-sm text-text-primary placeholder:text-text-muted
-            focus:outline-none transition-colors
-            disabled:opacity-50"
-          />
-        </div>
-      </Card>
     </div>
   );
 }
@@ -389,8 +370,8 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
   return (
     <div className="space-y-5">
       <Card
-        title="Журнал диагностики"
-        description="Служебные события приложения для разбора зависаний, ошибок STT, клавиш и запросов к прокси."
+        title="Журнал приложения"
+        description="Служебные события приложения для разбора ошибок запуска, аудио и обращений к сервису."
       >
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="muted">Событий: {entries.length}</Badge>
@@ -408,7 +389,7 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
             }}
             icon={<Copy className="w-3.5 h-3.5" />}
           >
-            {copied ? "Отчет скопирован" : "Копировать отчет"}
+            {copied ? "Сообщение скопировано" : "Копировать отчет"}
           </Button>
           <Button
             variant="ghost"
@@ -511,6 +492,10 @@ function getModelByVariant(
   );
 }
 
+function getVariantDisplayName(variant: SttModelVariant): string {
+  return "точный";
+}
+
 function isTimeoutLikeError(error: unknown): boolean {
   const message =
     error instanceof Error
@@ -525,10 +510,10 @@ function toRuntimeNetworkHint(error: unknown): string {
   if (!isTimeoutLikeError(error)) {
     return "";
   }
-  return "Не удалось быстро связаться с сервером релизов Vosk. Проверьте интернет, VPN или прокси и повторите попытку.";
+  return "Не удалось быстро связаться с сервером загрузки. Проверьте интернет, VPN или сеть и повторите попытку.";
 }
 
-function isInstallCancelledError(error: unknown): boolean {
+function isInstallОтменаledError(error: unknown): boolean {
   const message =
     error instanceof Error
       ? error.message
@@ -679,10 +664,10 @@ function toAudioTestErrorMessage(error: unknown): string {
     return "Не удалось найти выбранное устройство. Обновите список и попробуйте снова.";
   }
   if (normalized.includes("webview")) {
-    return "WebView не смог привязать тест к выбранному устройству. Проверьте доступность устройства и запустите проверку снова.";
+    return "Не удалось привязать тест к выбранному устройству. Проверьте доступность устройства и запустите проверку снова.";
   }
   if (normalized.includes("sinkid")) {
-    return "Этот WebView не поддерживает проверку конкретного динамика через setSinkId.";
+    return "Проверка конкретного динамика недоступна в этой среде.";
   }
 
   return message;
@@ -777,7 +762,7 @@ async function openPreferredMicrophoneTestStream(
       ? "post-permission-match"
       : "selected-device-unresolved";
     if (!preferredBrowserDeviceId) {
-      throw new Error("Selected microphone is not available in WebView");
+      throw new Error("Выбранный микрофон недоступен");
     }
   }
 
@@ -802,7 +787,7 @@ async function openPreferredMicrophoneTestStream(
   if (!retriedBrowserDeviceId) {
     if (strictSelection) {
       stream.getTracks().forEach((currentTrack) => currentTrack.stop());
-      throw new Error("Selected microphone is not available in WebView");
+      throw new Error("Выбранный микрофон недоступен");
     }
     return {
       stream,
@@ -850,7 +835,7 @@ function formatAudioDebugDevice(device: AudioDeviceInfo | null | undefined): str
     return "не найдено";
   }
 
-  const defaultLabel = device.is_default ? ", Windows default" : "";
+  const defaultLabel = device.is_default ? ", по умолчанию Windows" : "";
   return `${device.name} [${device.id}] (${device.sample_rate} Hz, ${device.channels} ch${defaultLabel})`;
 }
 
@@ -882,8 +867,8 @@ function buildAudioRouteSummary(params: {
     title: "Режим: Windows по умолчанию",
     detail: endpoint.detail,
     auxiliary: endpoint.default_device
-      ? `Текущий default: ${formatAudioDebugDevice(endpoint.default_device)}`
-      : "Windows default устройство не найдено.",
+      ? `Текущее устройство по умолчанию: ${formatAudioDebugDevice(endpoint.default_device)}`
+      : "Устройство Windows по умолчанию не найдено.",
   };
 }
 
@@ -894,7 +879,7 @@ function appendAudioDeviceList(
 ): void {
   lines.push(title);
   if (devices.length === 0) {
-    lines.push("- none");
+    lines.push("- нет");
     return;
   }
 
@@ -932,43 +917,43 @@ function buildAudioDebugReport(params: {
     speakerTestDebugInfo,
   } = params;
   const lines = [
-    "AI Interview Audio Debug Report",
+    "Отчет аудио",
     "================================",
-    `Generated at: ${new Date().toISOString()}`,
-    `Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
-    `Snapshot captured at: ${fetchedAt ? new Date(fetchedAt).toISOString() : "not yet captured"}`,
+    `Сформировано: ${new Date().toISOString()}`,
+    `Часовой пояс: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    `Снимок аудио: ${fetchedAt ? new Date(fetchedAt).toISOString() : "еще не собран"}`,
     "",
   ];
 
   if (!snapshot) {
-    lines.push("No Tauri audio snapshot available yet.");
+    lines.push("Снимок аудио пока недоступен.");
   } else {
-    lines.push("Snapshot");
-    lines.push(`- Microphone selected: ${formatAudioDebugSelection(snapshot.microphone)}`);
-    lines.push(`- Microphone effective: ${formatAudioDebugDevice(snapshot.microphone.effective_device)}`);
-    lines.push(`- Microphone default: ${formatAudioDebugDevice(snapshot.microphone.default_device)}`);
-    lines.push(`- Microphone detail: ${snapshot.microphone.detail}`);
-    lines.push(`- Output selected: ${formatAudioDebugSelection(snapshot.system_audio)}`);
-    lines.push(`- Output effective: ${formatAudioDebugDevice(snapshot.system_audio.effective_device)}`);
-    lines.push(`- Output default: ${formatAudioDebugDevice(snapshot.system_audio.default_device)}`);
-    lines.push(`- Output detail: ${snapshot.system_audio.detail}`);
+    lines.push("Снимок");
+    lines.push(`- Микрофон выбран: ${formatAudioDebugSelection(snapshot.microphone)}`);
+    lines.push(`- Микрофон используется: ${formatAudioDebugDevice(snapshot.microphone.effective_device)}`);
+    lines.push(`- Микрофон по умолчанию: ${formatAudioDebugDevice(snapshot.microphone.default_device)}`);
+    lines.push(`- Микрофон: ${snapshot.microphone.detail}`);
+    lines.push(`- Вывод выбран: ${formatAudioDebugSelection(snapshot.system_audio)}`);
+    lines.push(`- Вывод используется: ${formatAudioDebugDevice(snapshot.system_audio.effective_device)}`);
+    lines.push(`- Вывод по умолчанию: ${formatAudioDebugDevice(snapshot.system_audio.default_device)}`);
+    lines.push(`- Вывод: ${snapshot.system_audio.detail}`);
     lines.push(
-      `- System audio loopback: ${
+      `- Захват системного звука: ${
         snapshot.system_audio_status.available
-          ? "available"
+          ? "доступно"
           : snapshot.system_audio_status.supported
-            ? "unavailable"
-            : "unsupported"
+            ? "недоступно"
+            : "не поддерживается"
       }`,
     );
-    lines.push(`- System audio detail: ${snapshot.system_audio_status.detail}`);
+    lines.push(`- Системный звук: ${snapshot.system_audio_status.detail}`);
     lines.push("");
-    appendAudioDeviceList(lines, "Input devices", snapshot.input_devices);
+    appendAudioDeviceList(lines, "Устройства ввода", snapshot.input_devices);
     lines.push("");
-    appendAudioDeviceList(lines, "Output devices", snapshot.output_devices);
+    appendAudioDeviceList(lines, "Устройства вывода", snapshot.output_devices);
     if (snapshot.notes.length > 0) {
       lines.push("");
-      lines.push("Notes");
+      lines.push("Заметки");
       for (const note of snapshot.notes) {
         lines.push(`- ${note}`);
       }
@@ -976,38 +961,38 @@ function buildAudioDebugReport(params: {
   }
 
   lines.push("");
-  lines.push("Microphone live test");
-  lines.push(`- Active: ${micTestActive ? "yes" : "no"}`);
-  lines.push(`- Current level: ${Math.round(micLevel * 100)}%`);
-  lines.push(`- Peak level: ${Math.round(micPeakLevel * 100)}%`);
-  lines.push(`- Average level: ${Math.round(micAverageLevel * 100)}%`);
-  lines.push(`- Silent for: ${Math.round(micSilentDurationMs / 100) / 10}s`);
-  lines.push(`- Message: ${micTestMessage ?? "none"}`);
+  lines.push("Проверка микрофона");
+  lines.push(`- Активна: ${micTestActive ? "да" : "нет"}`);
+  lines.push(`- Текущий уровень: ${Math.round(micLevel * 100)}%`);
+  lines.push(`- Пик: ${Math.round(micPeakLevel * 100)}%`);
+  lines.push(`- Средний уровень: ${Math.round(micAverageLevel * 100)}%`);
+  lines.push(`- Тишина: ${Math.round(micSilentDurationMs / 100) / 10}s`);
+  lines.push(`- Сообщение: ${micTestMessage ?? "нет"}`);
   if (micTestDebugInfo) {
-    lines.push(`- Requested device: ${micTestDebugInfo.requestedDeviceName ?? "Windows default"}`);
-    lines.push(`- Browser device id: ${micTestDebugInfo.preferredBrowserDeviceId ?? "not resolved"}`);
-    lines.push(`- Track label: ${micTestDebugInfo.trackLabel ?? "unknown"}`);
-    lines.push(`- Resolution stage: ${micTestDebugInfo.resolutionStage}`);
-    lines.push(`- Selection matched: ${micTestDebugInfo.selectionMatched ? "yes" : "no"}`);
+    lines.push(`- Запрошенное устройство: ${micTestDebugInfo.requestedDeviceName ?? "по умолчанию Windows"}`);
+    lines.push(`- Устройство в окне: ${micTestDebugInfo.preferredBrowserDeviceId ?? "не определено"}`);
+    lines.push(`- Активная дорожка: ${micTestDebugInfo.trackLabel ?? "неизвестно"}`);
+    lines.push(`- Этап выбора: ${micTestDebugInfo.resolutionStage}`);
+    lines.push(`- Выбор совпал: ${micTestDebugInfo.selectionMatched ? "да" : "нет"}`);
     lines.push(
-      `- Track settings: ${
+      `- Параметры дорожки: ${
         micTestDebugInfo.trackSettings
           ? JSON.stringify(micTestDebugInfo.trackSettings)
-          : "unavailable"
+          : "недоступно"
       }`,
     );
   }
 
   lines.push("");
-  lines.push("Speaker test");
-  lines.push(`- Running: ${speakerTestRunning ? "yes" : "no"}`);
+  lines.push("Проверка динамика");
+  lines.push(`- Активна: ${speakerTestRunning ? "да" : "нет"}`);
   lines.push(`- Message: ${speakerTestMessage ?? "none"}`);
   if (speakerTestDebugInfo) {
-    lines.push(`- Requested output: ${speakerTestDebugInfo.requestedOutputName ?? "Windows default"}`);
-    lines.push(`- Browser sink id: ${speakerTestDebugInfo.preferredSinkId ?? "not resolved"}`);
-    lines.push(`- setSinkId supported: ${speakerTestDebugInfo.setSinkIdSupported ? "yes" : "no"}`);
-    lines.push(`- Routed to preferred sink: ${speakerTestDebugInfo.routedToPreferredSink ? "yes" : "no"}`);
-    lines.push(`- Active sink id: ${speakerTestDebugInfo.activeSinkId ?? "unknown"}`);
+    lines.push(`- Запрошенный вывод: ${speakerTestDebugInfo.requestedOutputName ?? "по умолчанию Windows"}`);
+    lines.push(`- Устройство вывода в окне: ${speakerTestDebugInfo.preferredSinkId ?? "не определено"}`);
+    lines.push(`- Выбор динамика поддерживается: ${speakerTestDebugInfo.setSinkIdSupported ? "да" : "нет"}`);
+    lines.push(`- Сигнал направлен в выбранный динамик: ${speakerTestDebugInfo.routedToPreferredSink ? "да" : "нет"}`);
+    lines.push(`- Активный вывод: ${speakerTestDebugInfo.activeSinkId ?? "неизвестно"}`);
   }
 
   return lines.join("\n");
@@ -1344,10 +1329,10 @@ function AudioSettings({
         !navigator.mediaDevices ||
         typeof navigator.mediaDevices.getUserMedia !== "function"
       ) {
-        throw new Error("MediaDevices API is not available");
+        throw new Error("Проверка микрофона недоступна в этой среде");
       }
       if (!microphoneUsesWindowsDefault && !selectedMicrophoneDevice) {
-        throw new Error("Selected microphone is not available");
+        throw new Error("Выбранный микрофон недоступен");
       }
 
       const selectedMicrophone =
@@ -1368,7 +1353,7 @@ function AudioSettings({
           .webkitAudioContext ?? null);
       if (!AudioContextCtor) {
         stream.getTracks().forEach((track) => track.stop());
-        throw new Error("AudioContext is not available");
+        throw new Error("Проверка аудио недоступна в этой среде");
       }
 
       const audioContext = new AudioContextCtor();
@@ -1437,7 +1422,7 @@ function AudioSettings({
       });
       setMicTestMessage(
         !microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched
-          ? `Проверка запущена, но WebView использует другое устройство: ${track?.label ?? "неизвестно"}.`
+          ? `Проверка запущена, но окно приложения использует другое устройство: ${track?.label ?? "неизвестно"}.`
           : selectedMicrophone
           ? `Проверка запущена: ${selectedMicrophone}`
           : "Проверка запущена. Скажите что-нибудь в микрофон.",
@@ -1445,7 +1430,7 @@ function AudioSettings({
       if (!microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched) {
         logWarn(
           "audio.micTest",
-          "Browser test stream did not bind to the selected microphone",
+          "Проверка не подключилась к выбранному микрофону",
           {
             requestedDeviceName: selectedMicrophone,
             preferredBrowserDeviceId,
@@ -1482,10 +1467,10 @@ function AudioSettings({
         ((window as unknown as { webkitAudioContext?: typeof AudioContext })
           .webkitAudioContext ?? null);
       if (!AudioContextCtor) {
-        throw new Error("AudioContext is not available");
+        throw new Error("Проверка аудио недоступна в этой среде");
       }
       if (!systemAudioUsesWindowsDefault && !selectedSystemAudioDevice) {
-        throw new Error("Selected output device is not available");
+        throw new Error("Выбранный динамик недоступен");
       }
 
       const selectedOutputName =
@@ -1496,7 +1481,7 @@ function AudioSettings({
         selectedOutputName,
       );
       if (!systemAudioUsesWindowsDefault && !preferredSinkId) {
-        throw new Error("Selected output device is not available in WebView");
+        throw new Error("Выбранный динамик недоступен в окне приложения");
       }
 
       const context = new AudioContextCtor();
@@ -1511,7 +1496,7 @@ function AudioSettings({
       };
       const setSinkIdSupported = typeof withSink.setSinkId === "function";
       if (!systemAudioUsesWindowsDefault && !setSinkIdSupported) {
-        throw new Error("setSinkId is not available for selected output device");
+        throw new Error("Выбор конкретного динамика недоступен");
       }
       if (preferredSinkId && setSinkIdSupported) {
         await withSink.setSinkId(preferredSinkId);
@@ -1627,7 +1612,7 @@ function AudioSettings({
           </div>
 
           <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted leading-relaxed">
-            Если оставить режим по умолчанию, helper берет текущие устройства Windows по умолчанию.
+            Если оставить режим по умолчанию, приложение возьмет текущие устройства Windows.
             Если выбрать конкретные устройства, во время интервью будут использоваться именно они.
           </div>
 
@@ -1659,14 +1644,6 @@ function AudioSettings({
                 {micSilenceHint && (
                   <div className="mt-2 text-xs leading-relaxed text-warning">
                     {micSilenceHint}
-                  </div>
-                )}
-                {micTestDebugInfo && (
-                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
-                    Browser device: {micTestDebugInfo.preferredBrowserDeviceId ?? "не найден"}<br />
-                    Track: {micTestDebugInfo.trackLabel ?? "неизвестно"}<br />
-                    Match: {micTestDebugInfo.selectionMatched ? "совпадает" : "не совпадает"}<br />
-                    Resolve: {micTestDebugInfo.resolutionStage}
                   </div>
                 )}
                 {micTestMessage && (
@@ -1705,12 +1682,6 @@ function AudioSettings({
                 {speakerTestMessage && (
                   <div className="mt-2 text-xs leading-relaxed text-text-muted">
                     {speakerTestMessage}
-                  </div>
-                )}
-                {speakerTestDebugInfo && (
-                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
-                    Browser sink: {speakerTestDebugInfo.preferredSinkId ?? "не найден"}<br />
-                    setSinkId: {speakerTestDebugInfo.setSinkIdSupported ? "доступен" : "недоступен"}
                   </div>
                 )}
                 <div className="mt-3">
@@ -1778,7 +1749,8 @@ function LanguageSettings({
   const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<number | null>(null);
   const [runtimeNetworkHint, setRuntimeNetworkHint] = useState<string | null>(null);
   const [activeModelOperation, setActiveModelOperation] = useState<ModelOperation | null>(null);
-  const [cancelingInstall, setCancelingInstall] = useState(false);
+  const [copiedModelDownloadUrl, setCopiedModelDownloadUrl] = useState<string | null>(null);
+  const [cancelingInstall, setОтменаingInstall] = useState(false);
   const [bootstrapInstalling, setBootstrapInstalling] = useState(false);
   const queueWorkerBusyRef = useRef(false);
 
@@ -1840,9 +1812,9 @@ function LanguageSettings({
     const { isTauri, installVoskRuntime } = await import("@/lib/tauri");
     if (!isTauri()) {
       const detail =
-        "Установка Vosk доступна только в desktop helper. Откройте приложение, а не вкладку браузера.";
+        "Подготовка распознавания доступна только в приложении. Откройте установленную версию, а не вкладку браузера.";
       setError(detail);
-      logWarn("stt.install", "Vosk runtime install requested outside Tauri", { detail });
+      logWarn("speech.install", "Speech module install requested outside desktop app", { detail });
       return false;
     }
 
@@ -1860,7 +1832,7 @@ function LanguageSettings({
       contentLength: null,
       speedBytesPerSecond: null,
       etaSeconds: null,
-      detail: "Устанавливаем последнюю стабильную версию Vosk runtime...",
+      detail: "Устанавливаем компоненты распознавания...",
       language: null,
       variant: null,
     });
@@ -1884,18 +1856,18 @@ function LanguageSettings({
           etaSeconds: metrics.etaSeconds,
           detail:
             progress.phase === "downloading"
-              ? "Скачиваем последнюю стабильную версию Vosk runtime..."
-              : "Распаковываем последнюю стабильную версию Vosk runtime...",
+              ? "Скачиваем компоненты распознавания..."
+              : "Распаковываем компоненты распознавания...",
           language: null,
           variant: null,
         });
       });
-      setSuccess("Vosk runtime установлен.");
+      setSuccess("Компоненты распознавания установлены.");
       await refresh();
       return true;
     } catch (err: unknown) {
-      if (isInstallCancelledError(err)) {
-        setSuccess("Установка Vosk отменена.");
+      if (isInstallОтменаledError(err)) {
+        setSuccess("Подготовка распознавания отменена.");
         setError(null);
         return false;
       }
@@ -1907,7 +1879,7 @@ function LanguageSettings({
         networkHint ||
           (err instanceof Error
             ? err.message
-            : "Не удалось установить последнюю стабильную версию Vosk runtime."),
+            : "Не удалось установить компоненты распознавания."),
       );
       return false;
     } finally {
@@ -1926,9 +1898,9 @@ function LanguageSettings({
       const { isTauri, downloadVoskModel, listVoskModels } = await import("@/lib/tauri");
       if (!isTauri()) {
         const detail =
-          "Установка модели распознавания доступна только в desktop helper. Откройте приложение, а не вкладку браузера.";
+          "Установка профиля распознавания доступна только в приложении. Откройте установленную версию, а не вкладку браузера.";
         setError(detail);
-        logWarn("stt.install", "Vosk model install requested outside Tauri", {
+        logWarn("speech.install", "Speech profile install requested outside desktop app", {
           language,
           variant,
           detail,
@@ -1952,14 +1924,14 @@ function LanguageSettings({
           model = getModelByVariant(latestModels, language, variant);
         } catch (err: unknown) {
           setError(
-            err instanceof Error ? err.message : "Не удалось обновить список языковых моделей.",
+            err instanceof Error ? err.message : "Не удалось обновить список профилей распознавания.",
           );
           return false;
         }
       }
       if (!model) {
         setError(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель недоступна для языка ${getLanguageLabel(language)}.`,
+          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
         );
         return false;
       }
@@ -1984,7 +1956,7 @@ function LanguageSettings({
         contentLength: null,
         speedBytesPerSecond: null,
         etaSeconds: null,
-        detail: `Устанавливаем ${model.name}...`,
+        detail: `Устанавливаем ${getVariantDisplayName(variant)} профиль...`,
         language,
         variant,
       });
@@ -2024,8 +1996,8 @@ function LanguageSettings({
               etaSeconds: metrics.etaSeconds,
               detail:
                 progress.phase === "downloading"
-                  ? `Скачиваем ${model.name}...`
-                  : `Распаковываем ${model.name}...`,
+                  ? `Скачиваем ${getVariantDisplayName(variant)} профиль...`
+                  : `Распаковываем ${getVariantDisplayName(variant)} профиль...`,
               language,
               variant,
             });
@@ -2034,19 +2006,19 @@ function LanguageSettings({
         );
 
         setSuccess(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель установлена для языка ${getLanguageLabel(language)}.`,
+          `Точный профиль установлен для языка ${getLanguageLabel(language)}.`,
         );
         return true;
       } catch (err: unknown) {
-        if (isInstallCancelledError(err)) {
-          setSuccess(`Установка ${variant === "large" ? "большой" : "быстрой"} модели отменена.`);
+        if (isInstallОтменаledError(err)) {
+          setSuccess("Установка точного профиля отменена.");
           setError(null);
           return false;
         }
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось установить ${variant === "large" ? "большую" : "быструю"} модель для языка ${getLanguageLabel(language)}.`,
+            : `Не удалось установить точный профиль для языка ${getLanguageLabel(language)}.`,
         );
         return false;
       } finally {
@@ -2071,7 +2043,7 @@ function LanguageSettings({
         await import("@/lib/tauri");
       if (!isTauri()) {
         setError(
-          "Установка модели из ZIP доступна только в desktop helper. Откройте приложение, а не вкладку браузера.",
+          "Установка из ZIP доступна только в приложении. Откройте установленную версию, а не вкладку браузера.",
         );
         return false;
       }
@@ -2094,14 +2066,14 @@ function LanguageSettings({
           setError(
             err instanceof Error
               ? err.message
-              : "Не удалось обновить список языковых моделей.",
+              : "Не удалось обновить список профилей распознавания.",
           );
           return false;
         }
       }
       if (!model) {
         setError(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель недоступна для языка ${getLanguageLabel(language)}.`,
+          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
         );
         return false;
       }
@@ -2123,7 +2095,7 @@ function LanguageSettings({
         contentLength: model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null,
         speedBytesPerSecond: null,
         etaSeconds: null,
-        detail: `Устанавливаем ${model.name} из ZIP...`,
+        detail: `Устанавливаем ${getVariantDisplayName(variant)} профиль из ZIP...`,
         language,
         variant,
       });
@@ -2149,7 +2121,7 @@ function LanguageSettings({
               contentLength: estimatedContentLength,
               speedBytesPerSecond: metrics.speedBytesPerSecond,
               etaSeconds: metrics.etaSeconds,
-              detail: `Распаковываем ${model.name} из выбранного ZIP...`,
+              detail: `Распаковываем ${getVariantDisplayName(variant)} профиль из выбранного ZIP...`,
               language,
               variant,
             });
@@ -2158,19 +2130,19 @@ function LanguageSettings({
         );
 
         setSuccess(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель установлена из ZIP для языка ${getLanguageLabel(language)}.`,
+          `Точный профиль установлен из ZIP для языка ${getLanguageLabel(language)}.`,
         );
         return true;
       } catch (err: unknown) {
-        if (isInstallCancelledError(err)) {
-          setSuccess(`Установка ${variant === "large" ? "большой" : "быстрой"} модели отменена.`);
+        if (isInstallОтменаledError(err)) {
+          setSuccess("Установка точного профиля отменена.");
           setError(null);
           return false;
         }
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось установить ${variant === "large" ? "большую" : "быструю"} модель из ZIP.`,
+            : `Не удалось установить точный профиль из ZIP.`,
         );
         return false;
       } finally {
@@ -2192,6 +2164,7 @@ function LanguageSettings({
   const openModelDownloadUrl = useCallback(async (url: string) => {
     setError(null);
     setSuccess(null);
+    setCopiedModelDownloadUrl(null);
 
     try {
       const { isTauri, openExternalUrl } = await import("@/lib/tauri");
@@ -2206,6 +2179,23 @@ function LanguageSettings({
       setSuccess("Открыли ссылку на ZIP в браузере.");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : `Не удалось открыть ссылку: ${url}`);
+    }
+  }, []);
+
+  const copyModelDownloadUrl = useCallback(async (url: string) => {
+    setError(null);
+    setSuccess(null);
+
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedModelDownloadUrl(url);
+      setSuccess("Ссылка на ZIP скопирована. Ее можно открыть в браузере или менеджере загрузок.");
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Не удалось скопировать ссылку на ZIP.",
+      );
     }
   }, []);
 
@@ -2229,16 +2219,16 @@ function LanguageSettings({
           await removeVoskModel(versionId);
         }
         if (language === primaryLanguage) {
-          setPrimarySttVariant("small");
+          setPrimarySttVariant("large");
         } else if (language === secondaryLanguage) {
-          setSecondarySttVariant("small");
+          setSecondarySttVariant("large");
         }
-        setSuccess(`Большая модель удалена для языка ${getLanguageLabel(language)}.`);
+        setSuccess(`Точный профиль удален для языка ${getLanguageLabel(language)}.`);
       } catch (err: unknown) {
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось удалить большую модель для языка ${getLanguageLabel(language)}.`,
+            : `Не удалось удалить точный профиль для языка ${getLanguageLabel(language)}.`,
         );
       } finally {
         setActiveModelOperation(null);
@@ -2296,7 +2286,7 @@ function LanguageSettings({
       if (shouldQueue) {
         enqueueSttInstallTask({ language, variant });
         setSuccess(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель для языка ${getLanguageLabel(language)} добавлена в очередь.`,
+          `${variant === "large" ? "Точный" : "Быстрый"} профиль для языка ${getLanguageLabel(language)} добавлен в очередь.`,
         );
         return true;
       }
@@ -2345,14 +2335,14 @@ function LanguageSettings({
     sttInstallQueue,
   ]);
 
-  const handleCancelInstall = useCallback(async () => {
+  const handleОтменаInstall = useCallback(async () => {
     clearSttInstallQueue();
     if (!sttInstall.active) {
       setSuccess("Очередь установки очищена.");
       return;
     }
 
-    setCancelingInstall(true);
+    setОтменаingInstall(true);
     setError(null);
     setSuccess(null);
     setSttInstall({
@@ -2367,10 +2357,10 @@ function LanguageSettings({
       setSuccess("Запрос на отмену отправлен.");
     } catch (err: unknown) {
       setError(
-        err instanceof Error ? err.message : "Не удалось отменить установку Vosk.",
+        err instanceof Error ? err.message : "Не удалось отменить установку.",
       );
     } finally {
-      setCancelingInstall(false);
+      setОтменаingInstall(false);
     }
   }, [clearSttInstallQueue, sttInstall.active, setSttInstall]);
 
@@ -2383,7 +2373,7 @@ function LanguageSettings({
       const model = getModelByVariant(models, language, variant);
       if (!model) {
         setError(
-          `${variant === "large" ? "Большая" : "Быстрая"} модель недоступна для языка ${getLanguageLabel(language)}.`,
+          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
         );
         return;
       }
@@ -2398,7 +2388,7 @@ function LanguageSettings({
       markManualSttProfileOverride();
       setVariant(variant);
       setSuccess(
-        `Предпочтительная модель для языка ${getLanguageLabel(language)}: ${variant === "large" ? "большая" : "быстрая"}.`,
+        `Профиль для языка ${getLanguageLabel(language)}: ${variant === "large" ? "точный" : "быстрый"}.`,
       );
     },
     [models, requestModelInstall],
@@ -2421,10 +2411,10 @@ function LanguageSettings({
       speedBytesPerSecond: null,
       etaSeconds: null,
       detail: readiness.voskRuntimeLoaded
-        ? "Проверяем русскую модель Vosk..."
-        : "Запускаем установку Vosk runtime...",
+        ? "Проверяем русский пакет распознавания..."
+        : "Запускаем установку компонентов распознавания...",
       language: readiness.voskRuntimeLoaded ? primaryLanguage : null,
-      variant: readiness.voskRuntimeLoaded ? "small" : null,
+      variant: readiness.voskRuntimeLoaded ? "large" : null,
     });
 
     const targetLanguages: PrimaryLanguage[] =
@@ -2441,7 +2431,7 @@ function LanguageSettings({
       }
 
       for (const language of targetLanguages) {
-        const installed = await installModelVariant(language, "small", {
+        const installed = await installModelVariant(language, "large", {
           skipRuntimeInstall: true,
         });
         if (!installed) {
@@ -2450,7 +2440,7 @@ function LanguageSettings({
       }
 
       await refresh();
-      setSuccess("Vosk runtime и русская Small-модель установлены.");
+      setSuccess("Компоненты распознавания и точный русский профиль установлены.");
     } finally {
       setBootstrapInstalling(false);
       clearSttInstall();
@@ -2479,8 +2469,8 @@ function LanguageSettings({
       if (secondaryLanguage === value) {
         setSecondaryLanguage("none");
       }
-      setPrimarySttVariant("small");
-      setSuccess(`Быстрая модель для языка ${getLanguageLabel(value)} будет установлена автоматически.`);
+      setPrimarySttVariant("large");
+      setSuccess(`Точный профиль для языка ${getLanguageLabel(value)} будет установлен автоматически.`);
     },
     [
       primaryLanguage,
@@ -2506,17 +2496,14 @@ function LanguageSettings({
       }
 
       setSecondaryLanguage(value);
-      setSecondarySttVariant("small");
-      setSuccess(`Быстрая модель для языка ${getLanguageLabel(value)} будет установлена автоматически.`);
+      setSecondarySttVariant("large");
+      setSuccess(`Точный профиль для языка ${getLanguageLabel(value)} будет установлен автоматически.`);
     },
     [secondaryLanguage, setSecondaryLanguage, setSecondarySttVariant],
   );
 
   const primaryModel = useMemo(
-    () => ({
-      small: getModelByVariant(models, primaryLanguage, "small"),
-      large: getModelByVariant(models, primaryLanguage, "large"),
-    }),
+    () => getModelByVariant(models, primaryLanguage, "large"),
     [models, primaryLanguage],
   );
 
@@ -2526,63 +2513,13 @@ function LanguageSettings({
     if (!secondaryPrimaryLanguage) {
       return null;
     }
-    return {
-      small: getModelByVariant(models, secondaryPrimaryLanguage, "small"),
-      large: getModelByVariant(models, secondaryPrimaryLanguage, "large"),
-    };
+    return getModelByVariant(models, secondaryPrimaryLanguage, "large");
   }, [models, secondaryPrimaryLanguage]);
-
-  const globalInstallingModelId = useMemo(() => {
-    if (
-      !sttInstall.active ||
-      sttInstall.phase !== "model" ||
-      !sttInstall.language ||
-      !sttInstall.variant
-    ) {
-      return null;
-    }
-    const installingModel = models.find(
-      (model) =>
-        model.language === sttInstall.language && model.variant === sttInstall.variant,
-    );
-    return installingModel?.id ?? null;
-  }, [
-    models,
-    sttInstall.active,
-    sttInstall.language,
-    sttInstall.phase,
-    sttInstall.variant,
-  ]);
 
   const queuedTaskKeys = useMemo(
     () => new Set(sttInstallQueue.map((task) => `${task.language}:${task.variant}`)),
     [sttInstallQueue],
   );
-
-  const queuedSmallLanguages = useMemo(() => {
-    if (!sttInstall.active || sttInstall.phase !== "model") {
-      return new Set<PrimaryLanguage>();
-    }
-    const targetLanguages: PrimaryLanguage[] = secondaryPrimaryLanguage
-      ? [primaryLanguage, secondaryPrimaryLanguage]
-      : [primaryLanguage];
-    const unresolved = targetLanguages.filter((language) => {
-      const small = getModelByVariant(models, language, "small");
-      return small !== null && !hasInstalledModel(small);
-    });
-    const queued = unresolved.filter((language) => {
-      const small = getModelByVariant(models, language, "small");
-      return small !== null && small.id !== globalInstallingModelId;
-    });
-    return new Set<PrimaryLanguage>(queued);
-  }, [
-    globalInstallingModelId,
-    models,
-    primaryLanguage,
-    secondaryPrimaryLanguage,
-    sttInstall.active,
-    sttInstall.phase,
-  ]);
 
   const runtimeCurrentVersion = useMemo(() => {
     if (!readiness.voskRuntimeLoaded) {
@@ -2598,11 +2535,10 @@ function LanguageSettings({
 
   const runtimeInstalled = readiness.voskRuntimeLoaded;
   const runtimeNeedsInstall = !runtimeInstalled;
-  const selectedPrimaryModel =
-    primarySttVariant === "large" ? primaryModel.large : primaryModel.small;
+  const selectedPrimaryModel = primaryModel;
   const selectedPrimaryModelInstalled = hasInstalledModel(selectedPrimaryModel);
   const selectedPrimaryModelSizeMb = selectedPrimaryModel?.size_mb ?? null;
-  const selectedPrimaryModelLabel = primarySttVariant === "large" ? "Large" : "Small";
+  const selectedPrimaryModelLabel = "Large";
   const selectedPrimaryModelMissing =
     runtimeInstalled && selectedPrimaryModel !== null && !selectedPrimaryModelInstalled;
   const runtimeNeedsUpdate =
@@ -2612,7 +2548,7 @@ function LanguageSettings({
     runtimeLatestVersion !== null &&
     compareRuntimeVersions(runtimeCurrentVersion, runtimeLatestVersion) < 0;
 
-  const secondaryModelInstalled = hasInstalledModel(secondaryModel?.small ?? null);
+  const secondaryModelInstalled = hasInstalledModel(secondaryModel);
 
   const voskReady = readiness.vosk === "granted";
   const selectedPrimaryModelInstalling =
@@ -2649,31 +2585,29 @@ function LanguageSettings({
   );
   const activeInstallTitle =
     sttInstall.phase === "runtime"
-      ? "Устанавливаем Vosk runtime"
-      : sttInstall.variant === "large"
-        ? "Скачиваем большую русскую модель"
-        : "Скачиваем быструю русскую модель";
+      ? "Устанавливаем распознавание"
+      : "Скачиваем точный русский профиль";
   const activeInstallHint =
     sttInstall.phase === "model" && sttInstall.variant === "large"
-      ? "Источник: e-rd.ru. Large весит около 1.8 ГБ, поэтому на медленном интернете установка может занять несколько минут."
+      ? "Источник: e-rd.ru. Точный профиль весит около 1.8 ГБ, поэтому на медленном интернете установка может занять несколько минут."
       : "Источник: e-rd.ru. Если процент пару секунд стоит на 0%, это нормально: соединение и размер архива еще подготавливаются.";
   const voskInstallBusy = bootstrapInstalling || runtimeInstalling || sttInstall.active;
   const voskInstallButtonLabel = voskInstallBusy
     ? "Устанавливаем..."
     : runtimeNeedsInstall
-      ? "Установить Vosk runtime"
+      ? "Установить распознавание"
       : selectedPrimaryModelMissing
         ? `Установить ${selectedPrimaryModelLabel}`
-        : "Проверить Vosk";
+        : "Проверить";
   const voskInstallHint = runtimeNeedsInstall
-    ? "Не хватает Vosk runtime: это набор локальных DLL для распознавания речи. Small-модель уже может быть установлена отдельно."
+    ? "Не хватает компонентов распознавания. Точный профиль уже может быть установлен отдельно."
     : selectedPrimaryModelMissing
-      ? `Не хватает выбранной модели ${selectedPrimaryModelLabel}. Без нее live-распознавание не запустится.`
-      : "Компоненты на диске есть, но движок еще не подтвердил готовность. Нажмите, чтобы перепроверить и обновить состояние.";
+      ? `Не хватает выбранного профиля ${selectedPrimaryModelLabel}. Без него распознавание не запустится.`
+      : "Компоненты на диске есть, но готовность еще не подтверждена. Нажмите, чтобы перепроверить состояние.";
   const voskStatusDetail =
     readiness.vosk === "granted"
-      ? "Vosk готов к live-распознаванию микрофона и системного звука."
-      : "Нужно установить локальный Vosk runtime и выбранную русскую модель.";
+      ? "Распознавание готово: микрофон и системный звук можно использовать."
+      : "Нужно установить компоненты распознавания и выбранный русский профиль.";
   const currentQualityProfile = useMemo(
     () => resolveSttQualityProfile(primarySttVariant, secondarySttVariant),
     [primarySttVariant, secondarySttVariant],
@@ -2706,7 +2640,7 @@ function LanguageSettings({
   const isSpeechSection = section === "speech";
 
   const handleQualityProfileChange = useCallback(
-    (profileId: "small" | "large") => {
+    (profileId: "large") => {
       const profile = getSttQualityProfileById(profileId);
       setPrimarySttVariant(profile.primaryVariant);
       setSecondarySttVariant(profile.secondaryVariant);
@@ -2723,7 +2657,7 @@ function LanguageSettings({
         <>
           <Card
             title="Язык собеседования"
-            description="Основной язык распознавания речи для обычного пользовательского сценария."
+            description="Основной язык распознавания речи."
           >
             <div className="space-y-1.5">
               <div className="text-xs text-text-muted uppercase tracking-wider">Основной язык</div>
@@ -2779,12 +2713,12 @@ function LanguageSettings({
             className={getFocusSectionClass(focusTarget === "language-runtime")}
           >
             <Card
-              title="Голосовой движок"
-              description="Локальный Vosk для live-распознавания на русском."
+              title="Распознавание речи"
+              description="Локальное распознавание микрофона и системного звука на русском."
             >
               <StatusIndicator
                 status={readiness.vosk}
-                label="Vosk"
+                label="Распознавание"
                 description={voskStatusDetail}
               />
 
@@ -2805,12 +2739,12 @@ function LanguageSettings({
                     {runtimeInstalling
                       ? `Устанавливаем${runtimeInstallProgress !== null ? ` ${runtimeInstallProgress}%` : "..."}` 
                       : runtimeNeedsInstall
-                        ? "Установить Vosk"
+                        ? "Установить распознавание"
                         : "Обновить до стабильной версии"}
                   </Button>
                 ) : (
                   <Badge variant={showLatestRuntimeVersion ? "success" : "muted"}>
-                    Runtime установлен
+                    Компоненты установлены
                   </Badge>
                 )}
                 {selectedPrimaryModelMissing && (
@@ -2832,14 +2766,14 @@ function LanguageSettings({
 
               {selectedPrimaryModelMissing && (
                 <div className="mt-3 rounded-lg border border-warning/30 bg-warning-muted p-3 text-xs leading-relaxed text-warning">
-                  Выбранная модель {selectedPrimaryModelLabel} еще не установлена. Без нее live-распознавание не запустится.
+                  Выбранный профиль {selectedPrimaryModelLabel} еще не установлен. Без него распознавание не запустится.
                 </div>
               )}
 
               {runtimeInstalling && (
                 <div className="mt-3 space-y-2">
                   <ProgressBar
-                    label="Устанавливаем последнюю стабильную версию Vosk runtime..."
+                    label="Устанавливаем компоненты распознавания..."
                     percent={runtimeInstallProgress}
                   />
                   <div className="flex justify-end">
@@ -2847,7 +2781,7 @@ function LanguageSettings({
                       variant="ghost"
                       size="sm"
                       onClick={() => {
-                        void handleCancelInstall();
+                        void handleОтменаInstall();
                       }}
                       disabled={cancelingInstall}
                     >
@@ -2864,8 +2798,8 @@ function LanguageSettings({
             className={getFocusSectionClass(focusTarget === "language-models")}
           >
             <Card
-              title="Качество распознавания"
-              description="Только русский Live STT: быстрый Small или точный Large."
+              title="Профиль распознавания"
+              description="Русское распознавание работает через точный профиль Large."
               className="mb-4"
             >
               <div className="grid gap-2 sm:grid-cols-2">
@@ -2892,9 +2826,7 @@ function LanguageSettings({
                         </Badge>
                       </div>
                       <p className="mt-1.5 text-xs leading-relaxed text-text-secondary">
-                        {profile.id === "large"
-                          ? "Точнее, но тяжелее и дольше стартует."
-                          : "Быстрый старт и минимальная нагрузка."}
+                        Точнее распознает русский голос, но пакет тяжелее и запускается дольше.
                       </p>
                     </button>
                   );
@@ -2903,8 +2835,8 @@ function LanguageSettings({
             </Card>
 
             <Card
-              title="Русская модель"
-              description="Для релиза оставляем два профиля: Small и Large. Язык сейчас фиксирован: русский."
+              title="Русский пакет"
+              description="Для релиза оставляем один точный русский профиль Large."
             >
               {sttInstall.active && (
                 <div className="mb-4 rounded-xl border border-accent/30 bg-accent/8 p-4 shadow-[0_0_30px_rgba(87,208,255,0.08)]">
@@ -2914,7 +2846,7 @@ function LanguageSettings({
                         {activeInstallTitle}
                       </div>
                       <p className="mt-1 text-xs leading-relaxed text-text-secondary">
-                        {sttInstall.detail || "Устанавливаем компоненты Vosk..."}
+                        {sttInstall.detail || "Подготавливаем распознавание..."}
                       </p>
                       <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
                         {activeInstallHint}
@@ -2937,7 +2869,7 @@ function LanguageSettings({
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-muted">
                     <span>
                       {activeInstallTransferLabel
-                        ? "Загрузка идет. После скачивания приложение распакует модель автоматически."
+                        ? "Загрузка идет. После скачивания приложение распакует пакет автоматически."
                         : "Кнопку можно не нажимать повторно: установка уже запущена."}
                     </span>
                     {sttInstallQueue.length > 0 && (
@@ -2950,7 +2882,7 @@ function LanguageSettings({
                       variant="ghost"
                       size="sm"
                       onClick={() => {
-                        void handleCancelInstall();
+                        void handleОтменаInstall();
                       }}
                       disabled={cancelingInstall}
                     >
@@ -2963,7 +2895,7 @@ function LanguageSettings({
               {!voskReady && !sttInstall.active && (
                 <div className="mb-4 p-3 rounded-lg border border-warning/30 bg-warning-muted flex items-center justify-between gap-3">
                   <div className="text-xs text-warning leading-relaxed">
-                    <div className="font-semibold">Vosk еще не полностью готов.</div>
+                    <div className="font-semibold">Распознавание еще не полностью готово.</div>
                     <div className="mt-1">{voskInstallHint}</div>
                   </div>
                   <Button
@@ -2996,9 +2928,7 @@ function LanguageSettings({
                       )}
                     </div>
                     <p className="mt-1 text-xs leading-relaxed text-text-muted">
-                      {primarySttVariant === "large"
-                        ? "Более точное распознавание, модель тяжелее."
-                        : "Быстрый live-режим с низкой нагрузкой."}
+                      Более точное распознавание, пакет тяжелее.
                     </p>
                   </div>
 
@@ -3038,7 +2968,19 @@ function LanguageSettings({
                           void openModelDownloadUrl(selectedPrimaryModel.download_url);
                         }}
                       >
-                        Скачать ZIP вручную
+                        Скачать вручную
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={<Copy className="h-3.5 w-3.5" />}
+                        onClick={() => {
+                          void copyModelDownloadUrl(selectedPrimaryModel.download_url);
+                        }}
+                      >
+                        {copiedModelDownloadUrl === selectedPrimaryModel.download_url
+                          ? "Ссылка скопирована"
+                          : "Скопировать ссылку"}
                       </Button>
                       <Button
                         variant="secondary"
@@ -3048,19 +2990,22 @@ function LanguageSettings({
                         }}
                         disabled={disabled || runtimeInstalling || sttInstall.active}
                       >
-                        Установить из ZIP
+                        Установить из файла
                       </Button>
                     </div>
                     <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
                       Если встроенная загрузка идет медленно, скачайте архив браузером или менеджером
-                      загрузок, затем выберите этот ZIP здесь. Распаковывать вручную не нужно.
+                      загрузок, затем выберите этот файл здесь. Распаковывать вручную не нужно.
                     </p>
+                    <div className="mt-2 break-all rounded-md border border-border/60 bg-black/20 px-2 py-1.5 text-[10px] leading-relaxed text-text-muted">
+                      Файл загрузки: {selectedPrimaryModel.download_url}
+                    </div>
                   </div>
                 )}
 
                 {selectedPrimaryModel === null && (
                   <p className="mt-3 text-xs leading-relaxed text-warning">
-                    Модель {selectedPrimaryModelLabel} сейчас недоступна в списке Vosk.
+                    Профиль {selectedPrimaryModelLabel} сейчас недоступен для установки.
                   </p>
                 )}
 
@@ -3075,7 +3020,7 @@ function LanguageSettings({
                         variant="ghost"
                         size="sm"
                         onClick={() => {
-                          void handleCancelInstall();
+                          void handleОтменаInstall();
                         }}
                         disabled={cancelingInstall}
                       >
@@ -3096,306 +3041,6 @@ function LanguageSettings({
   );
 }
 
-function LanguageModelRow({
-  title,
-  language,
-  smallModel,
-  largeModel,
-  selectedVariant,
-  activeOperation,
-  installProgress,
-  onVariantChange,
-  onInstallModel,
-  onRemoveLarge,
-  installPhase,
-  installActive,
-  globalInstallingModelId,
-  smallQueued,
-  largeQueued,
-  onCancelInstall,
-  disabled,
-}: {
-  title: string;
-  language: PrimaryLanguage;
-  smallModel: VoskModelOption | null;
-  largeModel: VoskModelOption | null;
-  selectedVariant: SttModelVariant;
-  activeOperation: ModelOperation | null;
-  installProgress: number | null;
-  onVariantChange: (variant: SttModelVariant) => void;
-  onInstallModel: (variant: SttModelVariant) => void;
-  onRemoveLarge: () => void;
-  installPhase: string;
-  installActive: boolean;
-  globalInstallingModelId: string | null;
-  smallQueued: boolean;
-  largeQueued: boolean;
-  onCancelInstall: () => void;
-  disabled: boolean;
-}) {
-  const smallAvailable = smallModel !== null;
-  const largeAvailable = largeModel !== null;
-  const smallInstalled = hasInstalledModel(smallModel);
-  const largeInstalled = hasInstalledModel(largeModel);
-  const smallSizeMb = smallModel?.size_mb ?? null;
-  const largeSizeMb = largeModel?.size_mb ?? null;
-  const isGlobalInstallForModel = (model: VoskModelOption | null) =>
-    installActive &&
-    installPhase === "model" &&
-    model !== null &&
-    model.id === globalInstallingModelId;
-
-  const smallInstalling =
-    (activeOperation?.variant === "small" && activeOperation?.action === "install") ||
-    isGlobalInstallForModel(smallModel);
-  const largeInstalling =
-    (activeOperation?.variant === "large" && activeOperation?.action === "install") ||
-    isGlobalInstallForModel(largeModel);
-  const largeRemoving =
-    activeOperation?.variant === "large" && activeOperation?.action === "remove";
-  const smallStatusVariant = smallInstalling
-    ? "warning"
-    : smallQueued
-      ? "warning"
-      : !smallAvailable
-      ? "danger"
-      : smallInstalled
-        ? smallModel?.update_available
-          ? "warning"
-          : "success"
-        : "muted";
-  const largeStatusVariant = largeRemoving
-    ? "warning"
-    : largeInstalling
-      ? "warning"
-      : largeQueued
-        ? "warning"
-      : !largeAvailable
-        ? "danger"
-        : largeInstalled
-          ? largeModel?.update_available
-            ? "warning"
-            : "success"
-          : "muted";
-  const smallStatusLabel = smallInstalling
-    ? "Installing"
-    : smallQueued
-      ? "Queued"
-      : !smallAvailable
-      ? "Not available"
-      : smallInstalled
-        ? smallModel?.update_available
-          ? "Installed (update)"
-          : "Installed"
-        : "Not installed";
-  const largeStatusLabel = largeRemoving
-    ? "Removing"
-    : largeInstalling
-      ? "Installing"
-      : largeQueued
-        ? "Queued"
-      : !largeAvailable
-        ? "Not available"
-        : largeInstalled
-          ? largeModel?.update_available
-            ? "Installed (update)"
-            : "Installed"
-          : "Not installed";
-  const canSelectSmall = !disabled && !smallInstalling && !largeRemoving && smallAvailable;
-  const canSelectLarge = !disabled && !largeInstalling && !largeRemoving && largeAvailable;
-
-  return (
-    <div className="rounded-lg border border-border bg-bg-secondary p-3">
-      <div className="flex items-center gap-2 mb-2">
-        <Badge variant="muted">{title}</Badge>
-        <span className="text-sm font-medium text-text-primary">{getLanguageLabel(language)}</span>
-      </div>
-
-      <p className="text-xs text-text-muted mb-3">
-        Preferred model for this language:
-      </p>
-
-      <div className="space-y-3">
-        <div
-          className={`rounded-lg border p-3 transition-colors ${
-            selectedVariant === "small"
-              ? "border-accent bg-accent/5"
-              : "border-border bg-bg-primary/40"
-          } ${
-            canSelectSmall ? "cursor-pointer hover:border-border-active" : "cursor-not-allowed"
-          }`}
-          onClick={() => {
-            if (canSelectSmall) {
-              onVariantChange("small");
-            }
-          }}
-        >
-          <div className="flex items-start gap-3">
-            <input
-              type="radio"
-              name={`model-${title}-${language}`}
-              checked={selectedVariant === "small"}
-              onChange={() => onVariantChange("small")}
-              disabled={!canSelectSmall}
-              onClick={(event) => {
-                event.stopPropagation();
-              }}
-              className="mt-0.5 accent-accent"
-            />
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2">
-                  <Badge variant={smallStatusVariant}>{smallStatusLabel}</Badge>
-                  <span className="text-sm font-medium text-text-primary">Small</span>
-                </div>
-                {smallSizeMb !== null && (
-                  <span className="text-xs text-text-muted">{smallSizeMb} MB</span>
-                )}
-              </div>
-              <p className="mt-1 text-xs text-text-muted">
-                Faster startup and lower RAM usage.
-              </p>
-              {smallAvailable && !smallInstalled && !smallInstalling && (
-                <div className="mt-2">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onInstallModel("small");
-                    }}
-                    disabled={disabled || largeRemoving}
-                  >
-                    Install{smallSizeMb !== null ? ` (${smallSizeMb} MB)` : ""}
-                  </Button>
-                </div>
-              )}
-              {smallQueued && !smallInstalling && (
-                <p className="mt-2 text-xs text-warning">Queued for installation...</p>
-              )}
-              {smallInstalling && (
-                <div className="mt-3 space-y-2">
-                  <ProgressBar label="Installing small model..." percent={installProgress} />
-                  <div className="flex justify-end">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onCancelInstall();
-                      }}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div
-          className={`rounded-lg border p-3 transition-colors ${
-            selectedVariant === "large"
-              ? "border-accent bg-accent/5"
-              : "border-border bg-bg-primary/40"
-          } ${
-            canSelectLarge ? "cursor-pointer hover:border-border-active" : "cursor-not-allowed"
-          }`}
-          onClick={() => {
-            if (canSelectLarge) {
-              onVariantChange("large");
-            }
-          }}
-        >
-          <div className="flex items-start gap-3">
-            <input
-              type="radio"
-              name={`model-${title}-${language}`}
-              checked={selectedVariant === "large"}
-              onChange={() => onVariantChange("large")}
-              disabled={!canSelectLarge}
-              onClick={(event) => {
-                event.stopPropagation();
-              }}
-              className="mt-0.5 accent-accent"
-            />
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2">
-                  <Badge variant={largeStatusVariant}>{largeStatusLabel}</Badge>
-                  <span className="text-sm font-medium text-text-primary">Large</span>
-                </div>
-                {largeSizeMb !== null && (
-                  <span className="text-xs text-text-muted">{largeSizeMb} MB</span>
-                )}
-              </div>
-              <p className="mt-1 text-xs text-text-muted leading-relaxed">
-                Higher recognition accuracy, but heavier on disk, RAM, and CPU.
-                {largeSizeMb !== null ? ` Estimated disk usage: ${largeSizeMb} MB.` : ""}
-              </p>
-              {largeAvailable && !largeInstalled && !largeInstalling && !largeQueued && (
-                <div className="mt-2">
-                  <Button
-                    size="sm"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onInstallModel("large");
-                    }}
-                    disabled={disabled || largeRemoving}
-                  >
-                    Install{largeSizeMb !== null ? ` (${largeSizeMb} MB)` : ""}
-                  </Button>
-                </div>
-              )}
-              {largeQueued && !largeInstalling && (
-                <p className="mt-2 text-xs text-warning">Queued for installation...</p>
-              )}
-              {largeInstalled && !largeRemoving && (
-                <div className="mt-2">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onRemoveLarge();
-                    }}
-                    disabled={disabled || largeInstalling}
-                  >
-                    Remove Large{largeSizeMb !== null ? ` (${largeSizeMb} MB)` : ""}
-                  </Button>
-                </div>
-              )}
-              {(largeInstalling || largeRemoving) && (
-                <div className="mt-3 space-y-2">
-                  <ProgressBar
-                    label={largeRemoving ? "Removing large model..." : "Installing large model..."}
-                    percent={largeRemoving ? null : installProgress}
-                  />
-                  {largeInstalling && (
-                    <div className="flex justify-end">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onCancelInstall();
-                        }}
-                      >
-                        Cancel
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ImageSettings({ disabled }: { disabled: boolean }) {
   const { apiKey, imageHandlingMode, setImageHandlingMode } = useSettingsStore();
 
@@ -3407,14 +3052,14 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
         <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
           <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
           <p className="text-xs text-warning leading-relaxed">
-            Images settings are locked until API key is configured.
+            Настройки скриншотов доступны после ввода лицензионного ключа.
           </p>
         </div>
       )}
 
       <Card
-        title="Screenshot Handling"
-        description="How screenshots are processed before sending to the LLM."
+        title="Скриншоты"
+        description="Как обрабатывать скриншоты перед отправкой."
       >
         <div
           className={`space-y-3 transition-opacity ${aiLocked ? "opacity-50 pointer-events-none" : "opacity-100"}`}
@@ -3429,8 +3074,8 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
               className="accent-accent"
             />
             <div>
-              <div className="text-sm font-medium">OCR → text only</div>
-              <div className="text-xs text-text-muted">Private, low cost. Text extracted locally.</div>
+              <div className="text-sm font-medium">OCR - только текст</div>
+              <div className="text-xs text-text-muted">Локальное извлечение текста перед отправкой.</div>
             </div>
           </label>
           <label className={`flex items-center gap-3 p-3 rounded-lg border border-border transition-colors ${aiLocked ? "cursor-not-allowed" : "hover:border-border-active cursor-pointer"}`}>
@@ -3443,8 +3088,8 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
               className="accent-accent"
             />
             <div>
-              <div className="text-sm font-medium">Send full image</div>
-              <div className="text-xs text-text-muted">Better for diagrams/code. Requires multimodal model.</div>
+              <div className="text-sm font-medium">Отправлять изображение</div>
+              <div className="text-xs text-text-muted">Лучше для схем и кода, когда текста недостаточно.</div>
             </div>
           </label>
         </div>
@@ -3459,25 +3104,25 @@ function PrivacySettings({ disabled }: { disabled: boolean }) {
   return (
     <div className="space-y-5">
       <Card
-        title="Capture Protection"
-        description="Hide the overlay from screen sharing and recording software."
+        title="Видимость при шаринге"
+        description="Скрывать окно из демонстрации экрана и записи."
       >
         <Toggle
           checked={protectOverlay}
           onChange={setProtectOverlay}
           disabled={disabled}
-          label="Protect overlay from screen capture"
-          description="Uses OS-level window protection. Best-effort: some browsers and recorders may still capture the window."
+          label="Скрывать окно при захвате экрана"
+          description="Использует системную защиту окна. Перед интервью лучше проверить режим в тестовом звонке."
         />
 
         <div className="mt-4 space-y-2">
           <div className="text-xs font-medium text-text-muted uppercase tracking-wider">
-            Platform Status
+            Статус платформы
           </div>
           <StatusIndicator
             status="supported"
-            label="macOS Capture Protection"
-            description="Window sharing type exclusion is active."
+            label="macOS Видимость при шаринге"
+            description="Скрытие окна активно."
           />
         </div>
       </Card>

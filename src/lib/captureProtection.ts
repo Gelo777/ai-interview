@@ -38,6 +38,6 @@ export async function applyCaptureProtectionPreference(enabled: boolean): Promis
   }
 
   if (!appliedToAnyWindow) {
-    throw new Error("No AI Interview windows were available for capture protection.");
+    throw new Error("Не удалось найти окна приложения для настройки видимости.");
   }
 }

@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const hasCommand = args.length > 0;
-const command = hasCommand ? args[0] : "";
+const command = hasCommand ? args[0] : "dev";
 const passthroughArgs = hasCommand ? args.slice(1) : [];
 const needsDevConfig = command === "dev";
 const tauriArgs = needsDevConfig

@@ -7,6 +7,10 @@ import { useSettingsStore } from "@/stores/settings";
 import { logError, logInfo } from "@/lib/diagnostics";
 import type { CaptureAudioSampleResult, CapturedAudioTrack } from "@/lib/tauri";
 
+interface AudioQualityCheckProps {
+  onCompleted?: (result: CaptureAudioSampleResult) => void;
+}
+
 function formatDuration(ms: number | null | undefined): string {
   if (!ms || ms <= 0) {
     return "0.0s";
@@ -19,8 +23,8 @@ function formatTrackSummary(track: CapturedAudioTrack): string {
     return track.detail || "Источник недоступен.";
   }
 
-  const sampleRate = track.sample_rate ? `${track.sample_rate} Hz` : "unknown Hz";
-  return `${formatDuration(track.duration_ms)}, ${sampleRate}, ${track.sample_count} samples`;
+  const sampleRate = track.sample_rate ? `${track.sample_rate} Hz` : "частота не определена";
+  return `${formatDuration(track.duration_ms)}, ${sampleRate}, ${track.sample_count} сэмплов`;
 }
 
 function AudioTrackResult({
@@ -64,7 +68,7 @@ function AudioTrackResult({
   );
 }
 
-export function AudioQualityCheck() {
+export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
   const microphoneDeviceId = useSettingsStore((state) => state.microphoneDeviceId);
   const systemAudioDeviceId = useSettingsStore((state) => state.systemAudioDeviceId);
   const [running, setRunning] = useState(false);
@@ -78,9 +82,9 @@ export function AudioQualityCheck() {
     }
 
     return [
-      `Folder: ${result.output_dir}`,
-      result.microphone.file_path ? `Mic: ${result.microphone.file_path}` : null,
-      result.system_audio.file_path ? `System: ${result.system_audio.file_path}` : null,
+      `Папка: ${result.output_dir}`,
+      result.microphone.file_path ? `Микрофон: ${result.microphone.file_path}` : null,
+      result.system_audio.file_path ? `Системный звук: ${result.system_audio.file_path}` : null,
     ]
       .filter((line): line is string => Boolean(line))
       .join("\n");
@@ -95,7 +99,7 @@ export function AudioQualityCheck() {
     try {
       const { captureAudioSample, isTauri } = await import("@/lib/tauri");
       if (!isTauri()) {
-        throw new Error("Audio test is available only in the desktop app.");
+        throw new Error("Проверка аудио доступна только в установленном приложении.");
       }
 
       const captureResult = await captureAudioSample({
@@ -105,6 +109,7 @@ export function AudioQualityCheck() {
         systemAudioDeviceId: systemAudioDeviceId || undefined,
       });
       setResult(captureResult);
+      onCompleted?.(captureResult);
       logInfo("audio.quality", "Audio quality check finished", {
         outputDir: captureResult.output_dir,
         micAvailable: captureResult.microphone.available,
@@ -118,7 +123,7 @@ export function AudioQualityCheck() {
     } finally {
       setRunning(false);
     }
-  }, [microphoneDeviceId, systemAudioDeviceId]);
+  }, [microphoneDeviceId, onCompleted, systemAudioDeviceId]);
 
   const copyPaths = useCallback(async () => {
     if (!resultPaths) {

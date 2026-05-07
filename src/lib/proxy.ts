@@ -25,12 +25,42 @@ export interface LicenseValidationResult {
   status: ProxyLicenseStatus | null;
 }
 
+export interface SupportReportResponse {
+  reportId: string;
+  createdAt: string;
+}
+
+export type AiFeedbackRating = "good" | "bad" | "wrong_mode";
+
+export interface AiFeedbackResponse {
+  отзываId: string;
+  createdAt: string;
+}
+
+export interface ProxyServiceStatus {
+  status: string;
+  generatedAt: string;
+  backendVersion?: string | null;
+  openAiConfigured?: boolean;
+  chatModel?: string | null;
+  sttModel?: string | null;
+}
+
+export type TelemetrySeverity = "info" | "warn" | "error";
+
+export interface TelemetryEventResponse {
+  eventId: string;
+  createdAt: string;
+}
+
 const MAX_OUTPUT_CHARS = 1600;
 const MAX_LIST_ITEMS = 2;
 const MAX_LIST_ITEM_CHARS = 260;
 const MAX_CODE_LINES = 48;
 const MAX_CODE_CHARS = 2800;
 export const HARDCODED_PROXY_BASE_URL = "http://85.198.82.221:8080";
+export const PROXY_BASE_URL =
+  import.meta.env.VITE_PROXY_BASE_URL?.trim() || HARDCODED_PROXY_BASE_URL;
 
 function joinBaseUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
@@ -42,7 +72,7 @@ function getProxyBaseUrl(
 ): string {
   void baseUrlPreset;
   void customBaseUrl;
-  return HARDCODED_PROXY_BASE_URL;
+  return PROXY_BASE_URL;
 }
 
 async function getDeviceHeaders(): Promise<Record<string, string>> {
@@ -79,7 +109,7 @@ export async function getLicenseStatus(
     throw new Error("Введите лицензионный ключ.");
   }
   if (!baseUrl) {
-    throw new Error("Укажите адрес прокси.");
+    throw new Error("Не указан адрес сервиса.");
   }
 
   if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
@@ -177,7 +207,7 @@ export async function requestProxyHint(params: {
     throw new Error("Введите лицензионный ключ.");
   }
   if (!baseUrl) {
-    throw new Error("Укажите адрес прокси.");
+    throw new Error("Не указан адрес сервиса.");
   }
   if (!question.trim()) {
     throw new Error("Нет текста для отправки.");
@@ -213,7 +243,7 @@ export async function requestProxyHint(params: {
 
   let response: Response;
   try {
-    logInfo("proxy.hint", "Sending hint request", {
+    logInfo("service.hint", "Sending assistant request", {
       baseUrl,
       language,
       hasImage: Boolean(imageBase64Png),
@@ -230,18 +260,18 @@ export async function requestProxyHint(params: {
     });
   } catch (error) {
     if (timeoutTriggered) {
-      logWarn("proxy.hint", "Hint request timed out", {
+      logWarn("service.hint", "Assistant request timed out", {
         timeoutMs: effectiveTimeoutMs,
       });
       throw new Error(
-        `Прокси не ответил за ${Math.round(effectiveTimeoutMs / 1000)} сек. Попробуйте еще раз.`,
+        `Сервис не ответил за ${Math.round(effectiveTimeoutMs / 1000)} сек. Попробуйте еще раз.`,
       );
     }
     if (signal?.aborted) {
-      logInfo("proxy.hint", "Hint request aborted by signal");
+      logInfo("service.hint", "Assistant request aborted by signal");
       throw new Error("Запрос был отменен.");
     }
-    logWarn("proxy.hint", "Hint request failed with network error", error);
+    logWarn("service.hint", "Assistant request failed with network error", error);
     throw error;
   } finally {
     globalThis.clearTimeout(timeoutId);
@@ -250,29 +280,165 @@ export async function requestProxyHint(params: {
 
   if (!response.ok) {
     const detail = await readErrorMessage(response);
-    logWarn("proxy.hint", "Hint request failed with HTTP status", {
+    logWarn("service.hint", "Assistant request failed with HTTP status", {
       status: response.status,
       detail,
     });
     throw new Error(detail);
   }
 
-  logInfo("proxy.hint", "Hint request completed successfully", {
+  logInfo("service.hint", "Assistant request completed successfully", {
     status: response.status,
   });
   return (await response.json()) as ProxyHintResponse;
 }
 
-export function formatProxyHintResponse(response: ProxyHintResponse): string {
+export async function submitSupportReport(params: {
+  licenseKey: string;
+  report: string;
+  appVersion: string;
+  category?: string;
+}): Promise<SupportReportResponse> {
+  const trimmedKey = params.licenseKey.trim();
+  if (!trimmedKey) {
+    throw new Error("Введите лицензионный ключ перед отправкой отчета.");
+  }
+  if (!params.report.trim()) {
+    throw new Error("Отчет пустой.");
+  }
+
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/support/reports"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-License-Key": trimmedKey,
+      ...(await getDeviceHeaders()),
+    },
+    body: JSON.stringify({
+      appVersion: params.appVersion,
+      category: params.category ?? "desktop",
+      report: params.report,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return (await response.json()) as SupportReportResponse;
+}
+
+export async function submitAiFeedback(params: {
+  licenseKey: string;
+  rating: AiFeedbackRating;
+  reason?: string;
+  hintId?: string | null;
+  intentMode?: string | null;
+  taskType?: string | null;
+  hadScreenshot?: boolean;
+  question?: string;
+  response?: string;
+  appVersion: string;
+}): Promise<AiFeedbackResponse> {
+  const trimmedKey = params.licenseKey.trim();
+  if (!trimmedKey) {
+    throw new Error("Введите лицензионный ключ перед отправкой отзыва.");
+  }
+
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/support/отзыва"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-License-Key": trimmedKey,
+      ...(await getDeviceHeaders()),
+    },
+    body: JSON.stringify({
+      hintId: params.hintId ?? null,
+      rating: params.rating,
+      reason: params.reason ?? null,
+      intentMode: params.intentMode ?? null,
+      taskType: params.taskType ?? null,
+      hadScreenshot: params.hadScreenshot ?? false,
+      question: params.question ?? "",
+      response: params.response ?? "",
+      appVersion: params.appVersion,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return (await response.json()) as AiFeedbackResponse;
+}
+
+export async function getServiceStatus(): Promise<ProxyServiceStatus> {
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/status"));
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return (await response.json()) as ProxyServiceStatus;
+}
+
+export async function submitTelemetryEvent(params: {
+  licenseKey?: string;
+  eventType: string;
+  severity: TelemetrySeverity;
+  appVersion: string;
+  os?: string;
+  deviceName?: string;
+  message?: string;
+  payload?: string | Record<string, unknown> | null;
+}): Promise<TelemetryEventResponse> {
+  const trimmedKey = params.licenseKey?.trim() ?? "";
+  const payload =
+    typeof params.payload === "string"
+      ? params.payload
+      : params.payload
+        ? JSON.stringify(params.payload)
+        : null;
+
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/telemetry/events"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(trimmedKey ? { "X-License-Key": trimmedKey } : {}),
+      ...(await getDeviceHeaders()),
+    },
+    body: JSON.stringify({
+      eventType: params.eventType,
+      severity: params.severity,
+      appVersion: params.appVersion,
+      os: params.os ?? getClientOsLabel(),
+      deviceName: params.deviceName ?? null,
+      message: params.message ?? null,
+      payload,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return (await response.json()) as TelemetryEventResponse;
+}
+
+export function formatProxyHintResponse(
+  response: ProxyHintResponse,
+  options: { expectedIntentMode?: string | null } = {},
+): string {
   const compactOutput = truncateText(response.output?.trim() ?? "", MAX_OUTPUT_CHARS);
   const compactCode = truncateCode(response.code ?? "");
+  const shouldHideNextSteps = options.expectedIntentMode === "THEORY";
 
   const sections = [
     compactOutput,
     formatNamedList("Код", compactCode ? [compactCode] : []),
     formatNamedList("Чек-лист", response.checklist ?? []),
     formatNamedList("Уточняющие вопросы", response.questions ?? []),
-    formatNamedList("Следующие шаги", response.nextSteps ?? []),
+    formatNamedList("Следующие шаги", shouldHideNextSteps ? [] : (response.nextSteps ?? [])),
   ].filter(Boolean);
 
   return sections.join("\n\n").trim();
@@ -319,6 +485,15 @@ function truncateCode(value: string): string {
 
 function toProxyLanguage(language: PrimaryLanguage): string {
   return language.split("-")[0]?.toLowerCase() || "ru";
+}
+
+function getClientOsLabel(): string {
+  if (typeof navigator === "undefined") {
+    return "unknown";
+  }
+  const platform = navigator.platform || "unknown";
+  const userAgent = navigator.userAgent || "";
+  return `${platform} ${userAgent}`.trim();
 }
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
@@ -387,17 +562,17 @@ function toFriendlyProxyError(
   const normalized = `${code} ${message}`.toLowerCase();
 
   if (normalized.includes("http 401 from openai") || normalized.includes("invalid_api_key")) {
-    return "AI-сервис временно недоступен: на сервере нужно обновить OpenAI API key.";
+    return "Сервис временно недоступен: обработка ответов не настроена.";
   }
   if (status === 502 && normalized.includes("openai")) {
-    return "AI-сервис временно недоступен: proxy не смог получить ответ от OpenAI.";
+    return "Сервис временно недоступен: не удалось получить ответ.";
   }
   return null;
 }
 
 function normalizeValidationError(error: unknown): string {
   if (error instanceof TypeError) {
-    return "Не удалось подключиться к прокси. Проверьте адрес сервера, сеть и CORS.";
+    return "Не удалось подключиться к сервису. Проверьте интернет и повторите попытку.";
   }
   if (error instanceof Error && error.message.trim()) {
     return error.message;

@@ -54,12 +54,12 @@ pub async fn list_versions() -> Result<Vec<VoskRuntimeVersion>, String> {
             .get(VOSK_RUNTIME_MIRROR_RELEASES_URL)
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch mirrored Vosk runtime releases: {}", e))?
+            .map_err(|e| format!("Не удалось получить список компонентов распознавания: {}", e))?
             .error_for_status()
-            .map_err(|e| format!("Mirrored Vosk runtime releases request failed: {}", e))?
+            .map_err(|e| format!("Не удалось загрузить список компонентов распознавания: {}", e))?
             .json::<Vec<VoskRuntimeVersion>>()
             .await
-            .map_err(|e| format!("Failed to parse mirrored Vosk runtime releases: {}", e))
+            .map_err(|e| format!("Не удалось прочитать список компонентов распознавания: {}", e))
     }
     .await
     .unwrap_or_else(|_| fallback_runtime_versions());
@@ -85,7 +85,7 @@ pub async fn install_runtime(
     install_control::reset_cancel();
     let versions = list_versions().await?;
     if versions.is_empty() {
-        return Err("No compatible Vosk runtime versions found for this platform.".to_string());
+        return Err("Для этой платформы не найдены совместимые компоненты распознавания.".to_string());
     }
 
     let requested = requested_version.map(|v| normalize_tag(v.trim()));
@@ -94,7 +94,7 @@ pub async fn install_runtime(
             .iter()
             .find(|v| v.version == version || normalize_tag(&v.tag) == version)
             .cloned()
-            .ok_or_else(|| format!("Requested Vosk version '{}' is not available.", version))?
+            .ok_or_else(|| format!("Запрошенная версия компонентов '{}' недоступна.", version))?
     } else {
         versions[0].clone()
     };
@@ -108,7 +108,7 @@ pub async fn install_runtime(
                 runtime_base_dir.join("current_version.txt"),
                 selected.version.as_bytes(),
             )
-            .map_err(|e| format!("Failed to store current runtime version: {}", e))?;
+            .map_err(|e| format!("Не удалось сохранить текущую версию компонентов: {}", e))?;
             cleanup_old_runtime_versions(&runtime_base_dir, &selected.version)?;
             return Ok(VoskRuntimeInstallResult {
                 version: selected.version,
@@ -130,32 +130,32 @@ pub async fn install_runtime(
         .get(&selected.download_url)
         .send()
         .await
-        .map_err(|e| format!("Failed to download Vosk runtime: {}", e))?
+        .map_err(|e| format!("Не удалось скачать компоненты распознавания: {}", e))?
         .error_for_status()
-        .map_err(|e| format!("Vosk runtime download failed: {}", e))?;
+        .map_err(|e| format!("Загрузка компонентов распознавания не удалась: {}", e))?;
 
     let temp_archive_path = runtime_base_dir.join(format!(".{}.runtime.zip", selected.version));
     if temp_archive_path.exists() {
         fs::remove_file(&temp_archive_path)
-            .map_err(|e| format!("Failed to cleanup temp runtime archive: {}", e))?;
+            .map_err(|e| format!("Не удалось очистить временный архив: {}", e))?;
     }
 
     let total_size = response.content_length();
     let mut stream = response.bytes_stream();
     let mut downloaded = 0_u64;
     let mut archive_file = fs::File::create(&temp_archive_path)
-        .map_err(|e| format!("Failed to create temp runtime archive: {}", e))?;
+        .map_err(|e| format!("Не удалось создать временный архив: {}", e))?;
 
     while let Some(chunk) = stream.next().await {
         if install_control::is_cancelled() {
             let _ = fs::remove_file(&temp_archive_path);
-            return Err("Vosk installation cancelled by user.".to_string());
+            return Err("Установка отменена.".to_string());
         }
-        let chunk = chunk.map_err(|e| format!("Failed to read Vosk runtime chunk: {}", e))?;
+        let chunk = chunk.map_err(|e| format!("Не удалось прочитать данные загрузки: {}", e))?;
         downloaded += chunk.len() as u64;
         archive_file
             .write_all(&chunk)
-            .map_err(|e| format!("Failed to write Vosk runtime archive: {}", e))?;
+            .map_err(|e| format!("Не удалось сохранить архив компонентов: {}", e))?;
 
         let percent = total_size
             .map(|size| (downloaded as f32 / size as f32) * 90.0)
@@ -172,15 +172,15 @@ pub async fn install_runtime(
     }
     archive_file
         .flush()
-        .map_err(|e| format!("Failed to flush Vosk runtime archive: {}", e))?;
+        .map_err(|e| format!("Не удалось завершить запись архива компонентов: {}", e))?;
     drop(archive_file);
 
     if install_dir.exists() {
         fs::remove_dir_all(&install_dir)
-            .map_err(|e| format!("Failed to replace existing runtime install: {}", e))?;
+            .map_err(|e| format!("Не удалось заменить установленные компоненты: {}", e))?;
     }
     fs::create_dir_all(&install_dir)
-        .map_err(|e| format!("Failed to create runtime install directory: {}", e))?;
+        .map_err(|e| format!("Не удалось создать папку компонентов: {}", e))?;
 
     let _ = app.emit(
         "vosk_runtime_install_progress",
@@ -193,7 +193,7 @@ pub async fn install_runtime(
     );
 
     let archive_file = fs::File::open(&temp_archive_path)
-        .map_err(|e| format!("Failed to open runtime archive: {}", e))?;
+        .map_err(|e| format!("Не удалось открыть архив компонентов: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(archive_file).map_err(|e| format!("Invalid zip archive: {}", e))?;
     let mut extracted_files: Vec<String> = Vec::new();
@@ -201,7 +201,7 @@ pub async fn install_runtime(
     for index in 0..archive.len() {
         if install_control::is_cancelled() {
             let _ = fs::remove_dir_all(&install_dir);
-            return Err("Vosk installation cancelled by user.".to_string());
+            return Err("Установка отменена.".to_string());
         }
         let mut file = archive
             .by_index(index)
@@ -227,14 +227,14 @@ pub async fn install_runtime(
     }
 
     if extracted_files.is_empty() {
-        return Err("Vosk runtime archive does not contain expected runtime files.".to_string());
+        return Err("Архив компонентов распознавания не содержит нужных файлов.".to_string());
     }
 
     fs::write(
         runtime_base_dir.join("current_version.txt"),
         selected.version.as_bytes(),
     )
-    .map_err(|e| format!("Failed to store current runtime version: {}", e))?;
+    .map_err(|e| format!("Не удалось сохранить текущую версию компонентов: {}", e))?;
 
     cleanup_old_runtime_versions(&runtime_base_dir, &selected.version)?;
     let _ = fs::remove_file(&temp_archive_path);
@@ -261,14 +261,14 @@ fn collect_existing_runtime_files(install_dir: &Path) -> Result<Vec<String>, Str
     let mut files = Vec::new();
     let entries = fs::read_dir(install_dir).map_err(|e| {
         format!(
-            "Failed to list existing runtime files in '{}': {}",
+            "Не удалось прочитать установленные компоненты в '{}': {}",
             install_dir.display(),
             e
         )
     })?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read runtime file entry: {}", e))?;
+        let entry = entry.map_err(|e| format!("Не удалось прочитать файл компонентов: {}", e))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -291,7 +291,7 @@ fn runtime_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .join("runtime")
         .join("vosk")
         .join(platform_dir_name());
-    fs::create_dir_all(&base).map_err(|e| format!("Failed to create runtime directory: {}", e))?;
+    fs::create_dir_all(&base).map_err(|e| format!("Не удалось создать папку компонентов: {}", e))?;
     Ok(base)
 }
 

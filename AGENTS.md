@@ -113,7 +113,7 @@ All native deps are bundled in the app binary / app bundle:
 | Capture protection | NSWindow API (built-in)      | SetWindowDisplayAffinity (built-in) | Platform API, no external files                                                                                                                                                         |
 | Global hotkeys     | tauri-plugin-global-shortcut | tauri-plugin-global-shortcut        | Compiled into binary                                                                                                                                                                    |
 
-The only runtime download is the Vosk language model (~50MB for small, ~1.8GB for large), managed by the app's model
+The runtime download is the Russian Large Vosk language model (~1.8GB), managed by the app's model
 manager.
 
 ## Testing Strategy

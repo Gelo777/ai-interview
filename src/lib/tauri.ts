@@ -529,7 +529,7 @@ export interface VoskModelOption {
   id: string;
   name: string;
   language: string;
-  variant: "small" | "large";
+  variant: "large";
   size_mb: number;
   download_url: string;
   installed: boolean;

@@ -30,9 +30,21 @@ import { getSttPerformanceProfileLabel } from "@/lib/sttProfiles";
 import { logError, logInfo, logWarn } from "@/lib/diagnostics";
 import { formatTransferDiagnostics } from "@/lib/installProgress";
 import { applyCaptureProtectionPreference } from "@/lib/captureProtection";
+import { getServiceStatus } from "@/lib/proxy";
+import { submitCriticalSupportReport } from "@/lib/supportReporting";
+import type { CaptureAudioSampleResult } from "@/lib/tauri";
 
 const START_READINESS_TIMEOUT_MS = 8000;
 const SETUP_GUIDE_DISMISSED_KEY = "ai-interview-setup-guide-dismissed-v1";
+const AUDIO_TEST_COMPLETED_KEY = "ai-interview-audio-test-completed-v1";
+
+type SetupStep = {
+  title: string;
+  description: string;
+  done: boolean;
+  actionLabel?: string;
+  onAction?: () => void;
+};
 
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -69,7 +81,7 @@ function toFriendlyStartError(error: unknown): string {
     return "Запуск занял слишком много времени. Проверь сеть и устройства, затем попробуй еще раз.";
   }
   if (normalized.includes("overlay")) {
-    return "Не удалось открыть встроенный helper. Попробуй запустить снова.";
+    return "Не удалось открыть рабочее окно. Попробуйте запустить снова.";
   }
 
   return detail;
@@ -97,14 +109,26 @@ export function Dashboard() {
   const setProtectOverlay = useSettingsStore((s) => s.setProtectOverlay);
   const [starting, setStarting] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [runningSystemCheck, setRunningSystemCheck] = useState(false);
+  const [lastSystemCheckAt, setLastSystemCheckAt] = useState<number | null>(null);
+  const [systemCheckError, setSystemCheckError] = useState<string | null>(null);
+  const [proxyStatusDetail, setProxyStatusDetail] = useState<string | null>(null);
   const [applyingCaptureProtection, setApplyingCaptureProtection] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [startReportStatus, setStartReportStatus] = useState<string | null>(null);
+  const [sendingStartReport, setSendingStartReport] = useState(false);
   const [captureProtectionError, setCaptureProtectionError] = useState<string | null>(null);
   const [setupGuideDismissed, setSetupGuideDismissed] = useState(() => {
     if (typeof window === "undefined") {
       return false;
     }
     return window.localStorage.getItem(SETUP_GUIDE_DISMISSED_KEY) === "1";
+  });
+  const [audioTestCompleted, setAudioTestCompleted] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.localStorage.getItem(AUDIO_TEST_COMPLETED_KEY) === "1";
   });
   const audioCheckRef = useRef<HTMLDivElement | null>(null);
 
@@ -126,6 +150,7 @@ export function Dashboard() {
     permissions.systemAudio === "granted" &&
     readiness.vosk === "granted" &&
     !installBlocksInterview;
+  const cloudReady = readiness.apiKey === "granted" && readiness.model === "granted";
 
   const openSettingsTab = useCallback(
     (tab: SettingsTab, focus?: SettingsFocusTarget) => {
@@ -168,7 +193,7 @@ export function Dashboard() {
       startSession();
       setView("interview");
       setInterviewActive(true);
-      logInfo("interview.start", "Embedded helper started successfully");
+      logInfo("interview.start", "Interview session started successfully");
     } catch (e) {
       console.error("Failed to start interview", e);
       logError("interview.start", "Failed to start interview", e);
@@ -187,6 +212,61 @@ export function Dashboard() {
     readiness.vosk !== "granted" ? "распознавание речи" : null,
     installBlocksInterview ? "идет обязательная установка компонентов распознавания" : null,
   ].filter((item): item is string => Boolean(item));
+  const missingItemsText = missingItems.length > 0 ? missingItems.join(", ") : "нет";
+  const safeModeAvailable = cloudReady && !installBlocksInterview;
+  const safeModeReason =
+    missingItems.length > 0
+      ? `Режим без аудио включен, потому что не готовы: ${missingItems.join(", ")}.`
+      : "Режим без аудио включен вручную: используйте ручной ввод и ножницы.";
+
+  const handleStartSafeMode = useCallback(async () => {
+    setStarting(true);
+    setStartError(null);
+    logWarn("interview.start", "Без аудио start requested", {
+      safeModeAvailable,
+      reason: safeModeReason,
+    });
+
+    try {
+      let readyToStart = safeModeAvailable;
+      if (!readyToStart) {
+        const [, cloud] = await withTimeout(
+          Promise.all([refreshLocalReadinessNow(), refreshCloudReadinessNow()]),
+          START_READINESS_TIMEOUT_MS,
+          "Истекло время ожидания проверки готовности.",
+        );
+        readyToStart = cloud.apiReady && cloud.modelReady && !installBlocksInterview;
+      }
+
+      if (!readyToStart) {
+        setStartError(
+          "Режим без аудио недоступен: нужна активная лицензия и подключение к сервису.",
+        );
+        return;
+      }
+
+      startSession({ mode: "safe", safeModeReason });
+      setView("interview");
+      setInterviewActive(true);
+      logWarn("interview.start", "Session started without audio capture", {
+        reason: safeModeReason,
+      });
+    } catch (e) {
+      console.error("Failed to start audio-free mode", e);
+      logError("interview.start", "Failed to start audio-free mode", e);
+      setInterviewActive(false);
+      setStartError(toFriendlyStartError(e));
+    } finally {
+      setStarting(false);
+    }
+  }, [
+    installBlocksInterview,
+    safeModeAvailable,
+    safeModeReason,
+    setInterviewActive,
+    setView,
+    startSession,
+  ]);
 
   const dismissSetupGuide = useCallback(() => {
     setSetupGuideDismissed(true);
@@ -198,6 +278,86 @@ export function Dashboard() {
   const scrollToAudioCheck = useCallback(() => {
     audioCheckRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
+
+  const handleAudioCheckCompleted = useCallback((result: CaptureAudioSampleResult) => {
+    const microphoneOk = result.microphone.available && Boolean(result.microphone.file_path);
+    const systemAudioOk =
+      result.system_audio.available && Boolean(result.system_audio.file_path);
+
+    if (!microphoneOk || !systemAudioOk) {
+      return;
+    }
+
+    setAudioTestCompleted(true);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(AUDIO_TEST_COMPLETED_KEY, "1");
+    }
+  }, []);
+
+  const handleRunSystemCheck = useCallback(async () => {
+    setRunningSystemCheck(true);
+    setSystemCheckError(null);
+    setProxyStatusDetail(null);
+    logInfo("system.check", "Manual readiness check started");
+
+    try {
+      const [, , proxyStatus] = await withTimeout(
+        Promise.all([
+          refreshLocalReadinessNow(),
+          refreshCloudReadinessNow(),
+          getServiceStatus().catch((error) => {
+            logWarn("service.status", "Service status endpoint is not available", error);
+            return null;
+          }),
+        ]),
+        START_READINESS_TIMEOUT_MS,
+        "Истекло время ожидания проверки готовности.",
+      );
+      if (proxyStatus) {
+        setProxyStatusDetail(
+          proxyStatus.openAiConfigured
+            ? "Сервис доступен."
+            : "Сервис доступен, но обработка ответов временно не настроена.",
+        );
+      }
+      setLastSystemCheckAt(Date.now());
+      logInfo("system.check", "Manual readiness check finished");
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : "Не удалось выполнить проверку готовности.";
+      setSystemCheckError(detail);
+      logError("system.check", "Manual readiness check failed", error);
+    } finally {
+      setRunningSystemCheck(false);
+    }
+  }, []);
+
+  const handleSendStartReport = useCallback(async () => {
+    setSendingStartReport(true);
+    setStartReportStatus(null);
+
+    try {
+      const result = await submitCriticalSupportReport({
+        category: "desktop-start",
+        title: `Start failed: ${startError ?? "readiness blocked"}`,
+        extra: `Missing items: ${missingItemsText}`,
+        throttleKey: `desktop-start:${startError ?? missingItemsText}`,
+        force: true,
+      });
+
+      setStartReportStatus(
+        result.sent
+          ? `Отчет отправлен: ${result.reportId}`
+          : result.reason === "missing-license"
+            ? "Сначала нужен лицензионный ключ, чтобы привязать обращение к вашему аккаунту."
+            : "Не удалось отправить сообщение. Можно скопировать его вручную в блоке помощи ниже.",
+      );
+    } finally {
+      setSendingStartReport(false);
+    }
+  }, [missingItemsText, startError]);
 
   const handleToggleScreenShareVisibility = useCallback(async () => {
     const nextProtectOverlay = !protectOverlay;
@@ -299,7 +459,7 @@ export function Dashboard() {
     },
   ] as const;
 
-  const setupSteps = [
+  const setupSteps: SetupStep[] = [
     {
       title: "Лицензия",
       description: readiness.apiKey === "granted" ? "Ключ принят." : "Введите ключ из бота.",
@@ -314,10 +474,10 @@ export function Dashboard() {
       title: "Голосовой движок",
       description:
         readiness.vosk === "granted"
-          ? "Vosk runtime и модель готовы."
-          : "Установите Vosk и русскую модель Small или Large.",
+          ? "Распознавание речи готово."
+          : "Установите русский пакет распознавания.",
       done: readiness.vosk === "granted" && !installBlocksInterview,
-      actionLabel: readiness.vosk === "granted" ? undefined : "Настроить STT",
+      actionLabel: readiness.vosk === "granted" ? undefined : "Настроить",
       onAction:
         readiness.vosk === "granted"
           ? undefined
@@ -351,14 +511,18 @@ export function Dashboard() {
     },
     {
       title: "Тест качества",
-      description: "Запишите WAV и послушайте микрофон/системный звук.",
-      done: allReady,
-      actionLabel: "Записать тест",
-      onAction: scrollToAudioCheck,
+      description: audioTestCompleted
+        ? "WAV-файлы уже записывали. При проблемах можно повторить."
+        : "Запишите WAV и послушайте микрофон/системный звук.",
+      done: audioTestCompleted,
+      actionLabel: audioTestCompleted ? undefined : "Записать тест",
+      onAction: audioTestCompleted ? undefined : scrollToAudioCheck,
     },
   ];
 
-  const shouldShowSetupGuide = !setupGuideDismissed || !allReady;
+  const setupComplete = allReady && audioTestCompleted;
+  const nextSetupStep = setupSteps.find((step) => !step.done) ?? null;
+  const shouldShowSetupGuide = !setupGuideDismissed || !setupComplete;
 
   const shouldShowUpdateCard =
     appUpdate.enabled &&
@@ -472,6 +636,43 @@ export function Dashboard() {
         />
       )}
 
+      <SystemDoctorCard
+        allReady={allReady}
+        setupComplete={setupComplete}
+        nextStep={nextSetupStep}
+        running={runningSystemCheck}
+        lastCheckedAt={lastSystemCheckAt}
+        error={systemCheckError}
+        proxyStatusDetail={proxyStatusDetail}
+        onRunCheck={handleRunSystemCheck}
+      />
+
+      <PreStartCheckCard
+        steps={setupSteps}
+        allReady={allReady}
+        safeModeAvailable={safeModeAvailable}
+        safeModeReason={safeModeReason}
+        starting={starting}
+        checking={runningSystemCheck}
+        onStart={handleStartInterview}
+        onStartSafeMode={handleStartSafeMode}
+        onRunCheck={handleRunSystemCheck}
+      />
+
+      {startError && (
+        <StartFailureCard
+          error={startError}
+          missingItems={missingItems}
+          safeModeAvailable={safeModeAvailable}
+          sendingReport={sendingStartReport}
+          reportStatus={startReportStatus}
+          onRetry={handleStartInterview}
+          onRunCheck={handleRunSystemCheck}
+          onStartSafeMode={handleStartSafeMode}
+          onSendReport={handleSendStartReport}
+        />
+      )}
+
       <section className="grid gap-6 xl:grid-cols-[1.45fr_0.95fr]">
         <Card className="relative overflow-hidden p-7">
           <div className="pointer-events-none absolute right-0 top-0 h-44 w-44 rounded-full bg-accent/15 blur-3xl" />
@@ -484,8 +685,7 @@ export function Dashboard() {
               Открыл, ввел ключ, проверил готовность и начал работать.
             </h1>
             <p className="mt-3 max-w-2xl text-sm leading-7 text-text-secondary">
-              Мы постепенно ведем приложение к простому сценарию через лицензию и прокси.
-              Пользователь не должен разбираться в моделях, провайдерах и технических настройках.
+              Все важное собрано в одном месте: лицензия, готовность, звук, история и запуск помощника.
             </p>
 
             <div className="mt-6 flex flex-wrap items-center gap-3">
@@ -497,6 +697,16 @@ export function Dashboard() {
               >
                 {starting ? "Запуск..." : "Начать"}
               </Button>
+              {!allReady && safeModeAvailable && (
+                <Button
+                  variant="secondary"
+                  size="lg"
+                  onClick={handleStartSafeMode}
+                  disabled={starting}
+                >
+                  Без аудио
+                </Button>
+              )}
               <Button
                 variant="secondary"
                 size="lg"
@@ -522,11 +732,6 @@ export function Dashboard() {
                 {protectOverlay ? "Показать при шаринге" : "Скрыть при шаринге"}
               </Button>
             </div>
-            {startError && (
-              <div className="mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
-                {startError}
-              </div>
-            )}
             {captureProtectionError && (
               <div className="mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
                 {captureProtectionError}
@@ -542,7 +747,7 @@ export function Dashboard() {
           <div className="mt-3 grid grid-cols-2 gap-3">
             <MetricPanel label="Готовность" value={allReady ? "100%" : `${5 - missingItems.length}/5`} tone={allReady ? "ready" : "warning"} />
             <MetricPanel label="Язык" value={primaryLanguage} tone="neutral" />
-            <MetricPanel label="Профиль STT" value={sttProfileLabel} tone="neutral" />
+            <MetricPanel label="Профиль речи" value={sttProfileLabel} tone="neutral" />
             <MetricPanel label="Проблемы" value={missingItems.length.toString()} tone={missingItems.length === 0 ? "ready" : "warning"} />
           </div>
           <div className="mt-3 rounded-2xl border border-white/8 bg-white/[0.03] p-3">
@@ -575,6 +780,11 @@ export function Dashboard() {
               <div className="mt-1 text-sm leading-relaxed text-warning/90">
                 Не хватает: {missingItems.join(", ")}.
               </div>
+              {safeModeAvailable && (
+                <div className="mt-2 text-xs leading-relaxed text-warning/80">
+                  Можно продолжить в режиме без аудио: ручной вопрос, ножницы и ответ помощника.
+                </div>
+              )}
             </div>
           </div>
         </Card>
@@ -587,7 +797,7 @@ export function Dashboard() {
               <Download className="w-5 h-5 text-success" />
             </div>
             <div>
-              <div className="text-sm font-semibold text-success">Улучшаем распознавание в фоне</div>
+              <div className="text-sm font-semibold text-success">Готовим точный профиль в фоне</div>
               <div className="mt-1 text-sm leading-relaxed text-success/90">
                 {sttInstall.detail}
                 {sttInstall.percent !== null ? ` ${sttInstall.percent}%` : ""}
@@ -598,7 +808,7 @@ export function Dashboard() {
                 </div>
               )}
               <div className="mt-2 text-xs text-text-muted">
-                Интервью можно запускать уже сейчас. Пока скачивается большая модель, приложение работает на базовой.
+                Интервью можно запускать уже сейчас. Пока точный профиль загружается, приложение работает на базовом.
               </div>
             </div>
           </div>
@@ -632,7 +842,7 @@ export function Dashboard() {
 
       <div className="grid gap-6">
         <div ref={audioCheckRef}>
-          <AudioQualityCheck />
+          <AudioQualityCheck onCompleted={handleAudioCheckCompleted} />
         </div>
 
         <div className="grid gap-6 xl:grid-cols-2">
@@ -681,13 +891,7 @@ function SetupGuideCard({
   allReady,
   onDismiss,
 }: {
-  steps: Array<{
-    title: string;
-    description: string;
-    done: boolean;
-    actionLabel?: string;
-    onAction?: () => void;
-  }>;
+  steps: SetupStep[];
   allReady: boolean;
   onDismiss: () => void;
 }) {
@@ -701,11 +905,10 @@ function SetupGuideCard({
             Первый запуск
           </div>
           <h2 className="mt-2 text-2xl font-semibold text-text-primary">
-            Доведем helper до рабочего состояния
+            Подготовим приложение к работе
           </h2>
           <p className="mt-2 max-w-3xl text-sm leading-7 text-text-secondary">
-            Это короткий чеклист: лицензия, Vosk, микрофон, системный звук и тестовая запись.
-            После него пользователь понимает, что именно готово, а не просто ждет.
+            Это короткий чеклист: лицензия, микрофон, системный звук, распознавание и тестовая запись. После него видно, что именно готово.
           </p>
         </div>
 
@@ -758,6 +961,336 @@ function SetupGuideCard({
             )}
           </div>
         ))}
+      </div>
+    </Card>
+  );
+}
+
+function StartFailureCard({
+  error,
+  missingItems,
+  safeModeAvailable,
+  sendingReport,
+  reportStatus,
+  onRetry,
+  onRunCheck,
+  onStartSafeMode,
+  onSendReport,
+}: {
+  error: string;
+  missingItems: string[];
+  safeModeAvailable: boolean;
+  sendingReport: boolean;
+  reportStatus: string | null;
+  onRetry: () => void;
+  onRunCheck: () => void;
+  onStartSafeMode: () => void;
+  onSendReport: () => void;
+}) {
+  return (
+    <Card className="border-danger/30 bg-[linear-gradient(135deg,rgba(255,107,107,0.13),rgba(20,31,47,0.94))] p-6">
+      <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+        <div className="flex items-start gap-4">
+          <div className="mt-0.5 flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-danger/30 bg-danger/10">
+            <AlertTriangle className="h-5 w-5 text-danger" />
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-danger/80">
+              Запуск не состоялся
+            </div>
+            <h2 className="mt-1 text-2xl font-semibold text-text-primary">
+              Есть понятный путь восстановления
+            </h2>
+            <p className="mt-2 max-w-3xl text-sm leading-7 text-text-secondary">
+              {error}
+            </p>
+            {missingItems.length > 0 && (
+              <div className="mt-3 rounded-2xl border border-danger/20 bg-black/15 p-3 text-sm text-text-secondary">
+                Не готово: {missingItems.join(", ")}.
+              </div>
+            )}
+            {reportStatus && (
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-sm text-text-secondary">
+                {reportStatus}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex min-w-[220px] flex-wrap gap-2 lg:justify-end">
+          <Button
+            variant="secondary"
+            onClick={onRunCheck}
+            icon={<RefreshCw className="h-4 w-4" />}
+          >
+            Проверить всё
+          </Button>
+          <Button onClick={onRetry} icon={<Play className="h-4 w-4" />}>
+            Повторить запуск
+          </Button>
+          {safeModeAvailable && (
+            <Button variant="secondary" onClick={onStartSafeMode}>
+              Без аудио
+            </Button>
+          )}
+          <Button
+            variant="secondary"
+            onClick={onSendReport}
+            disabled={sendingReport}
+          >
+            {sendingReport ? "Отправляем..." : "Отправить сообщение"}
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function PreStartCheckCard({
+  steps,
+  allReady,
+  safeModeAvailable,
+  safeModeReason,
+  starting,
+  checking,
+  onStart,
+  onStartSafeMode,
+  onRunCheck,
+}: {
+  steps: SetupStep[];
+  allReady: boolean;
+  safeModeAvailable: boolean;
+  safeModeReason: string;
+  starting: boolean;
+  checking: boolean;
+  onStart: () => void;
+  onStartSafeMode: () => void;
+  onRunCheck: () => void;
+}) {
+  const completedCount = steps.filter((step) => step.done).length;
+
+  return (
+    <Card className="border-white/10 bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(24,48,66,0.92))] p-6">
+      <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+        <div className="min-w-0">
+          <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted">
+            Предстартовый чек
+          </div>
+          <h2 className="mt-1 text-2xl font-semibold text-text-primary">
+            {allReady ? "Полный режим готов" : "Перед запуском есть незакрытые пункты"}
+          </h2>
+          <p className="mt-2 max-w-3xl text-sm leading-7 text-text-secondary">
+            Проверяем не только наличие устройств, но и готовность сценария:
+            лицензию, сервис, звук, распознавание и контрольную запись.
+          </p>
+        </div>
+
+        <div className="flex shrink-0 flex-wrap gap-2">
+          <Button
+            onClick={onRunCheck}
+            disabled={checking || starting}
+            variant="secondary"
+            icon={<RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} />}
+          >
+            {checking ? "Проверяем..." : "Проверить всё"}
+          </Button>
+          <Button
+            onClick={onStart}
+            disabled={!allReady || starting}
+            icon={<Play className="h-4 w-4" />}
+          >
+            {starting ? "Запуск..." : "Полный режим"}
+          </Button>
+          {!allReady && safeModeAvailable && (
+            <Button variant="secondary" onClick={onStartSafeMode} disabled={starting}>
+              Без аудио
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-2 md:grid-cols-5">
+        {steps.map((step) => (
+          <div
+            key={step.title}
+            className={`rounded-2xl border p-3 ${
+              step.done
+                ? "border-success/20 bg-success-muted/40"
+                : "border-warning/25 bg-warning-muted/20"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              {step.done ? (
+                <CheckCircle className="h-4 w-4 text-success" />
+              ) : (
+                <Circle className="h-4 w-4 text-warning" />
+              )}
+              <div className="text-sm font-semibold text-text-primary">{step.title}</div>
+            </div>
+            <div className="mt-2 text-xs leading-relaxed text-text-muted">
+              {step.description}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 flex flex-col gap-2 rounded-2xl border border-white/10 bg-black/15 p-3 text-xs leading-relaxed text-text-secondary md:flex-row md:items-center md:justify-between">
+        <span>
+          Готово {completedCount}/{steps.length}.{" "}
+          {allReady
+            ? "Можно начинать интервью с распознаванием речи."
+            : safeModeAvailable
+              ? safeModeReason
+              : "Нужна активная лицензия и подключение к сервису, чтобы открыть режим без аудио."}
+        </span>
+        {!allReady && safeModeAvailable && (
+          <span className="text-warning">
+            Режим без аудио: ручной ввод + ножницы.
+          </span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function SystemDoctorCard({
+  allReady,
+  setupComplete,
+  nextStep,
+  running,
+  lastCheckedAt,
+  error,
+  proxyStatusDetail,
+  onRunCheck,
+}: {
+  allReady: boolean;
+  setupComplete: boolean;
+  nextStep: SetupStep | null;
+  running: boolean;
+  lastCheckedAt: number | null;
+  error: string | null;
+  proxyStatusDetail: string | null;
+  onRunCheck: () => void;
+}) {
+  const checkedLabel = lastCheckedAt
+    ? new Date(lastCheckedAt).toLocaleTimeString("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : null;
+
+  const title = running
+    ? "Проверяем систему"
+    : error
+      ? "Проверка не завершилась"
+      : setupComplete
+        ? "Все готово к интервью"
+        : allReady
+          ? "Можно запускать, но стоит проверить звук"
+          : "Есть следующий шаг";
+
+  const detail = running
+    ? "Проверяем лицензию, сервис, микрофон, системный звук и распознавание."
+    : error
+      ? error
+      : setupComplete
+        ? "Лицензия, сервис, микрофон, системный звук, распознавание и тестовая запись готовы."
+        : allReady
+          ? "Основные проверки зелёные. Осталось записать короткий WAV, чтобы убедиться в качестве."
+          : "Нажмите проверку или выполните следующий шаг. Так сразу видно, что осталось подготовить.";
+
+  return (
+    <Card className="border-accent/20 bg-[linear-gradient(135deg,rgba(87,208,255,0.10),rgba(56,178,120,0.08),rgba(20,31,47,0.94))] p-6">
+      <div className="grid gap-5 xl:grid-cols-[1fr_0.7fr] xl:items-center">
+        <div className="flex items-start gap-4">
+          <div
+            className={`mt-0.5 flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border ${
+              setupComplete
+                ? "border-success/25 bg-success-muted"
+                : error
+                  ? "border-danger/30 bg-danger/10"
+                  : "border-accent/25 bg-accent/10"
+            }`}
+          >
+            {running ? (
+              <RefreshCw className="h-5 w-5 animate-spin text-accent" />
+            ) : setupComplete ? (
+              <CheckCircle className="h-5 w-5 text-success" />
+            ) : (
+              <AlertTriangle className={error ? "h-5 w-5 text-danger" : "h-5 w-5 text-warning"} />
+            )}
+          </div>
+
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-accent/80">
+              Автопроверка
+            </div>
+            <h2 className="mt-1 text-2xl font-semibold text-text-primary">{title}</h2>
+            <p className="mt-2 max-w-3xl text-sm leading-7 text-text-secondary">
+              {detail}
+            </p>
+            {checkedLabel && (
+              <div className="mt-2 text-xs text-text-muted">
+                Последняя проверка: {checkedLabel}
+              </div>
+            )}
+            {proxyStatusDetail && (
+              <div className="mt-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-text-secondary">
+                {proxyStatusDetail}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-white/10 bg-black/15 p-4">
+          <div className="text-[11px] uppercase tracking-[0.16em] text-text-muted">
+            Дальше
+          </div>
+          {nextStep ? (
+            <>
+              <div className="mt-2 text-base font-semibold text-text-primary">
+                {nextStep.title}
+              </div>
+              <div className="mt-1 text-sm leading-relaxed text-text-secondary">
+                {nextStep.description}
+              </div>
+              <div className="mt-4 flex flex-wrap gap-3">
+                {nextStep.actionLabel && nextStep.onAction && (
+                  <Button variant="secondary" onClick={nextStep.onAction}>
+                    {nextStep.actionLabel}
+                  </Button>
+                )}
+                <Button
+                  onClick={onRunCheck}
+                  disabled={running}
+                  icon={<RefreshCw className={`h-4 w-4 ${running ? "animate-spin" : ""}`} />}
+                >
+                  {running ? "Проверяем..." : "Проверить всё"}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="mt-2 text-base font-semibold text-text-primary">
+                Можно начинать
+              </div>
+              <div className="mt-1 text-sm leading-relaxed text-text-secondary">
+                Все обязательные шаги закрыты. Можно начинать интервью или повторить проверку перед стартом.
+              </div>
+              <div className="mt-4">
+                <Button
+                  variant="secondary"
+                  onClick={onRunCheck}
+                  disabled={running}
+                  icon={<RefreshCw className={`h-4 w-4 ${running ? "animate-spin" : ""}`} />}
+                >
+                  {running ? "Проверяем..." : "Перепроверить"}
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </Card>
   );

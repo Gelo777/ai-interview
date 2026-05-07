@@ -6,6 +6,7 @@ import {
 } from "@/stores/settings";
 import { useHistoryStore } from "@/stores/history";
 import { MainLayout } from "@/components/layout/MainLayout";
+import { DiagnosticsReporter } from "@/components/app/DiagnosticsReporter";
 import { Dashboard } from "@/pages/Dashboard";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { HistoryPage } from "@/pages/HistoryPage";
@@ -13,7 +14,7 @@ import { InterviewOverlay } from "@/pages/InterviewOverlay";
 import { isTauri } from "@/lib/tauri";
 import { ensureSttModelWarm } from "@/lib/sttWarmup";
 import { useReadinessMonitor } from "@/hooks/useReadinessMonitor";
-import type { PrimaryLanguage, SttModelVariant } from "@/lib/types";
+import type { PrimaryLanguage } from "@/lib/types";
 import { resolveLatestStableRuntimeVersion } from "@/lib/runtimeVersion";
 import type { AppUpdateProgressEvent } from "@/lib/tauri";
 import { logInfo, logWarn } from "@/lib/diagnostics";
@@ -80,8 +81,6 @@ export default function App() {
   const hydrateApiKey = useSettingsStore((s) => s.hydrateApiKey);
   const primaryLanguage = useSettingsStore((s) => s.primaryLanguage);
   const secondaryLanguage = useSettingsStore((s) => s.secondaryLanguage);
-  const primarySttVariant = useSettingsStore((s) => s.primarySttVariant);
-  const secondarySttVariant = useSettingsStore((s) => s.secondarySttVariant);
   const historyRetentionDays = useSettingsStore((s) => s.historyRetentionDays);
   const protectOverlay = useSettingsStore((s) => s.protectOverlay);
   const setSttInstall = useAppStore((s) => s.setSttInstall);
@@ -245,12 +244,12 @@ export default function App() {
       void import("@/lib/tauri")
         .then(({ cancelVoskInstall }) => cancelVoskInstall())
         .catch(() => {
-          // Best effort: stop any background Vosk install while interview is active.
+          // Best effort: pause background speech setup while interview is active.
         });
       return;
     }
 
-    const baselineKey = `${primaryLanguage}|${primarySttVariant}|${secondaryLanguage}|${secondarySttVariant}`;
+    const baselineKey = `${primaryLanguage}|${secondaryLanguage}|large-only`;
     if (autoBaselineKeyRef.current === baselineKey) {
       return;
     }
@@ -305,7 +304,7 @@ export default function App() {
             contentLength: null,
             speedBytesPerSecond: null,
             etaSeconds: null,
-            detail: "Устанавливаем Vosk runtime...",
+            detail: "Устанавливаем компоненты распознавания...",
             language: null,
             variant: null,
           });
@@ -328,8 +327,8 @@ export default function App() {
               etaSeconds: metrics.etaSeconds,
               detail:
                 progress.phase === "downloading"
-                  ? "Скачиваем Vosk runtime..."
-                  : "Распаковываем Vosk runtime...",
+                  ? "Скачиваем компоненты распознавания..."
+                  : "Распаковываем компоненты распознавания...",
               language: null,
               variant: null,
             });
@@ -372,20 +371,20 @@ export default function App() {
           }
         }
 
-        const smallInstallPlan = targetLanguages
+        const largeInstallPlan = targetLanguages
           .map((language) =>
-            models.find((model) => model.language === language && model.variant === "small"),
+            models.find((model) => model.language === language && model.variant === "large"),
           )
-          .filter((small): small is NonNullable<typeof small> => Boolean(small))
-          .filter((small) => needsModelInstall(small));
+          .filter((large): large is NonNullable<typeof large> => Boolean(large))
+          .filter((large) => needsModelInstall(large));
 
-        for (let index = 0; index < smallInstallPlan.length; index += 1) {
+        for (let index = 0; index < largeInstallPlan.length; index += 1) {
           if (cancelled) {
             return;
           }
-          const small = smallInstallPlan[index];
+          const large = largeInstallPlan[index];
           const step = index + 1;
-          const total = smallInstallPlan.length;
+          const total = largeInstallPlan.length;
 
           setSttInstall({
             active: true,
@@ -395,15 +394,15 @@ export default function App() {
             contentLength: null,
             speedBytesPerSecond: null,
             etaSeconds: null,
-            detail: `Подготавливаем базовую модель ${small.name} (${step}/${total})...`,
-            language: small.language as PrimaryLanguage,
-            variant: "small",
+            detail: `Подготавливаем точный профиль (${step}/${total})...`,
+            language: large.language as PrimaryLanguage,
+            variant: "large",
           });
 
           const modelProgressTracker = createTransferProgressTracker();
           await downloadVoskModel(
-            small.download_url,
-            small.id,
+            large.download_url,
+            large.id,
             (progress) => {
               if (cancelled) {
                 return;
@@ -413,18 +412,18 @@ export default function App() {
                 itemPercent <= 0 &&
                 progress.content_length === null &&
                 progress.bytes_downloaded > 0 &&
-                small.size_mb > 0
+                large.size_mb > 0
               ) {
                 itemPercent = Math.min(
                   99,
-                  (progress.bytes_downloaded / (small.size_mb * 1024 * 1024)) * 100,
+                  (progress.bytes_downloaded / (large.size_mb * 1024 * 1024)) * 100,
                 );
               }
               const overallPercent = Math.round(
                 ((index + Math.max(0, Math.min(100, itemPercent)) / 100) / total) * 100,
               );
               const estimatedContentLength =
-                progress.content_length ?? (small.size_mb > 0 ? small.size_mb * 1024 * 1024 : null);
+                progress.content_length ?? (large.size_mb > 0 ? large.size_mb * 1024 * 1024 : null);
               const metrics = updateTransferProgressTracker(
                 modelProgressTracker,
                 progress.bytes_downloaded,
@@ -440,13 +439,13 @@ export default function App() {
                 etaSeconds: metrics.etaSeconds,
                 detail:
                   progress.phase === "downloading"
-                    ? `Скачиваем базовую модель ${small.name} (${step}/${total})...`
-                    : `Распаковываем базовую модель ${small.name} (${step}/${total})...`,
-                language: small.language as PrimaryLanguage,
-                variant: "small",
+                    ? `Скачиваем точный профиль (${step}/${total})...`
+                    : `Распаковываем точный профиль (${step}/${total})...`,
+                language: large.language as PrimaryLanguage,
+                variant: "large",
               });
             },
-            small.installed_versions.filter((id) => id !== small.id),
+            large.installed_versions.filter((id) => id !== large.id),
           );
           if (cancelled) {
             return;
@@ -458,62 +457,20 @@ export default function App() {
           }
         }
 
-        const pickVariantForLanguage = (language: PrimaryLanguage): SttModelVariant => {
-          if (language === primaryLanguage) {
-            return primarySttVariant;
-          }
-          if (language === secondaryLanguage) {
-            return secondarySttVariant;
-          }
-          return "small";
-        };
-
-        // Stability-first baseline:
-        // we auto-install only small models here.
-        // Large models stay manual in Settings to avoid heavy background load.
-
-        const preferredVariant = pickVariantForLanguage(primaryLanguage);
-        const preferredModel = models.find(
-          (model) =>
-            model.language === primaryLanguage &&
-            model.variant === preferredVariant,
+        const activeLarge = models.find(
+          (model) => model.language === primaryLanguage && model.variant === "large",
         );
-        const fallbackSmall = models.find(
-          (model) => model.language === primaryLanguage && model.variant === "small",
-        );
-        const activeModelId =
-          resolveInstalledModelId(preferredModel ?? { id: "", installed: false, installed_versions: [] }) ??
-          resolveInstalledModelId(fallbackSmall ?? { id: "", installed: false, installed_versions: [] });
-        const largeWarmupModelIds = Array.from(
-          new Set(
-            targetLanguages
-              .map((language) => {
-                const preferredVariant = pickVariantForLanguage(language);
-                if (preferredVariant !== "large") {
-                  return null;
-                }
-                return resolveInstalledModelId(
-                  models.find(
-                    (model) =>
-                      model.language === language && model.variant === preferredVariant,
-                  ) ?? { id: "", installed: false, installed_versions: [] },
-                );
-              })
-              .filter((modelId): modelId is string => Boolean(modelId)),
-          ),
+        const activeModelId = resolveInstalledModelId(
+          activeLarge ?? { id: "", installed: false, installed_versions: [] },
         );
 
-        const resolvedActiveModelId = activeModelId ?? "";
-        if (resolvedActiveModelId.length > 0 && !cancelled) {
-          await setActiveVoskModel(resolvedActiveModelId);
-        }
-
-        if (!cancelled && largeWarmupModelIds.length > 0) {
-          await Promise.allSettled(largeWarmupModelIds.map((modelId) => ensureSttModelWarm(modelId)));
+        if (activeModelId && !cancelled) {
+          await setActiveVoskModel(activeModelId);
+          await ensureSttModelWarm(activeModelId);
         }
       } catch (error) {
-        logWarn("stt.baseline", "Automatic STT setup failed", error);
-        console.warn("Automatic STT setup failed:", error);
+        logWarn("speech.baseline", "Automatic speech setup failed", error);
+        console.warn("Automatic speech setup failed:", error);
       } finally {
         clearSttInstall();
       }
@@ -528,9 +485,7 @@ export default function App() {
     isInterviewActive,
     isOverlayWindow,
     primaryLanguage,
-    primarySttVariant,
     secondaryLanguage,
-    secondarySttVariant,
     setSttInstall,
     setReadiness,
   ]);
@@ -675,11 +630,14 @@ export default function App() {
   }
 
   return (
-    <MainLayout>
-      {view === "dashboard" && <Dashboard />}
-      {view === "settings" && <SettingsPage />}
-      {view === "history" && <HistoryPage />}
-      {view === "interview" && <InterviewOverlay mode="embedded" />}
-    </MainLayout>
+    <>
+      <DiagnosticsReporter />
+      <MainLayout>
+        {view === "dashboard" && <Dashboard />}
+        {view === "settings" && <SettingsPage />}
+        {view === "history" && <HistoryPage />}
+        {view === "interview" && <InterviewOverlay mode="embedded" />}
+      </MainLayout>
+    </>
   );
 }

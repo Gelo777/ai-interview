@@ -105,7 +105,7 @@ export const useAppStore = create<AppState>()(
         model: "checking",
         modelDetail: "Проверяем подключение к сервису...",
         vosk: "checking",
-        voskDetail: "Проверяем Vosk...",
+        voskDetail: "Проверяем распознавание...",
         voskRuntimeLoaded: false,
         voskRuntimePath: null,
         voskLatestStableVersion: null,

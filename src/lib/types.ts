@@ -24,7 +24,7 @@ export type PrimaryLanguage =
   | "ko-KR";
 export type SecondaryLanguage = PrimaryLanguage | "none";
 export type ModelLifecycleStatus = "active" | "deprecated" | "sunset";
-export type SttModelVariant = "small" | "large";
+export type SttModelVariant = "large";
 export type HotkeyAction =
   | "send_to_llm"
   | "send_with_screenshot"
@@ -123,7 +123,11 @@ export interface SessionRecord {
   endedAt: number;
   model: string;
   provider: Provider;
+  mode?: "live" | "safe";
+  safeModeReason?: string | null;
   metrics: SessionMetrics;
+  transcript?: ChatMessage[];
+  aiResponses?: LlmResponse[];
   finalReport?: FinalReport;
 }
 
