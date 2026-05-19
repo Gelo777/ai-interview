@@ -23,7 +23,9 @@ import { useHistoryStore } from "@/stores/history";
 import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import {
   HARDCODED_PROXY_BASE_URL,
+  buildLiveSttWebSocketUrl,
   formatProxyHintResponse,
+  requestLiveSttTranscribeLatest,
   requestProxyHint,
   submitAiFeedback,
   type AiFeedbackRating,
@@ -76,6 +78,14 @@ const SCREENSHOT_PICKER_TIMEOUT_MS = 12000;
 const SCREENSHOT_STREAM_READY_TIMEOUT_MS = 4000;
 const STT_AUTOSTART_ENABLED = true;
 const STT_STRICT_AUDIO_MODE = true;
+const STT_ENGINE_SERVER_ONLY = true;
+const SERVER_STT_OPTIMISTIC_START = true;
+const SERVER_STT_STREAM_CHUNK_SECONDS = 2;
+const SERVER_STT_LOOP_GAP_MS = 100;
+const SERVER_STT_RETRY_BASE_MS = 1200;
+const SERVER_STT_WS_READY_TIMEOUT_MS = 15000;
+const SERVER_STT_TRANSCRIBE_WINDOW_SECONDS = 18;
+const SERVER_STT_SAVE_DEBUG_AUDIO = true;
 
 type InterviewOverlayMode = "embedded" | "detached";
 
@@ -449,7 +459,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const [sttStartupStartedAt, setSttStartupStartedAt] = useState<number | null>(null);
   const [sttStartupElapsedMs, setSttStartupElapsedMs] = useState(0);
   const [isSttRecovering, setIsSttRecovering] = useState(false);
+  const [serverSttRestartNonce, setServerSttRestartNonce] = useState(0);
   const [manualQuestion, setManualQuestion] = useState("");
+  const [isServerLiveReady, setIsServerLiveReady] = useState(false);
   const [cropDialogImageBase64, setCropDialogImageBase64] = useState<string | null>(
     null,
   );
@@ -499,6 +511,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const sttStopPromiseRef = useRef<Promise<void> | null>(null);
   const activeSttLanguageRef = useRef<PrimaryLanguage>(activeSttLanguage);
   const sttAcceptingResultsRef = useRef(true);
+  const serverSttLiveRef = useRef<{ socket: WebSocket | null; streamId: string | null }>({
+    socket: null,
+    streamId: null,
+  });
 
   useEffect(() => {
     activeSttLanguageRef.current = activeSttLanguage;
@@ -762,6 +778,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   const stopSttSessionGracefully = useCallback(
     async (reason: "restart" | "language_switch" | "cleanup") => {
+      if (STT_ENGINE_SERVER_ONLY) {
+        sttAcceptingResultsRef.current = false;
+        return;
+      }
+
       if (sttStopPromiseRef.current) {
         logInfo("speech.stop", "Waiting for already running speech stop", { reason });
         await sttStopPromiseRef.current;
@@ -978,6 +999,35 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   const restartSttSession = useCallback(
     async (reason: "manual" | "no_signal"): Promise<boolean> => {
+      if (STT_ENGINE_SERVER_ONLY) {
+        if (sttRecoveryInProgressRef.current) {
+          return false;
+        }
+        sttRecoveryInProgressRef.current = true;
+        setIsSttRecovering(true);
+        try {
+          setSttStatusText("Перезапускаем серверное распознавание...");
+          sttSignalSeenRef.current = { mic: false, system: false };
+          sttTranscriptSeenRef.current = { mic: false, system: false };
+          sttNoSignalNoticeShownRef.current = false;
+          sttNoSignalRecoveryAttemptedRef.current = false;
+          setServerSttRestartNonce((value) => value + 1);
+          if (reason === "manual") {
+            addMessage({
+              id: crypto.randomUUID(),
+              timestamp: Date.now(),
+              source: "ai_marker",
+              text: "Перезапускаем захват и серверный live STT...",
+              isFinal: true,
+            });
+          }
+          return true;
+        } finally {
+          sttRecoveryInProgressRef.current = false;
+          setIsSttRecovering(false);
+        }
+      }
+
       if (sttRecoveryInProgressRef.current) {
         return false;
       }
@@ -1173,6 +1223,17 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     [addMessage, startSttSessionWithRecovery, stopSttSessionGracefully],
   );
   const toggleSttLanguage = useCallback(async () => {
+    if (STT_ENGINE_SERVER_ONLY) {
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: "Серверный live STT сейчас работает только на русском.",
+        isFinal: true,
+      });
+      return;
+    }
+
     if (settings.secondaryLanguage === "none") {
       logWarn("speech.language", "Language switch skipped: secondary language is not configured");
       addMessage({
@@ -1466,6 +1527,315 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     sttNoTranscriptHintShownRef.current = { mic: false, system: false };
     setSttStatusText("Подготавливаем распознавание...");
 
+    if (STT_ENGINE_SERVER_ONLY) {
+      let disposed = false;
+
+      async function setupServerStt() {
+        const { isTauri, captureServerSttChunk, getDeviceIdentity } = await import("@/lib/tauri");
+        if (disposed) {
+          return;
+        }
+        if (!isTauri()) {
+          logInfo("speech.setup", "Skipping server speech setup in non-desktop mode");
+          return;
+        }
+
+        const initialSettings = useSettingsStore.getState();
+        const licenseKey = initialSettings.apiKey.trim();
+        if (!licenseKey) {
+          await activateSafeMode(
+            "Лицензионный ключ не найден. Добавьте ключ в настройках, чтобы включить live-распознавание.",
+            { stopAudio: false },
+          );
+          return;
+        }
+
+        setActiveSttLanguage(initialSettings.primaryLanguage);
+        setSttWarmupModelId(null);
+        setSttWarmupUi(null);
+        sttAcceptingResultsRef.current = true;
+        serverSttLiveRef.current.socket?.close();
+        serverSttLiveRef.current = { socket: null, streamId: null };
+        setIsServerLiveReady(false);
+        if (SERVER_STT_OPTIMISTIC_START) {
+          setIsSttStarting(false);
+          setSttStartupStartedAt(null);
+          setSttStartupElapsedMs(0);
+          setSttStatusText("Подключаем серверный live-поток аудио...");
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text: "Подключаем live-поток к серверу. Текст будет формироваться по кнопке вопроса.",
+            isFinal: true,
+          });
+        } else {
+          setSttStatusText(
+            "Подключаем серверный live-поток микрофона и системного звука...",
+          );
+          setSttStartupStartedAt(Date.now());
+          setSttStartupElapsedMs(0);
+          setIsSttStarting(true);
+        }
+
+        const resolveLanguageTag = (value: string) => value.split("-")[0]?.toLowerCase() || "ru";
+        const closeLiveSocket = () => {
+          const currentSocket = serverSttLiveRef.current.socket;
+          if (currentSocket) {
+            try {
+              currentSocket.close();
+            } catch {
+              // no-op
+            }
+          }
+          serverSttLiveRef.current = { socket: null, streamId: null };
+          setIsServerLiveReady(false);
+        };
+
+        const connectLiveSocket = async () => {
+          const currentSettings = useSettingsStore.getState();
+          const liveLicenseKey = currentSettings.apiKey.trim();
+          if (!liveLicenseKey) {
+            throw new Error("Лицензионный ключ отсутствует.");
+          }
+          const lang = resolveLanguageTag(currentSettings.primaryLanguage || "ru-RU");
+          const identity = await getDeviceIdentity().catch(() => null);
+          const wsUrl = buildLiveSttWebSocketUrl({
+            licenseKey: liveLicenseKey,
+            lang,
+            deviceFingerprint: identity?.fingerprint,
+            deviceName: identity?.name,
+            baseUrl: HARDCODED_PROXY_BASE_URL,
+          });
+
+          const connection = await withTimeout(
+            new Promise<{ socket: WebSocket; streamId: string }>((resolve, reject) => {
+              let settled = false;
+              const socket = new WebSocket(wsUrl);
+
+              const fail = (reason: string) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                try {
+                  socket.close();
+                } catch {
+                  // no-op
+                }
+                reject(new Error(reason));
+              };
+
+              socket.onmessage = (event) => {
+                try {
+                  const payload = JSON.parse(String(event.data)) as {
+                    type?: string;
+                    streamId?: string;
+                    message?: string;
+                  };
+                  if (payload.type === "ready" && payload.streamId?.trim()) {
+                    if (settled) {
+                      return;
+                    }
+                    settled = true;
+                    resolve({ socket, streamId: payload.streamId.trim() });
+                    return;
+                  }
+                  if (payload.type === "error") {
+                    fail(payload.message || "Сервер отклонил подключение live STT.");
+                  }
+                } catch {
+                  fail("Сервер вернул некорректный ответ live STT websocket.");
+                }
+              };
+              socket.onerror = () => {
+                fail("Не удалось открыть live STT websocket.");
+              };
+              socket.onclose = (event) => {
+                if (!settled) {
+                  fail(
+                    event.reason ||
+                      `Live STT websocket закрыт до инициализации (code=${event.code}).`,
+                  );
+                }
+              };
+            }),
+            SERVER_STT_WS_READY_TIMEOUT_MS,
+            "Серверный live-поток не ответил вовремя.",
+          );
+
+          connection.socket.onmessage = (event) => {
+            try {
+              const payload = JSON.parse(String(event.data)) as {
+                type?: string;
+                message?: string;
+              };
+              if (payload.type === "error" && payload.message) {
+                setSttStatusText(`Live-поток: ${payload.message}`);
+              }
+            } catch {
+              // no-op
+            }
+          };
+
+          connection.socket.onclose = () => {
+            if (!disposed) {
+              setIsServerLiveReady(false);
+              setSttStatusText("Live-поток аудио отключен. Пытаемся переподключиться...");
+            }
+          };
+
+          serverSttLiveRef.current = {
+            socket: connection.socket,
+            streamId: connection.streamId,
+          };
+          setIsServerLiveReady(true);
+          return { lang };
+        };
+
+        let firstChunkSettled = false;
+        let consecutiveErrors = 0;
+        let startupNoticeShown = false;
+        let connectedLanguage = resolveLanguageTag(initialSettings.primaryLanguage || "ru-RU");
+
+        await connectLiveSocket().then((connection) => {
+          connectedLanguage = connection.lang;
+        });
+
+        while (!disposed && useSessionStore.getState().isActive && !endingRef.current) {
+          const liveSettings = useSettingsStore.getState();
+          const liveLicenseKey = liveSettings.apiKey.trim();
+          if (!liveLicenseKey) {
+            setSttStatusText("Лицензионный ключ отсутствует. Live-распознавание остановлено.");
+            break;
+          }
+
+          try {
+            const socket = serverSttLiveRef.current.socket;
+            if (!socket || socket.readyState !== WebSocket.OPEN || !serverSttLiveRef.current.streamId) {
+              throw new Error("Live STT websocket не подключен.");
+            }
+
+            const chunk = await captureServerSttChunk({
+              durationSeconds: SERVER_STT_STREAM_CHUNK_SECONDS,
+              microphoneDeviceId: liveSettings.microphoneDeviceId || undefined,
+              systemAudioDeviceId: liveSettings.systemAudioDeviceId || undefined,
+            });
+
+            if (disposed) {
+              return;
+            }
+
+            if (!firstChunkSettled && !SERVER_STT_OPTIMISTIC_START) {
+              firstChunkSettled = true;
+              setIsSttStarting(false);
+              setSttStartupStartedAt(null);
+              setSttStartupElapsedMs(0);
+            } else if (!firstChunkSettled) {
+              firstChunkSettled = true;
+            }
+
+            if (chunk.microphone.available) {
+              sttSignalSeenRef.current.mic = true;
+            }
+            if (chunk.system_audio.available) {
+              sttSignalSeenRef.current.system = true;
+            }
+
+            const micPayload = chunk.microphone.wav_base64?.trim() || "";
+            const systemPayload = chunk.system_audio.wav_base64?.trim() || "";
+            if (!micPayload && !systemPayload) {
+              setSttStatusText("Поток аудио активен, но речь пока не обнаружена.");
+              await sleep(SERVER_STT_LOOP_GAP_MS);
+              continue;
+            }
+
+            socket.send(
+              JSON.stringify({
+                type: "chunk",
+                micWavBase64: micPayload || undefined,
+                systemWavBase64: systemPayload || undefined,
+                lang: connectedLanguage,
+              }),
+            );
+
+            setSttStatusText(
+              "Серверный live-поток активен. Нажмите «Отправить», чтобы распознать последние 30 секунд.",
+            );
+            if (!startupNoticeShown) {
+              startupNoticeShown = true;
+              addMessage({
+                id: crypto.randomUUID(),
+                timestamp: Date.now(),
+                source: "ai_marker",
+                text:
+                  "Поток аудио отправляется на сервер. По кнопке «Отправить» берём последние 30 секунд и формируем ответ.",
+                isFinal: true,
+              });
+            }
+
+            consecutiveErrors = 0;
+            await sleep(SERVER_STT_LOOP_GAP_MS);
+          } catch (error) {
+            if (disposed) {
+              return;
+            }
+
+            if (!firstChunkSettled && !SERVER_STT_OPTIMISTIC_START) {
+              firstChunkSettled = true;
+              setIsSttStarting(false);
+              setSttStartupStartedAt(null);
+              setSttStartupElapsedMs(0);
+            } else if (!firstChunkSettled) {
+              firstChunkSettled = true;
+            }
+
+            consecutiveErrors += 1;
+            const detail = toErrorDetail(error);
+            if (!firstChunkSettled) {
+              setSttStatusText(`Сервер STT не дал первый ответ: ${detail}`);
+            } else {
+              setSttStatusText(`Серверное распознавание: ${detail}`);
+            }
+            if (consecutiveErrors <= 2 || consecutiveErrors % 5 === 0) {
+              addMessage({
+                id: crypto.randomUUID(),
+                timestamp: Date.now(),
+                source: "ai_marker",
+                text: `Сбой live-потока: ${detail}`,
+                isFinal: true,
+              });
+            }
+
+            closeLiveSocket();
+            const retryDelay = Math.min(5000, SERVER_STT_RETRY_BASE_MS * consecutiveErrors);
+            await sleep(retryDelay);
+            if (disposed || !useSessionStore.getState().isActive || endingRef.current) {
+              break;
+            }
+            await connectLiveSocket().then((connection) => {
+              connectedLanguage = connection.lang;
+            });
+          }
+        }
+
+        closeLiveSocket();
+      }
+
+      void setupServerStt();
+
+      return () => {
+        disposed = true;
+        sttAcceptingResultsRef.current = false;
+        serverSttLiveRef.current.socket?.close();
+        serverSttLiveRef.current = { socket: null, streamId: null };
+        setIsServerLiveReady(false);
+        setIsSttStarting(false);
+        setSttStartupStartedAt(null);
+        setSttStartupElapsedMs(0);
+      };
+    }
+
     let unlistenResult: (() => void) | null = null;
     let unlistenDiagnostic: (() => void) | null = null;
     let noSignalTimer: number | null = null;
@@ -1688,6 +2058,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     stopSttSessionGracefully,
     startSttSessionWithRecovery,
     restartSttSession,
+    serverSttRestartNonce,
   ]);
 
   const handleChatScroll = useCallback(() => {
@@ -1798,17 +2169,100 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
       setLastLlmError(null);
 
-      const contextMessages = contextBuffer;
+      let contextMessages = contextBuffer;
       const manualQuestionText = manualQuestion.trim();
+      if (STT_ENGINE_SERVER_ONLY && !withScreenshot && manualQuestionText.length === 0) {
+        const streamId = serverSttLiveRef.current.streamId;
+        if (streamId) {
+          try {
+            setSttStatusText("Готовим последние 30 секунд речи для запроса...");
+            const latest = await requestLiveSttTranscribeLatest({
+              licenseKey: settings.apiKey,
+              streamId,
+              language: settings.primaryLanguage,
+              seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
+              saveAudioDebug: SERVER_STT_SAVE_DEBUG_AUDIO,
+              debugTag: "send",
+            });
+            if (latest.debugMicPath || latest.debugSystemPath) {
+              logInfo("llm.request", "Saved live STT debug audio", {
+                streamId,
+                micPath: latest.debugMicPath ?? null,
+                systemPath: latest.debugSystemPath ?? null,
+              });
+              addMessage({
+                id: crypto.randomUUID(),
+                timestamp: Date.now(),
+                source: "ai_marker",
+                text: `Сохранена отладочная запись: mic=${latest.debugMicPath ?? "-"} | system=${latest.debugSystemPath ?? "-"}`,
+                isFinal: true,
+              });
+            }
+            const systemText = latest.systemAudio.text.trim();
+            const micText = latest.microphone.text.trim();
+
+            if (systemText) {
+              handleSttResult({
+                source: "system",
+                text: systemText,
+                is_final: true,
+                confidence: 1,
+              });
+            }
+            if (micText) {
+              handleSttResult({
+                source: "mic",
+                text: micText,
+                is_final: true,
+                confidence: 1,
+              });
+            }
+
+            if (!systemText && !micText) {
+              addMessage({
+                id: crypto.randomUUID(),
+                timestamp: Date.now(),
+                source: "ai_marker",
+                text:
+                  "В последних 30 сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.",
+                isFinal: true,
+              });
+            }
+
+            contextMessages = useSessionStore.getState().contextBuffer;
+            setSttStatusText(
+              "Последний аудио-фрагмент обработан. Готовим ответ помощника...",
+            );
+          } catch (error) {
+            const detail = toErrorDetail(error);
+            logWarn("llm.request", "Failed to transcribe latest live STT window", {
+              streamId,
+              detail,
+            });
+            addMessage({
+              id: crypto.randomUUID(),
+              timestamp: Date.now(),
+              source: "ai_marker",
+              text: `Не удалось распознать последние 30 секунд: ${detail}`,
+              isFinal: true,
+            });
+          }
+        }
+      }
+
+      const transcriptCandidateMessages = contextMessages.filter(
+        (message) => message.source !== "ai_marker" && message.text.trim().length > 0,
+      );
       const intentSourceText =
-        manualQuestionText || contextMessages.map((message) => message.text).join("\n");
+        manualQuestionText || transcriptCandidateMessages.map((message) => message.text).join("\n");
       const requestIntent = resolveRequestIntentMode(
         manualQuestionText,
         intentSourceText,
         withScreenshot,
         intentModeOverride,
       );
-      const hasTextQuestion = contextMessages.length > 0 || manualQuestionText.length > 0;
+      const hasTextQuestion =
+        transcriptCandidateMessages.length > 0 || manualQuestionText.length > 0;
       if (!hasTextQuestion && !withScreenshot) {
         logWarn(
           "llm.request",
@@ -1861,7 +2315,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
       flushContextBuffer();
 
-      const transcriptLines = contextMessages.map(
+      const effectiveContextMessages = manualQuestionText
+        ? []
+        : transcriptCandidateMessages.slice(Math.max(0, transcriptCandidateMessages.length - 10));
+
+      const transcriptLines = effectiveContextMessages.map(
         (m) => `[${m.source === "interviewer" ? "Интервьюер" : "Вы"}]: ${m.text}`,
       );
       if (manualQuestionText) {
@@ -1874,23 +2332,30 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
       const transcript = transcriptLines.join("\n");
 
-      let userPrompt = buildInterviewPrompt({
-        transcript,
-        interviewContext: settings.interviewContext,
-        screenshotMode: withScreenshot,
-        manualQuestion: manualQuestionText,
-        forcedIntent: requestIntent.mode !== "AUTO" ? requestIntent : undefined,
-      });
+      let requestQuestion = manualQuestionText || transcript;
+      if (!requestQuestion.trim() && withScreenshot) {
+        requestQuestion = "Проанализируй скриншот и помоги с ответом на вопрос пользователя.";
+      }
       let imageBase64Png: string | undefined;
+
+      const appendToQuestion = (extra: string) => {
+        const chunk = extra.trim();
+        if (!chunk) {
+          return;
+        }
+        requestQuestion = requestQuestion.trim()
+          ? `${requestQuestion.trim()}\n\n${chunk}`
+          : chunk;
+      };
 
       logInfo("llm.request", "Prepared request payload", {
         withScreenshot,
         intentMode: requestIntent.mode,
         intentReason: requestIntent.reason,
-        transcriptMessages: contextMessages.length,
+        transcriptMessages: effectiveContextMessages.length,
         transcriptChars: transcript.length,
         manualQuestionChars: manualQuestionText.length,
-        promptChars: userPrompt.length,
+        questionChars: requestQuestion.length,
         language: settings.primaryLanguage,
       });
 
@@ -1925,23 +2390,23 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           }
 
           if (screenshotBase64 !== null) {
-            userPrompt +=
-              "\n\nЗадача по скриншоту: обязательно выполни routing перед ответом. Ручная просьба важнее OCR/изображения. Если в ручном вопросе или на скриншоте просят дописать/implement/complete/solve/fix/написать функцию/реализовать метод - режим LIVE_CODING, не CODE_REVIEW. Если виден stack trace, failing test или ошибка - DEBUG. Если только код без явной задачи - CODE_REVIEW. Если это не код - THEORY.";
+            appendToQuestion(
+              "Скриншот приложен. Если вопрос относится к коду или ошибке на экране, учитывай это в ответе.",
+            );
             if (settings.imageHandlingMode === "send_image") {
               imageBase64Png = screenshotBase64;
-              userPrompt += "\n\nК запросу приложен скриншот экрана с кодом или задачей.";
               logInfo("llm.screenshot", "Screenshot attached as image", {
                 base64Length: screenshotBase64.length,
               });
             } else {
               const ocrText = await tryExtractOcrText(screenshotBase64);
               if (ocrText) {
-                userPrompt += `\n\nТекст/код со скриншота:\n${ocrText}`;
+                appendToQuestion(`Текст/код со скриншота:\n${ocrText.slice(0, 2500)}`);
                 logInfo("llm.screenshot", "OCR text extracted from screenshot", {
                   ocrChars: ocrText.length,
                 });
               } else {
-                userPrompt += "\n\nСкриншот сделан, но OCR не смог извлечь текст.";
+                appendToQuestion("Скриншот сделан, но OCR не смог извлечь текст.");
                 logWarn("llm.screenshot", "Screenshot captured but OCR returned empty text");
               }
             }
@@ -1956,14 +2421,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             text: `Скриншот не добавлен: ${detail}`,
             isFinal: true,
           });
-          userPrompt += `\n\nНе удалось приложить скриншот: ${detail}`;
+          appendToQuestion(`Скриншот не добавлен: ${detail}`);
         }
       }
 
       abortRef.current?.abort();
       const requestController = new AbortController();
       abortRef.current = requestController;
-      const proxyUiTimeoutMs = withScreenshot ? 25_000 : 15_000;
+      const proxyUiTimeoutMs = withScreenshot ? 45_000 : 30_000;
       const proxyUiTimeoutMessage = `Сервис отвечает слишком долго (>${Math.round(proxyUiTimeoutMs / 1000)} сек). Проверьте сеть и повторите попытку.`;
 
       try {
@@ -1978,7 +2443,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             licenseKey: settings.apiKey,
             baseUrlPreset: "custom",
             customBaseUrl: HARDCODED_PROXY_BASE_URL,
-            question: userPrompt,
+            question: requestQuestion,
             language: settings.primaryLanguage,
             imageBase64Png,
             timeoutMs: proxyUiTimeoutMs,
@@ -1990,24 +2455,29 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         const formatted = formatProxyHintResponse(response, {
           expectedIntentMode: requestIntent.mode,
         });
+        const hadEmptyFormatted = !formatted.trim();
+        const safeFormatted = hadEmptyFormatted
+          ? "Не удалось сформировать содержательный ответ. Повторите вопрос короче и нажмите «Отправить» ещё раз."
+          : formatted;
         setLastHintMeta({
           hintId: response.hintId ?? null,
           taskType: response.taskType ?? null,
-          question: userPrompt,
+          question: requestQuestion,
           hadScreenshot: withScreenshot,
           intent: requestIntent,
         });
         const totalMs = performance.now() - startedAtMs;
         logInfo("assistant.request", "Received service response", {
           latencyMs: Math.round(totalMs),
-          responseChars: formatted.length,
+          responseChars: safeFormatted.length,
+          hadEmptyFormatted,
         });
 
         useSessionStore.setState((s) => ({
           lastLlmResponse: s.lastLlmResponse
             ? {
                 ...s.lastLlmResponse,
-                text: formatted,
+                text: safeFormatted,
                 isStreaming: false,
                 firstTokenLatencyMs: totalMs,
               }
@@ -2017,7 +2487,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 response.id === s.lastLlmResponse?.id
                   ? {
                       ...response,
-                      text: formatted,
+                      text: safeFormatted,
                       isStreaming: false,
                       firstTokenLatencyMs: totalMs,
                     }
@@ -2026,17 +2496,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             : s.llmResponses,
         }));
 
-        if (!formatted.trim()) {
-          const message = "Сервис вернул пустой ответ.";
-          logWarn("llm.request", message);
-          setLastLlmError(message);
-          addMessage({
-            id: crypto.randomUUID(),
-            timestamp: Date.now(),
-            source: "ai_marker",
-            text: `Ошибка сервиса: ${message}`,
-            isFinal: true,
-          });
+        if (hadEmptyFormatted) {
+          logWarn("llm.request", "Service response was empty after formatting. Fallback text applied.");
         }
 
         finishLlmResponse(totalMs);
@@ -2073,6 +2534,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       contextBuffer,
       finishLlmResponse,
       flushContextBuffer,
+      handleSttResult,
       intentModeOverride,
       isLlmLoading,
       manualQuestion,
@@ -2484,7 +2946,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     settings.hotkeys.find((h) => h.action === "switch_stt_language")?.keys ?? [],
   );
   const hasQuestionToSend =
-    contextBuffer.length > 0 || manualQuestion.trim().length > 0;
+    contextBuffer.length > 0 ||
+    manualQuestion.trim().length > 0 ||
+    (STT_ENGINE_SERVER_ONLY && isServerLiveReady);
   const visibleMessages = showFullTranscript ? messages : messages.slice(-4);
   const приложениеRootClassName = isEmbeddedMode
     ? "flex h-full min-h-0 w-full flex-col bg-black/20 text-zinc-100"
@@ -2511,7 +2975,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     : 0;
   const modelLoadingBannerVisible = !isSafeMode && (isSttStarting || Boolean(sttWarmupUi));
   const modelLoadingTitle = isSttStarting
-    ? "Загружаем точный профиль распознавания"
+    ? STT_ENGINE_SERVER_ONLY
+      ? "Подключаем серверное распознавание"
+      : "Загружаем точный профиль распознавания"
     : sttWarmupUi?.title ?? "Подготавливаем распознавание";
   const modelLoadingProgressPercent = isSttStarting
     ? startupProgressPercent
@@ -2520,9 +2986,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     ? `Прошло ${formatElapsed(sttStartupElapsedMs)}`
     : null;
   const modelLoadingHint = isSttStarting
-    ? sttStartupElapsedMs > LIVE_MODEL_LOADING_ESTIMATE_MS
-      ? "Large почти загружен или Windows продолжает читать большой языковой граф. Это не зависание: дождитесь статуса готовности."
-      : "Large весит около 3.5 ГБ и загружается в память. Во время загрузки не нажимайте перезапуск аудио."
+    ? STT_ENGINE_SERVER_ONLY
+      ? sttStartupElapsedMs > 30000
+        ? "Старт затянулся: проверяем резервный endpoint и повторяем сетевой запрос. Обычно это восстанавливается автоматически."
+        : "Проверяем аудио и отправляем первые чанки речи на сервер. Обычно это занимает 5-20 секунд."
+      : sttStartupElapsedMs > LIVE_MODEL_LOADING_ESTIMATE_MS
+        ? "Large почти загружен или Windows продолжает читать большой языковой граф. Это не зависание: дождитесь статуса готовности."
+        : "Large весит около 3.5 ГБ и загружается в память. Во время загрузки не нажимайте перезапуск аудио."
     : sttWarmupUi?.hint ?? sttStatusText;
 
   const openAudioSettings = () => {

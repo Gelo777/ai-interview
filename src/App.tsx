@@ -24,6 +24,8 @@ import {
 } from "@/lib/installProgress";
 import { applyCaptureProtectionPreference } from "@/lib/captureProtection";
 
+const CLIENT_STT_MODEL_INSTALL_ENABLED = false;
+
 function resolveInstalledModelId(model: {
   id: string;
   installed: boolean;
@@ -85,6 +87,7 @@ export default function App() {
   const protectOverlay = useSettingsStore((s) => s.protectOverlay);
   const setSttInstall = useAppStore((s) => s.setSttInstall);
   const clearSttInstall = useAppStore((s) => s.clearSttInstall);
+  const clearSttInstallQueue = useAppStore((s) => s.clearSttInstallQueue);
   const setReadiness = useAppStore((s) => s.setReadiness);
   const setAppUpdate = useAppStore((s) => s.setAppUpdate);
   const cleanup = useHistoryStore((s) => s.cleanup);
@@ -237,6 +240,21 @@ export default function App() {
 
   const autoBaselineKeyRef = useRef<string>("");
   useEffect(() => {
+    if (!CLIENT_STT_MODEL_INSTALL_ENABLED) {
+      clearSttInstall();
+      clearSttInstallQueue();
+      setReadiness({
+        vosk: "granted",
+        voskDetail:
+          "Серверный live STT включен. Установка локальных моделей на клиенте отключена.",
+        voskRuntimeLoaded: true,
+        voskRuntimePath: null,
+        voskModelLoaded: true,
+        voskModelPath: null,
+      });
+      return;
+    }
+
     if (isOverlayWindow !== false || !isTauri()) {
       return;
     }
@@ -481,6 +499,7 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    clearSttInstallQueue,
     clearSttInstall,
     isInterviewActive,
     isOverlayWindow,

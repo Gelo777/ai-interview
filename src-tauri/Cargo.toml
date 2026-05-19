@@ -1,6 +1,6 @@
 [package]
 name = "ai-interview"
-version = "0.1.19"
+version = "0.1.20"
 description = "AI Interview Desktop Assistant"
 authors = ["AI Interview Team"]
 license = "MIT"
@@ -30,7 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 cpal = "0.17"
 tauri-plugin-global-shortcut = "2"
 vosk = "0.3.1"
-reqwest = { version = "0.13", features = ["stream", "json"] }
+reqwest = { version = "0.13", features = ["stream", "json", "multipart"] }
 futures-util = "0.3"
 bytes = "1"
 zip = "2.2"

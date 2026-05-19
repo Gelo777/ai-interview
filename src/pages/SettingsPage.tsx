@@ -197,12 +197,64 @@ export function SettingsPage() {
           <AudioSettings disabled={isInterviewActive} focusTarget={activeFocus} />
         )}
         {tab === "speech" && (
-          <LanguageSettings
+          <ServerSpeechSettings
             disabled={isInterviewActive}
             focusTarget={activeFocus}
-            section="speech"
           />
         )}
+      </div>
+    </div>
+  );
+}
+
+function ServerSpeechSettings({
+  disabled,
+  focusTarget,
+}: {
+  disabled: boolean;
+  focusTarget: SettingsFocusTarget | null;
+}) {
+  return (
+    <div className="space-y-5">
+      <div id="language-models" className={getFocusSectionClass(focusTarget === "language-models")}>
+        <Card
+          title="Серверное распознавание речи"
+          description="Live STT теперь выполняется на сервере. Локальные модели на устройстве больше не устанавливаются."
+        >
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
+            <p>
+              Для запуска распознавания достаточно:
+              <span className="text-text-primary"> рабочего лицензионного ключа</span>,
+              микрофона и системного звука.
+            </p>
+            <p className="mt-2">
+              Установка Vosk/Whisper на клиенте отключена, поэтому проблемы со скачиванием моделей
+              больше не блокируют запуск helper.
+            </p>
+          </div>
+
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning-muted p-3">
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <p className="text-xs leading-relaxed text-warning">
+              Качество и стабильность распознавания теперь зависят в основном от сети и доступности
+              proxy backend.
+            </p>
+          </div>
+
+          <div className="mt-4">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                void refreshLocalReadinessNow();
+              }}
+              disabled={disabled}
+              icon={<RotateCcw className="h-3.5 w-3.5" />}
+            >
+              Обновить статус аудио
+            </Button>
+          </div>
+        </Card>
       </div>
     </div>
   );

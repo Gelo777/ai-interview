@@ -19,6 +19,25 @@ export interface ProxyHintResponse {
   nextSteps?: string[] | null;
 }
 
+export interface LiveSttTrackResponse {
+  source: string;
+  available: boolean;
+  text: string;
+  detail: string;
+  bufferedMs: number;
+}
+
+export interface LiveSttTranscribeLatestResponse {
+  streamId: string;
+  lang: string;
+  seconds: number;
+  transcript: string;
+  microphone: LiveSttTrackResponse;
+  systemAudio: LiveSttTrackResponse;
+  debugMicPath?: string | null;
+  debugSystemPath?: string | null;
+}
+
 export interface LicenseValidationResult {
   valid: boolean;
   detail: string | null;
@@ -58,12 +77,20 @@ const MAX_LIST_ITEMS = 2;
 const MAX_LIST_ITEM_CHARS = 260;
 const MAX_CODE_LINES = 48;
 const MAX_CODE_CHARS = 2800;
-export const HARDCODED_PROXY_BASE_URL = "http://85.198.82.221:8080";
+export const HARDCODED_PROXY_BASE_URL = "https://leonovcare.ru";
 export const PROXY_BASE_URL =
   import.meta.env.VITE_PROXY_BASE_URL?.trim() || HARDCODED_PROXY_BASE_URL;
 
 function joinBaseUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function toLiveSttWebSocketUrl(baseUrl: string): URL {
+  const url = new URL(baseUrl);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/api/v2/stt/live/ws";
+  url.search = "";
+  return url;
 }
 
 function getProxyBaseUrl(
@@ -291,6 +318,65 @@ export async function requestProxyHint(params: {
     status: response.status,
   });
   return (await response.json()) as ProxyHintResponse;
+}
+
+export function buildLiveSttWebSocketUrl(params: {
+  licenseKey: string;
+  lang: string;
+  deviceFingerprint?: string;
+  deviceName?: string;
+  baseUrl?: string;
+}): string {
+  const wsUrl = toLiveSttWebSocketUrl(params.baseUrl?.trim() || PROXY_BASE_URL);
+  wsUrl.searchParams.set("licenseKey", params.licenseKey.trim());
+  wsUrl.searchParams.set("lang", (params.lang || "ru").trim().toLowerCase());
+  if (params.deviceFingerprint?.trim()) {
+    wsUrl.searchParams.set("deviceFingerprint", params.deviceFingerprint.trim());
+  }
+  if (params.deviceName?.trim()) {
+    wsUrl.searchParams.set("deviceName", params.deviceName.trim());
+  }
+  return wsUrl.toString();
+}
+
+export async function requestLiveSttTranscribeLatest(params: {
+  licenseKey: string;
+  streamId: string;
+  language: PrimaryLanguage;
+  seconds?: number;
+  saveAudioDebug?: boolean;
+  debugTag?: string;
+}): Promise<LiveSttTranscribeLatestResponse> {
+  const trimmedKey = params.licenseKey.trim();
+  if (!trimmedKey) {
+    throw new Error("Введите лицензионный ключ.");
+  }
+  const streamId = params.streamId.trim();
+  if (!streamId) {
+    throw new Error("Live STT stream не инициализирован.");
+  }
+
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/stt/live/transcribe-latest"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-License-Key": trimmedKey,
+      ...(await getDeviceHeaders()),
+    },
+    body: JSON.stringify({
+      streamId,
+      lang: toProxyLanguage(params.language),
+      seconds: typeof params.seconds === "number" ? Math.max(1, Math.round(params.seconds)) : 30,
+      saveAudioDebug: Boolean(params.saveAudioDebug),
+      debugTag: params.debugTag?.trim() || undefined,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return (await response.json()) as LiveSttTranscribeLatestResponse;
 }
 
 export async function submitSupportReport(params: {

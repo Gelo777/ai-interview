@@ -10,6 +10,8 @@ use crate::system_audio;
 use crate::vosk_installer;
 use crate::vosk_runtime;
 use crate::whisper_stt_runtime as stt_runtime;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use futures_util::StreamExt;
@@ -18,7 +20,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::WebviewUrl;
@@ -38,7 +40,11 @@ const STT_STOP_COMMAND_TIMEOUT_SECS: u64 = 70;
 const WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD: f32 = 0.010;
 const WHISPER_CHUNK_SILENCE_RMS_THRESHOLD: f32 = 0.0035;
 const PROXY_LICENSE_TIMEOUT_SECS: u64 = 20;
+const PROXY_STT_CONNECT_TIMEOUT_SECS: u64 = 5;
+const PROXY_STT_TIMEOUT_SECS: u64 = 20;
+const SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS: u64 = 10;
 const SETTINGS_STATE_KEY: &str = "ai-interview-settings";
+static SERVER_STT_PREFERRED_ENDPOINT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn app_window_url(_app: &tauri::AppHandle) -> WebviewUrl {
     #[cfg(debug_assertions)]
@@ -1498,6 +1504,497 @@ pub async fn transcribe_captured_audio(
                 .to_string(),
         ),
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerSttChunkCaptureRequest {
+    pub duration_seconds: Option<u32>,
+    pub microphone_device_id: Option<String>,
+    pub system_audio_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSttChunkTrack {
+    pub source: String,
+    pub sample_rate: Option<u32>,
+    pub duration_ms: u64,
+    pub wav_base64: Option<String>,
+    pub available: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSttChunkCaptureResult {
+    pub duration_seconds: u32,
+    pub microphone: ServerSttChunkTrack,
+    pub system_audio: ServerSttChunkTrack,
+    pub captured_at_unix_ms: u64,
+}
+
+fn to_server_stt_chunk_track(
+    source: &str,
+    sample_rate: Option<u32>,
+    duration_ms: u64,
+    wav_base64: Option<String>,
+    available: bool,
+    detail: String,
+) -> ServerSttChunkTrack {
+    ServerSttChunkTrack {
+        source: source.to_string(),
+        sample_rate,
+        duration_ms,
+        wav_base64,
+        available,
+        detail,
+    }
+}
+
+#[tauri::command]
+pub async fn capture_server_stt_chunk(
+    app: tauri::AppHandle,
+    request: Option<ServerSttChunkCaptureRequest>,
+) -> Result<ServerSttChunkCaptureResult, String> {
+    if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
+        return Err(
+            "Stop active local speech session before server audio streaming capture."
+                .to_string(),
+        );
+    }
+
+    let request = request.unwrap_or_default();
+    let duration_seconds = request.duration_seconds.unwrap_or(2).clamp(1, 6);
+    let microphone_device_id = normalize_optional_device_id(request.microphone_device_id);
+    let system_audio_device_id = normalize_optional_device_id(request.system_audio_device_id);
+    let app_handle = app.clone();
+
+    let capture_task = tauri::async_runtime::spawn_blocking(move || {
+        capture_audio_sample_blocking(
+            &app_handle,
+            microphone_device_id,
+            system_audio_device_id,
+            duration_seconds,
+            false,
+        )
+    });
+
+    let capture_result = match tokio::time::timeout(
+        Duration::from_secs(duration_seconds as u64 + SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS),
+        capture_task,
+    )
+    .await
+    {
+        Ok(join_result) => join_result
+            .map_err(|join_err| format!("Failed to join live STT capture task: {}", join_err))??,
+        Err(_) => {
+            return Err("Live STT chunk capture timed out. Try a shorter duration.".to_string());
+        }
+    };
+
+    let capture_dir = capture_result.output_dir.clone();
+    let mic_path = capture_result.microphone.file_path.clone();
+    let system_path = capture_result.system_audio.file_path.clone();
+
+    let mic_has_audio = capture_result.microphone.available
+        && capture_result.microphone.sample_count > 0
+        && capture_result.microphone.duration_ms > 0;
+    let system_has_audio = capture_result.system_audio.available
+        && capture_result.system_audio.sample_count > 0
+        && capture_result.system_audio.duration_ms > 0;
+
+    let mut mic_base64: Option<String> = None;
+    let mut system_base64: Option<String> = None;
+
+    if mic_has_audio {
+        if let Some(path) = mic_path.as_deref() {
+            let bytes = std::fs::read(path)
+                .map_err(|err| format!("Failed to read captured mic chunk '{}': {}", path, err))?;
+            mic_base64 = Some(BASE64_STANDARD.encode(bytes));
+        }
+    }
+
+    if system_has_audio {
+        if let Some(path) = system_path.as_deref() {
+            let bytes = std::fs::read(path).map_err(|err| {
+                format!(
+                    "Failed to read captured system-audio chunk '{}': {}",
+                    path, err
+                )
+            })?;
+            system_base64 = Some(BASE64_STANDARD.encode(bytes));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+
+    Ok(ServerSttChunkCaptureResult {
+        duration_seconds,
+        microphone: to_server_stt_chunk_track(
+            "mic",
+            capture_result.microphone.sample_rate,
+            capture_result.microphone.duration_ms,
+            mic_base64,
+            mic_has_audio,
+            if mic_has_audio {
+                "ok".to_string()
+            } else {
+                capture_result.microphone.detail
+            },
+        ),
+        system_audio: to_server_stt_chunk_track(
+            "system",
+            capture_result.system_audio.sample_rate,
+            capture_result.system_audio.duration_ms,
+            system_base64,
+            system_has_audio,
+            if system_has_audio {
+                "ok".to_string()
+            } else {
+                capture_result.system_audio.detail
+            },
+        ),
+        captured_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerSttCaptureRequest {
+    pub license_key: String,
+    pub base_url: String,
+    pub language: Option<String>,
+    pub duration_seconds: Option<u32>,
+    pub microphone_device_id: Option<String>,
+    pub system_audio_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSttTrack {
+    pub source: String,
+    pub file_path: Option<String>,
+    pub text: String,
+    pub available: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSttCaptureResult {
+    pub capture_dir: String,
+    pub duration_seconds: u32,
+    pub language: String,
+    pub microphone: ServerSttTrack,
+    pub system_audio: ServerSttTrack,
+    pub transcribed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProxySttTrackResponse {
+    source: Option<String>,
+    available: Option<bool>,
+    text: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProxySttTranscribeResponse {
+    lang: Option<String>,
+    microphone: Option<ProxySttTrackResponse>,
+    #[serde(rename = "systemAudio")]
+    system_audio: Option<ProxySttTrackResponse>,
+}
+
+fn to_server_stt_track(
+    fallback_source: &str,
+    file_path: Option<String>,
+    track: Option<ProxySttTrackResponse>,
+) -> ServerSttTrack {
+    match track {
+        Some(value) => ServerSttTrack {
+            source: value
+                .source
+                .unwrap_or_else(|| fallback_source.to_string()),
+            file_path,
+            text: value.text.unwrap_or_default().trim().to_string(),
+            available: value.available.unwrap_or(false),
+            detail: value.detail.unwrap_or_default(),
+        },
+        None => ServerSttTrack {
+            source: fallback_source.to_string(),
+            file_path,
+            text: String::new(),
+            available: false,
+            detail: "Track is missing in server response.".to_string(),
+        },
+    }
+}
+
+#[tauri::command]
+pub async fn capture_and_transcribe_server_stt(
+    app: tauri::AppHandle,
+    request: Option<ServerSttCaptureRequest>,
+) -> Result<ServerSttCaptureResult, String> {
+    if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
+        return Err(
+            "Stop active local speech session before server transcription capture."
+                .to_string(),
+        );
+    }
+
+    let request = request.unwrap_or_default();
+    let license_key = request.license_key.trim().to_string();
+    if license_key.is_empty() {
+        return Err("License key is required.".to_string());
+    }
+
+    let base_url = request
+        .base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if base_url.is_empty() {
+        return Err("Proxy base URL is required.".to_string());
+    }
+
+    let language = request
+        .language
+        .unwrap_or_else(|| "ru".to_string())
+        .trim()
+        .to_lowercase();
+    let duration_seconds = request.duration_seconds.unwrap_or(4).clamp(1, 12);
+    let microphone_device_id = normalize_optional_device_id(request.microphone_device_id);
+    let system_audio_device_id = normalize_optional_device_id(request.system_audio_device_id);
+    let app_handle = app.clone();
+
+    let capture_task = tauri::async_runtime::spawn_blocking(move || {
+        capture_audio_sample_blocking(
+            &app_handle,
+            microphone_device_id,
+            system_audio_device_id,
+            duration_seconds,
+            false,
+        )
+    });
+
+    let capture_result = match tokio::time::timeout(
+        Duration::from_secs(
+            duration_seconds as u64 + SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS,
+        ),
+        capture_task,
+    )
+    .await
+    {
+        Ok(join_result) => join_result
+            .map_err(|join_err| format!("Failed to join server STT capture task: {}", join_err))??,
+        Err(_) => {
+            return Err("Server STT capture timed out. Try a shorter duration.".to_string());
+        }
+    };
+
+    let mic_path = capture_result.microphone.file_path.clone();
+    let system_path = capture_result.system_audio.file_path.clone();
+    let capture_dir = capture_result.output_dir.clone();
+
+    let mic_has_audio = capture_result.microphone.available
+        && capture_result.microphone.sample_count > 0
+        && capture_result.microphone.duration_ms > 0;
+    let system_has_audio = capture_result.system_audio.available
+        && capture_result.system_audio.sample_count > 0
+        && capture_result.system_audio.duration_ms > 0;
+    let mut attached_parts = 0usize;
+    let mut mic_bytes: Option<Vec<u8>> = None;
+    let mut system_bytes: Option<Vec<u8>> = None;
+
+    if mic_has_audio {
+        let Some(path) = mic_path.as_deref() else {
+            return Err("Captured microphone track has no file path.".to_string());
+        };
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("Failed to read captured mic audio '{}': {}", path, err))?;
+        mic_bytes = Some(bytes);
+        attached_parts += 1;
+    }
+
+    if system_has_audio {
+        let Some(path) = system_path.as_deref() else {
+            return Err("Captured system audio track has no file path.".to_string());
+        };
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("Failed to read captured system audio '{}': {}", path, err))?;
+        system_bytes = Some(bytes);
+        attached_parts += 1;
+    }
+
+    if attached_parts == 0 {
+        let _ = std::fs::remove_dir_all(&capture_dir);
+        return Ok(ServerSttCaptureResult {
+            capture_dir,
+            duration_seconds,
+            language,
+            microphone: ServerSttTrack {
+                source: "mic".to_string(),
+                file_path: mic_path,
+                text: String::new(),
+                available: false,
+                detail: format!(
+                    "No usable microphone samples were captured. {}",
+                    capture_result.microphone.detail
+                ),
+            },
+            system_audio: ServerSttTrack {
+                source: "system".to_string(),
+                file_path: system_path,
+                text: String::new(),
+                available: false,
+                detail: format!(
+                    "No usable system-audio samples were captured. {}",
+                    capture_result.system_audio.detail
+                ),
+            },
+            transcribed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0),
+        });
+    }
+
+    let mut url_candidates = vec![format!("{}/api/v1/stt/transcribe", base_url)];
+    let normalized_base = base_url.to_ascii_lowercase();
+    if normalized_base.contains("leonovcare.ru") {
+        let fallback = "http://85.198.82.221:8080/api/v1/stt/transcribe".to_string();
+        if !url_candidates.iter().any(|entry| entry == &fallback) {
+            url_candidates.push(fallback);
+        }
+    } else if normalized_base.contains("85.198.82.221:8080") {
+        let fallback = "https://leonovcare.ru/api/v1/stt/transcribe".to_string();
+        if !url_candidates.iter().any(|entry| entry == &fallback) {
+            url_candidates.push(fallback);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(PROXY_STT_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(PROXY_STT_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("Failed to build HTTP client for server STT: {}", err))?;
+
+    let device_identity = crate::device_identity::resolve();
+    if url_candidates.is_empty() {
+        let _ = std::fs::remove_dir_all(&capture_dir);
+        return Err("No server STT endpoint candidates are configured.".to_string());
+    }
+
+    let mut endpoint_order: Vec<usize> = Vec::with_capacity(url_candidates.len());
+    let preferred = SERVER_STT_PREFERRED_ENDPOINT.load(AtomicOrdering::Relaxed);
+    if preferred < url_candidates.len() {
+        endpoint_order.push(preferred);
+    }
+    for idx in 0..url_candidates.len() {
+        if !endpoint_order.contains(&idx) {
+            endpoint_order.push(idx);
+        }
+    }
+
+    let mut response: Option<reqwest::Response> = None;
+    let mut selected_url: Option<String> = None;
+    let mut selected_index: Option<usize> = None;
+    let mut last_transport_error: Option<String> = None;
+
+    for endpoint_index in endpoint_order {
+        let endpoint_url = url_candidates[endpoint_index].clone();
+        let mut form = reqwest::multipart::Form::new().text("lang", language.clone());
+
+        if let Some(bytes) = mic_bytes.as_ref() {
+            let part = reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name("mic.wav")
+                .mime_str("audio/wav")
+                .map_err(|err| format!("Failed to prepare mic audio multipart: {}", err))?;
+            form = form.part("mic", part);
+        }
+
+        if let Some(bytes) = system_bytes.as_ref() {
+            let part = reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name("system.wav")
+                .mime_str("audio/wav")
+                .map_err(|err| format!("Failed to prepare system audio multipart: {}", err))?;
+            form = form.part("system", part);
+        }
+
+        match client
+            .post(&endpoint_url)
+            .header("X-License-Key", &license_key)
+            .header("X-Device-Fingerprint", &device_identity.fingerprint)
+            .header("X-Device-Name", &device_identity.name)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(ok_response) => {
+                response = Some(ok_response);
+                selected_url = Some(endpoint_url);
+                selected_index = Some(endpoint_index);
+                break;
+            }
+            Err(err) => {
+                last_transport_error = Some(format!("{} (via {})", err, endpoint_url));
+            }
+        }
+    }
+
+    let response = match response {
+        Some(value) => value,
+        None => {
+            let _ = std::fs::remove_dir_all(&capture_dir);
+            return Err(format!(
+                "Failed to call server STT endpoint: {}.",
+                last_transport_error.unwrap_or_else(|| "unknown transport error".to_string())
+            ));
+        }
+    };
+    let selected_url = selected_url.unwrap_or_else(|| "unknown endpoint".to_string());
+    if let Some(index) = selected_index {
+        SERVER_STT_PREFERRED_ENDPOINT.store(index, AtomicOrdering::Relaxed);
+    }
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| {
+            let _ = std::fs::remove_dir_all(&capture_dir);
+            format!("Failed to read server STT response: {} (via {}).", err, selected_url)
+        })?;
+
+    let parsed = if status.is_success() {
+        serde_json::from_str::<ProxySttTranscribeResponse>(&body)
+            .map_err(|err| {
+                let _ = std::fs::remove_dir_all(&capture_dir);
+                format!(
+                    "Server STT returned invalid JSON: {} (via {}).",
+                    err, selected_url
+                )
+            })?
+    } else {
+        let detail = extract_proxy_error_message(&body).unwrap_or_else(|| {
+            format!("Server STT failed with HTTP {} (via {}).", status.as_u16(), selected_url)
+        });
+        let _ = std::fs::remove_dir_all(&capture_dir);
+        return Err(detail);
+    };
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+
+    Ok(ServerSttCaptureResult {
+        capture_dir,
+        duration_seconds,
+        language: parsed.lang.unwrap_or(language),
+        microphone: to_server_stt_track("mic", mic_path, parsed.microphone),
+        system_audio: to_server_stt_track("system", system_path, parsed.system_audio),
+        transcribed_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+    })
 }
 
 #[tauri::command]

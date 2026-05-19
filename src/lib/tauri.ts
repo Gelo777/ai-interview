@@ -115,6 +115,50 @@ export interface TranscribeCapturedAudioResult {
   transcribed_at_unix_ms: number;
 }
 
+export interface ServerSttChunkCaptureRequest extends AudioDeviceSelectionRequest {
+  durationSeconds?: number;
+}
+
+export interface ServerSttChunkTrack {
+  source: string;
+  sample_rate: number | null;
+  duration_ms: number;
+  wav_base64: string | null;
+  available: boolean;
+  detail: string;
+}
+
+export interface ServerSttChunkCaptureResult {
+  duration_seconds: number;
+  microphone: ServerSttChunkTrack;
+  system_audio: ServerSttChunkTrack;
+  captured_at_unix_ms: number;
+}
+
+export interface ServerSttCaptureRequest extends AudioDeviceSelectionRequest {
+  licenseKey: string;
+  baseUrl: string;
+  language?: string;
+  durationSeconds?: number;
+}
+
+export interface ServerSttTrack {
+  source: string;
+  file_path: string | null;
+  text: string;
+  available: boolean;
+  detail: string;
+}
+
+export interface ServerSttCaptureResult {
+  capture_dir: string;
+  duration_seconds: number;
+  language: string;
+  microphone: ServerSttTrack;
+  system_audio: ServerSttTrack;
+  transcribed_at_unix_ms: number;
+}
+
 export interface SystemAudioStatus {
   supported: boolean;
   available: boolean;
@@ -396,6 +440,37 @@ export async function transcribeCapturedAudio(
     request: {
       capture_dir: request?.captureDir?.trim() || undefined,
       language: request?.language?.trim() || undefined,
+    },
+  });
+}
+
+export async function captureAndTranscribeServerStt(
+  request: ServerSttCaptureRequest,
+): Promise<ServerSttCaptureResult> {
+  return invoke("capture_and_transcribe_server_stt", {
+    request: {
+      license_key: request.licenseKey.trim(),
+      base_url: request.baseUrl.trim(),
+      language: request.language?.trim() || undefined,
+      duration_seconds:
+        typeof request.durationSeconds === "number"
+          ? Math.round(request.durationSeconds)
+          : undefined,
+      ...normalizeAudioDeviceSelection(request),
+    },
+  });
+}
+
+export async function captureServerSttChunk(
+  request?: ServerSttChunkCaptureRequest,
+): Promise<ServerSttChunkCaptureResult> {
+  return invoke("capture_server_stt_chunk", {
+    request: {
+      ...normalizeAudioDeviceSelection(request),
+      duration_seconds:
+        typeof request?.durationSeconds === "number"
+          ? Math.round(request.durationSeconds)
+          : undefined,
     },
   });
 }

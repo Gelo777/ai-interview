@@ -63,7 +63,7 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
     const settings = useSettingsStore.getState();
     const microphoneDeviceId = settings.microphoneDeviceId.trim();
     const systemAudioDeviceId = settings.systemAudioDeviceId.trim();
-    const { checkPermissions, getVoskSttStatus, getSystemAudioStatus, isTauri, listAudioDevices } =
+    const { checkPermissions, getSystemAudioStatus, isTauri, listAudioDevices } =
       await import("@/lib/tauri");
 
     if (!isTauri()) {
@@ -81,12 +81,11 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
       };
     }
 
-    const [permissions, sttStatus, systemAudioStatus, audioDevices] = await Promise.all([
+    const [permissions, systemAudioStatus, audioDevices] = await Promise.all([
       checkPermissions({
         microphoneDeviceId: microphoneDeviceId || undefined,
         systemAudioDeviceId: systemAudioDeviceId || undefined,
       }),
-      getVoskSttStatus(),
       getSystemAudioStatus({
         systemAudioDeviceId: systemAudioDeviceId || undefined,
       }).catch(() => null),
@@ -111,22 +110,22 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
         ? "denied"
         : systemAudioPermission;
 
-    const voskReady =
-      sttStatus.available &&
-      sttStatus.runtime_library_loaded &&
-      sttStatus.model_loaded;
+    const serverSpeechReady = microphone !== "denied" || systemAudio !== "denied";
+    const serverSpeechDetail = serverSpeechReady
+      ? "Серверный live STT активен. Локальные модели на устройстве не требуются."
+      : "Серверный live STT включен, но доступ к микрофону и системному звуку сейчас недоступен.";
 
     return {
       microphone,
       systemAudio,
       screenCapture: toPermissionStatus(permissions.screen_capture),
-      voskStatus: voskReady ? "granted" : "denied",
-      voskDetail: toFriendlyVoskDetail(sttStatus.detail),
-      voskReady,
-      voskRuntimeLoaded: sttStatus.runtime_library_loaded,
-      voskRuntimePath: sttStatus.runtime_library_path,
-      voskModelLoaded: sttStatus.model_loaded,
-      voskModelPath: sttStatus.model_path,
+      voskStatus: serverSpeechReady ? "granted" : "denied",
+      voskDetail: serverSpeechDetail,
+      voskReady: serverSpeechReady,
+      voskRuntimeLoaded: true,
+      voskRuntimePath: null,
+      voskModelLoaded: true,
+      voskModelPath: null,
     };
   } catch {
     return {

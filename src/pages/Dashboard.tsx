@@ -37,6 +37,7 @@ import type { CaptureAudioSampleResult } from "@/lib/tauri";
 const START_READINESS_TIMEOUT_MS = 8000;
 const SETUP_GUIDE_DISMISSED_KEY = "ai-interview-setup-guide-dismissed-v1";
 const AUDIO_TEST_COMPLETED_KEY = "ai-interview-audio-test-completed-v1";
+const CLIENT_STT_MODEL_INSTALL_ENABLED = false;
 
 type SetupStep = {
   title: string;
@@ -134,9 +135,9 @@ export function Dashboard() {
 
   const lastSession = sessions[0] ?? null;
   const backgroundModelInstall =
-    sttInstall.active && sttInstall.phase === "background-model";
+    CLIENT_STT_MODEL_INSTALL_ENABLED && sttInstall.active && sttInstall.phase === "background-model";
 
-  const installBlocksInterview =
+  const installBlocksInterview = CLIENT_STT_MODEL_INSTALL_ENABLED &&
     sttInstall.active &&
     sttInstall.phase !== "background-model" &&
     (sttInstall.phase !== "model" ||
@@ -449,13 +450,13 @@ export function Dashboard() {
       label: "Распознавание речи",
       description:
         readiness.vosk === "granted"
-          ? "Распознавание речи готово к работе"
+          ? "Серверное распознавание готово к работе"
           : readiness.voskDetail,
       actionLabel: readiness.vosk === "granted" ? undefined : "Настроить",
       onAction:
         readiness.vosk === "granted"
           ? undefined
-          : () => openSettingsTab("speech", "language-runtime"),
+          : () => openSettingsTab("speech", "language-models"),
     },
   ] as const;
 
@@ -471,17 +472,17 @@ export function Dashboard() {
           : () => openSettingsTab("llm", "llm-api-key"),
     },
     {
-      title: "Голосовой движок",
+      title: "Распознавание речи",
       description:
         readiness.vosk === "granted"
-          ? "Распознавание речи готово."
-          : "Установите русский пакет распознавания.",
+          ? "Серверный STT подключен."
+          : "Проверьте ключ, сеть и доступ к аудио устройствам.",
       done: readiness.vosk === "granted" && !installBlocksInterview,
       actionLabel: readiness.vosk === "granted" ? undefined : "Настроить",
       onAction:
         readiness.vosk === "granted"
           ? undefined
-          : () => openSettingsTab("speech", "language-runtime"),
+          : () => openSettingsTab("speech", "language-models"),
     },
     {
       title: "Микрофон",

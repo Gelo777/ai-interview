@@ -153,6 +153,8 @@ pub fn run() {
             commands::get_audio_debug_snapshot,
             commands::capture_audio_sample,
             commands::transcribe_captured_audio,
+            commands::capture_server_stt_chunk,
+            commands::capture_and_transcribe_server_stt,
             commands::get_capture_protection,
             commands::get_system_audio_status,
             commands::set_capture_protection_for_window,
