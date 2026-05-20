@@ -85,6 +85,7 @@ const SERVER_STT_LOOP_GAP_MS = 100;
 const SERVER_STT_RETRY_BASE_MS = 1200;
 const SERVER_STT_WS_READY_TIMEOUT_MS = 15000;
 const SERVER_STT_TRANSCRIBE_WINDOW_SECONDS = 18;
+const SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS = 4;
 const SERVER_STT_SAVE_DEBUG_AUDIO = true;
 
 type InterviewOverlayMode = "embedded" | "detached";
@@ -1760,7 +1761,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             );
 
             setSttStatusText(
-              "Серверный live-поток активен. Нажмите «Отправить», чтобы распознать последние 30 секунд.",
+              `Серверный live-поток активен. Нажмите «Отправить», чтобы распознать последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд.`,
             );
             if (!startupNoticeShown) {
               startupNoticeShown = true;
@@ -2175,7 +2176,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         const streamId = serverSttLiveRef.current.streamId;
         if (streamId) {
           try {
-            setSttStatusText("Готовим последние 30 секунд речи для запроса...");
+            setSttStatusText(
+              `Готовим последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд речи для запроса...`,
+            );
             const latest = await requestLiveSttTranscribeLatest({
               licenseKey: settings.apiKey,
               streamId,
@@ -2183,6 +2186,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
               saveAudioDebug: SERVER_STT_SAVE_DEBUG_AUDIO,
               debugTag: "send",
+              consumeAfterRead: true,
+              retainTailSeconds: SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS,
             });
             if (latest.debugMicPath || latest.debugSystemPath) {
               logInfo("llm.request", "Saved live STT debug audio", {
@@ -2224,7 +2229,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 timestamp: Date.now(),
                 source: "ai_marker",
                 text:
-                  "В последних 30 сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.",
+                  `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.`,
                 isFinal: true,
               });
             }

@@ -346,6 +346,8 @@ export async function requestLiveSttTranscribeLatest(params: {
   seconds?: number;
   saveAudioDebug?: boolean;
   debugTag?: string;
+  consumeAfterRead?: boolean;
+  retainTailSeconds?: number;
 }): Promise<LiveSttTranscribeLatestResponse> {
   const trimmedKey = params.licenseKey.trim();
   if (!trimmedKey) {
@@ -369,6 +371,11 @@ export async function requestLiveSttTranscribeLatest(params: {
       seconds: typeof params.seconds === "number" ? Math.max(1, Math.round(params.seconds)) : 30,
       saveAudioDebug: Boolean(params.saveAudioDebug),
       debugTag: params.debugTag?.trim() || undefined,
+      consumeAfterRead: Boolean(params.consumeAfterRead),
+      retainTailSeconds:
+        typeof params.retainTailSeconds === "number"
+          ? Math.max(0, Math.round(params.retainTailSeconds))
+          : undefined,
     }),
   });
 
