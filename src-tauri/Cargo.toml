@@ -27,14 +27,14 @@ tauri-plugin-shell = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-cpal = "0.17"
+cpal = "0.18"
 tauri-plugin-global-shortcut = "2"
 vosk = "0.3.1"
 reqwest = { version = "0.13", features = ["stream", "json", "multipart"] }
 futures-util = "0.3"
 bytes = "1"
-zip = "2.2"
-libloading = "0.8"
+zip = "4.6"
+libloading = "0.9"
 base64 = "0.22"
 keyring = "3"
 whisper-rs = "0.16"
