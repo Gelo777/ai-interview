@@ -118,22 +118,72 @@ pub fn find_output_device(device_selector: Option<&str>) -> Option<cpal::Device>
     }
 }
 
-pub fn resolve_input_device(device_selector: Option<&str>) -> Result<cpal::Device, String> {
-    find_input_device(device_selector).ok_or_else(|| {
-        match normalize_device_selector(device_selector) {
-            Some(selector) => format!("Selected microphone device is not available: {}", selector),
-            None => "Microphone input device is not available".to_string(),
+pub fn resolve_input_device_with_fallback(
+    device_selector: Option<&str>,
+) -> Result<(cpal::Device, Option<String>), String> {
+    match normalize_device_selector(device_selector) {
+        Some(selector) => {
+            if let Some(selected) = find_input_device(Some(selector)) {
+                return Ok((selected, None));
+            }
+
+            if let Some(default_device) = find_input_device(None) {
+                return Ok((
+                    default_device,
+                    Some(format!(
+                        "Selected microphone device is not available: {}. Falling back to system default microphone.",
+                        selector
+                    )),
+                ));
+            }
+
+            Err(format!(
+                "Selected microphone device is not available: {}. Microphone input device is not available.",
+                selector
+            ))
         }
-    })
+        None => find_input_device(None)
+            .map(|device| (device, None))
+            .ok_or_else(|| "Microphone input device is not available".to_string()),
+    }
+}
+
+pub fn resolve_output_device_with_fallback(
+    device_selector: Option<&str>,
+) -> Result<(cpal::Device, Option<String>), String> {
+    match normalize_device_selector(device_selector) {
+        Some(selector) => {
+            if let Some(selected) = find_output_device(Some(selector)) {
+                return Ok((selected, None));
+            }
+
+            if let Some(default_device) = find_output_device(None) {
+                return Ok((
+                    default_device,
+                    Some(format!(
+                        "Selected output device is not available: {}. Falling back to system default output.",
+                        selector
+                    )),
+                ));
+            }
+
+            Err(format!(
+                "Selected output device is not available: {}. Default output device is not available for loopback.",
+                selector
+            ))
+        }
+        None => find_output_device(None)
+            .map(|device| (device, None))
+            .ok_or_else(|| "Default output device is not available for loopback".to_string()),
+    }
+}
+
+pub fn resolve_input_device(device_selector: Option<&str>) -> Result<cpal::Device, String> {
+    resolve_input_device_with_fallback(device_selector).map(|(device, _)| device)
 }
 
 pub fn resolve_output_device(device_selector: Option<&str>) -> Result<cpal::Device, String> {
-    find_output_device(device_selector).ok_or_else(|| {
-        match normalize_device_selector(device_selector) {
-            Some(selector) => format!("Selected output device is not available: {}", selector),
-            None => "Default output device is not available for loopback".to_string(),
-        }
-    })
+    resolve_output_device_with_fallback(device_selector).map(|(device, _)| device)
 }
 
 pub fn list_input_devices() -> Vec<AudioDeviceInfo> {

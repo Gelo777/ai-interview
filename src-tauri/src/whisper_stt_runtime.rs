@@ -83,18 +83,22 @@ fn normalize_device_selector(device_selector: Option<&str>) -> Option<&str> {
 fn resolve_input_device_with_fallback(
     device_selector: Option<&str>,
 ) -> Result<(cpal::Device, Option<String>), String> {
-    audio::resolve_input_device(normalize_device_selector(device_selector))
-        .map(|device| (device, None))
+    audio::resolve_input_device_with_fallback(normalize_device_selector(device_selector))
 }
 
 #[cfg(target_os = "windows")]
 fn resolve_output_selector_with_fallback(
     device_selector: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    (
-        normalize_device_selector(device_selector).map(str::to_string),
-        None,
-    )
+    let normalized = normalize_device_selector(device_selector);
+    if normalized.is_none() {
+        return (None, None);
+    }
+
+    match audio::resolve_output_device_with_fallback(normalized) {
+        Ok((device, warning)) => (Some(audio::resolve_device_id(&device)), warning),
+        Err(_) => (normalized.map(str::to_string), None),
+    }
 }
 
 #[derive(Debug, Clone)]

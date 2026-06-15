@@ -16,7 +16,7 @@ import {
   normalizePrimaryLanguage,
 } from "@/lib/languages";
 import { normalizeHotkeyKeys } from "@/lib/hotkeys";
-import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
+import { PROXY_BASE_URL } from "@/lib/proxy";
 import {
   DEFAULT_HISTORY_RETENTION_DAYS,
   normalizeHistoryRetentionDays,
@@ -205,7 +205,7 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       provider: "custom",
       baseUrlPreset: "custom",
-      customBaseUrl: HARDCODED_PROXY_BASE_URL,
+      customBaseUrl: PROXY_BASE_URL,
       primaryLanguage: defaultPrimaryLanguage,
       secondaryLanguage: "none",
       primarySttVariant: "large",
@@ -224,27 +224,28 @@ export const useSettingsStore = create<SettingsState>()(
       historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
       hotkeys: cloneDefaultHotkeys(),
 
-      setProvider: () =>
+      setProvider: (provider) =>
         set({
-          provider: "custom",
-          baseUrlPreset: "custom",
-          customBaseUrl: HARDCODED_PROXY_BASE_URL,
+          provider,
+          baseUrlPreset: provider === "custom" ? "custom" : provider,
+          customBaseUrl: PROXY_BASE_URL,
           selectedModel: null,
         }),
-      setBaseUrlPreset: () =>
+      setBaseUrlPreset: (baseUrlPreset) =>
         set({
-          baseUrlPreset: "custom",
-          provider: "custom",
-          customBaseUrl: HARDCODED_PROXY_BASE_URL,
+          baseUrlPreset,
+          provider: baseUrlPreset,
+          customBaseUrl: PROXY_BASE_URL,
           selectedModel: null,
         }),
-      setCustomBaseUrl: () =>
+      setCustomBaseUrl: (customBaseUrl) =>
         set((state) => ({
-          customBaseUrl: HARDCODED_PROXY_BASE_URL,
+          customBaseUrl: customBaseUrl.trim() || PROXY_BASE_URL,
           selectedModel: state.baseUrlPreset === "custom" ? null : state.selectedModel,
         })),
-      setPrimaryLanguage: () => set({ primaryLanguage: defaultPrimaryLanguage }),
-      setSecondaryLanguage: () => set({ secondaryLanguage: "none" }),
+      setPrimaryLanguage: (primaryLanguage) =>
+        set({ primaryLanguage: normalizePrimaryLanguage(primaryLanguage) }),
+      setSecondaryLanguage: (secondaryLanguage) => set({ secondaryLanguage }),
       setPrimarySttVariant: (primarySttVariant) => set({ primarySttVariant }),
       setSecondarySttVariant: (secondarySttVariant) => set({ secondarySttVariant }),
       setMicrophoneDeviceId: (microphoneDeviceId) => set({ microphoneDeviceId }),
@@ -323,7 +324,7 @@ export const useSettingsStore = create<SettingsState>()(
 
         state.baseUrlPreset = "custom";
         state.provider = "custom";
-        state.customBaseUrl = HARDCODED_PROXY_BASE_URL;
+        state.customBaseUrl = PROXY_BASE_URL;
         state.primaryLanguage = defaultPrimaryLanguage;
         state.secondaryLanguage = "none";
 

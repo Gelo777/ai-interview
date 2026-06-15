@@ -20,7 +20,8 @@ pub fn probe_runtime(app: &tauri::AppHandle) -> VoskRuntimeProbe {
         return VoskRuntimeProbe {
             available: false,
             library_path: None,
-            detail: "Компоненты распознавания поддерживаются только на macOS и Windows.".to_string(),
+            detail: "Компоненты распознавания поддерживаются только на macOS и Windows."
+                .to_string(),
         };
     }
 

@@ -92,12 +92,16 @@ export async function checkLocalReadiness(): Promise<LocalReadiness> {
       listAudioDevices().catch(() => []),
     ]);
 
+    const hasAnyMicrophone = audioDevices.some((device) => device.is_input);
+    const hasAnySystemOutput = audioDevices.some((device) => !device.is_input);
     const microphoneExists =
       !microphoneDeviceId ||
-      audioDevices.some((device) => device.is_input && device.id === microphoneDeviceId);
+      audioDevices.some((device) => device.is_input && device.id === microphoneDeviceId) ||
+      hasAnyMicrophone;
     const systemAudioExists =
       !systemAudioDeviceId ||
-      audioDevices.some((device) => !device.is_input && device.id === systemAudioDeviceId);
+      audioDevices.some((device) => !device.is_input && device.id === systemAudioDeviceId) ||
+      hasAnySystemOutput;
 
     const microphone = microphoneExists
       ? toPermissionStatus(permissions.microphone)

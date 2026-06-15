@@ -98,8 +98,11 @@ function getProxyBaseUrl(
   customBaseUrl: string,
 ): string {
   void baseUrlPreset;
-  void customBaseUrl;
-  return PROXY_BASE_URL;
+  const normalizedCustom = customBaseUrl.trim();
+  if (normalizedCustom) {
+    return normalizedCustom.replace(/\/+$/, "");
+  }
+  return PROXY_BASE_URL.replace(/\/+$/, "");
 }
 
 async function getDeviceHeaders(): Promise<Record<string, string>> {
@@ -343,11 +346,13 @@ export async function requestLiveSttTranscribeLatest(params: {
   licenseKey: string;
   streamId: string;
   language: PrimaryLanguage;
+  baseUrl?: string;
   seconds?: number;
   saveAudioDebug?: boolean;
   debugTag?: string;
   consumeAfterRead?: boolean;
   retainTailSeconds?: number;
+  contextHint?: string;
 }): Promise<LiveSttTranscribeLatestResponse> {
   const trimmedKey = params.licenseKey.trim();
   if (!trimmedKey) {
@@ -358,7 +363,8 @@ export async function requestLiveSttTranscribeLatest(params: {
     throw new Error("Live STT stream не инициализирован.");
   }
 
-  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/stt/live/transcribe-latest"), {
+  const baseUrl = params.baseUrl?.trim() || PROXY_BASE_URL;
+  const response = await fetch(joinBaseUrl(baseUrl, "/api/v2/stt/live/transcribe-latest"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -368,7 +374,7 @@ export async function requestLiveSttTranscribeLatest(params: {
     body: JSON.stringify({
       streamId,
       lang: toProxyLanguage(params.language),
-      seconds: typeof params.seconds === "number" ? Math.max(1, Math.round(params.seconds)) : 30,
+      seconds: typeof params.seconds === "number" ? Math.max(1, Math.round(params.seconds)) : 12,
       saveAudioDebug: Boolean(params.saveAudioDebug),
       debugTag: params.debugTag?.trim() || undefined,
       consumeAfterRead: Boolean(params.consumeAfterRead),
@@ -376,6 +382,7 @@ export async function requestLiveSttTranscribeLatest(params: {
         typeof params.retainTailSeconds === "number"
           ? Math.max(0, Math.round(params.retainTailSeconds))
           : undefined,
+      contextHint: params.contextHint?.trim() || undefined,
     }),
   });
 
@@ -438,7 +445,7 @@ export async function submitAiFeedback(params: {
     throw new Error("Введите лицензионный ключ перед отправкой отзыва.");
   }
 
-  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/support/отзыва"), {
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v2/support/feedback"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

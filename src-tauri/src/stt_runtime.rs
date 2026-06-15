@@ -75,18 +75,22 @@ fn normalize_device_selector(device_selector: Option<&str>) -> Option<&str> {
 fn resolve_input_device_with_fallback(
     device_selector: Option<&str>,
 ) -> Result<(cpal::Device, Option<String>), String> {
-    audio::resolve_input_device(normalize_device_selector(device_selector))
-        .map(|device| (device, None))
+    audio::resolve_input_device_with_fallback(normalize_device_selector(device_selector))
 }
 
 #[cfg(target_os = "windows")]
 fn resolve_output_selector_with_fallback(
     device_selector: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    (
-        normalize_device_selector(device_selector).map(str::to_string),
-        None,
-    )
+    let normalized = normalize_device_selector(device_selector);
+    if normalized.is_none() {
+        return (None, None);
+    }
+
+    match audio::resolve_output_device_with_fallback(normalized) {
+        Ok((device, warning)) => (Some(audio::resolve_device_id(&device)), warning),
+        Err(_) => (normalized.map(str::to_string), None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +222,8 @@ pub fn stop_global_session() -> Result<(), String> {
         if session_stopping_flag().load(Ordering::Relaxed) {
             log::info!("STT stop requested while previous stop is still completing");
             return Err(
-                "Остановка распознавания еще выполняется. Повторите через несколько секунд.".to_string(),
+                "Остановка распознавания еще выполняется. Повторите через несколько секунд."
+                    .to_string(),
             );
         }
 
@@ -258,7 +263,8 @@ pub fn stop_global_session() -> Result<(), String> {
                 STOP_JOIN_GRACE_PERIOD
             );
             return Err(
-                "Остановка распознавания еще выполняется. Повторите через несколько секунд.".to_string(),
+                "Остановка распознавания еще выполняется. Повторите через несколько секунд."
+                    .to_string(),
             );
         }
 
@@ -1799,9 +1805,7 @@ fn downsample_mono_i16_area(samples: &[i16], input_rate: u32, output_rate: u32) 
 }
 
 fn clamp_i16_from_f64(value: f64) -> i16 {
-    value
-        .round()
-        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    value.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 #[cfg(target_os = "macos")]

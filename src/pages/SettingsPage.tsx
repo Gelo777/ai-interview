@@ -25,7 +25,7 @@ import { useSettingsStore } from "@/stores/settings";
 import { useAppStore } from "@/stores/app";
 import { useHistoryStore } from "@/stores/history";
 import { useDiagnosticsStore } from "@/stores/diagnostics";
-import { HARDCODED_PROXY_BASE_URL } from "@/lib/proxy";
+import { PROXY_BASE_URL } from "@/lib/proxy";
 import { useApiKeyValidation } from "@/hooks/useApiKeyValidation";
 import { refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
 import {
@@ -278,7 +278,7 @@ function LlmSettings({
   const { validating, valid, detail } = useApiKeyValidation(
     apiKey,
     "custom",
-    HARDCODED_PROXY_BASE_URL,
+    PROXY_BASE_URL,
     disabled,
   );
 
@@ -350,10 +350,10 @@ function LlmSettings({
           <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
             Полезно заранее указать стек или тему. Например:{" "}
             <span className="text-text-primary">
-              Go backend, goroutines, channels, mutex, PostgreSQL, Docker
+              Backend interview, concurrency, databases, caching, system design
             </span>
             . Тогда сервис будет понимать, что речь идет о разработке, и осторожнее интерпретировать спорные слова вроде{" "}
-            <span className="text-text-primary">Go / goroutine / routine</span>.
+            <span className="text-text-primary">framework / library / API</span>.
           </div>
 
           <div className="mt-4 space-y-2">
@@ -363,7 +363,7 @@ function LlmSettings({
               onChange={(e) => setInterviewContext(e.target.value)}
               disabled={disabled}
               rows={4}
-              placeholder="Например: Собеседование на Go backend. Темы: goroutine, channels, context, REST API, PostgreSQL, Redis."
+              placeholder="Например: backend interview. Темы: concurrency, API, databases, caching, system design."
               className="w-full resize-y bg-bg-input border border-border rounded-lg px-3 py-2.5
               text-sm text-text-primary placeholder:text-text-muted
               focus:border-accent focus:outline-none transition-colors
@@ -649,8 +649,16 @@ function buildAudioDeviceOptions(
 function normalizeDeviceNameForMatch(value: string): string {
   return value
     .toLowerCase()
-    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^\p{L}0-9\s\-]/gu, " ")
     .replace(/[^a-zа-яё0-9\s\-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeDeviceNameForLookup(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}0-9\s\-]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -667,7 +675,7 @@ async function findBrowserMediaDeviceIdByName(
     return null;
   }
 
-  const target = normalizeDeviceNameForMatch(preferredName ?? "");
+  const target = normalizeDeviceNameForLookup(preferredName ?? "");
   if (!target) {
     return null;
   }
@@ -679,18 +687,15 @@ async function findBrowserMediaDeviceIdByName(
   }
 
   const exact = candidates.find(
-    (device) => normalizeDeviceNameForMatch(device.label) === target,
+    (device) => normalizeDeviceNameForLookup(device.label) === target,
   );
   if (exact?.deviceId) {
     return exact.deviceId;
   }
 
   const partial = candidates.find((device) => {
-    const normalizedLabel = normalizeDeviceNameForMatch(device.label);
-    return (
-      normalizedLabel.includes(target) ||
-      target.includes(normalizedLabel)
-    );
+    const normalizedLabel = normalizeDeviceNameForLookup(device.label);
+    return normalizedLabel.includes(target);
   });
 
   return partial?.deviceId ?? null;
@@ -764,26 +769,33 @@ function doesTrackMatchPreferredMicrophone(
   preferredName: string | null,
   preferredBrowserDeviceId: string | null,
 ): boolean {
-  if (!track || !preferredName) {
+  if (!track) {
+    return true;
+  }
+
+  if (!preferredName) {
     return true;
   }
 
   const settings =
     typeof track.getSettings === "function" ? track.getSettings() : null;
-  if (preferredBrowserDeviceId && settings?.deviceId === preferredBrowserDeviceId) {
-    return true;
-  }
-
-  const normalizedTrackLabel = normalizeDeviceNameForMatch(track.label ?? "");
-  const normalizedPreferredName = normalizeDeviceNameForMatch(preferredName);
+  const normalizedTrackLabel = normalizeDeviceNameForLookup(track.label ?? "");
+  const normalizedPreferredName = normalizeDeviceNameForLookup(preferredName);
   if (!normalizedTrackLabel || !normalizedPreferredName) {
     return false;
   }
 
-  return (
+  const labelMatched =
     normalizedTrackLabel.includes(normalizedPreferredName) ||
-    normalizedPreferredName.includes(normalizedTrackLabel)
-  );
+    normalizedPreferredName.includes(normalizedTrackLabel);
+
+  if (preferredBrowserDeviceId && settings?.deviceId === preferredBrowserDeviceId) {
+    // Browser IDs can map to stale virtual devices after graph changes;
+    // require label agreement to avoid silent false-positive selection.
+    return labelMatched;
+  }
+
+  return labelMatched;
 }
 
 async function openPreferredMicrophoneTestStream(
@@ -1083,6 +1095,8 @@ function AudioSettings({
   const [audioDebugMessage, setAudioDebugMessage] = useState<string | null>(null);
   const [audioDebugFetchedAt, setAudioDebugFetchedAt] = useState<number | null>(null);
   const [audioDebugCopied, setAudioDebugCopied] = useState(false);
+  const [autoProbeRunning, setAutoProbeRunning] = useState(false);
+  const [autoProbeMessage, setAutoProbeMessage] = useState<string | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micAudioContextRef = useRef<AudioContext | null>(null);
   const micAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -1261,6 +1275,91 @@ function AudioSettings({
     setAudioDebugMessage("Аудио-отчет скопирован в буфер обмена.");
     window.setTimeout(() => setAudioDebugCopied(false), 1400);
   }, [audioDebugReport]);
+
+  const handleAutoProbeAudio = useCallback(async () => {
+    if (controlsDisabled || autoProbeRunning) {
+      return;
+    }
+
+    setAutoProbeRunning(true);
+    setAutoProbeMessage(
+      "Говорите обычную фразу 2-3 секунды. Если нужно проверить системный звук, включите звук встречи или видео.",
+    );
+
+    try {
+      await new Promise((resolve) => window.setTimeout(resolve, 350));
+      const { isTauri, probeAudioDevices } = await import("@/lib/tauri");
+      if (!isTauri()) {
+        throw new Error("Автонастройка доступна только в desktop-приложении.");
+      }
+
+      const result = await probeAudioDevices({
+        microphoneDeviceId,
+        systemAudioDeviceId,
+        durationSeconds: 2,
+        probeAllInputDevices: true,
+        probeAllOutputDevices: true,
+      });
+
+      const applied: string[] = [];
+      const recommendedMic = result.recommended_microphone;
+      const recommendedSystem = result.recommended_system_audio;
+
+      if (recommendedMic?.has_signal && recommendedMic.device?.id) {
+        setMicrophoneDeviceId(recommendedMic.device.id);
+        applied.push(
+          `микрофон: ${recommendedMic.device.name} (rms ${Math.round(recommendedMic.rms)}, peak ${recommendedMic.peak_abs})`,
+        );
+      }
+
+      if (recommendedSystem?.has_signal && recommendedSystem.device?.id) {
+        setSystemAudioDeviceId(recommendedSystem.device.id);
+        applied.push(
+          `системный звук: ${recommendedSystem.device.name} (rms ${Math.round(recommendedSystem.rms)}, peak ${recommendedSystem.peak_abs})`,
+        );
+      }
+
+      logInfo("audio.autoProbe", "Native audio auto-probe completed", {
+        recommendedMicrophone: recommendedMic,
+        recommendedSystemAudio: recommendedSystem,
+        notes: result.notes,
+      });
+
+      if (applied.length > 0) {
+        setAutoProbeMessage(`Автонастройка применена: ${applied.join("; ")}.`);
+      } else {
+        const bestMic = result.microphone_candidates
+          .filter((candidate) => candidate.available)
+          .sort((left, right) => right.signal_score - left.signal_score)[0];
+        setAutoProbeMessage(
+          bestMic
+            ? `Голос не найден. Самый сильный микрофон: ${bestMic.device_name ?? bestMic.device?.name ?? "неизвестно"} (rms ${Math.round(bestMic.rms)}, peak ${bestMic.peak_abs}). Проверьте mute или повторите, говоря в нужный микрофон.`
+            : "Голос не найден ни на одном микрофоне. Проверьте доступ Windows к микрофону и mute.",
+        );
+      }
+
+      window.setTimeout(() => {
+        void refreshAudioDevices();
+        void refreshAudioDebugSnapshot("manual");
+      }, 250);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Не удалось выполнить автонастройку аудио.";
+      setAutoProbeMessage(message);
+      logWarn("audio.autoProbe", "Native audio auto-probe failed", error);
+    } finally {
+      setAutoProbeRunning(false);
+    }
+  }, [
+    autoProbeRunning,
+    controlsDisabled,
+    microphoneDeviceId,
+    refreshAudioDebugSnapshot,
+    refreshAudioDevices,
+    setMicrophoneDeviceId,
+    setSystemAudioDeviceId,
+    systemAudioDeviceId,
+  ]);
 
   const stopMicTest = useCallback(() => {
     if (micRafRef.current !== null) {
@@ -1666,6 +1765,36 @@ function AudioSettings({
           <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted leading-relaxed">
             Если оставить режим по умолчанию, приложение возьмет текущие устройства Windows.
             Если выбрать конкретные устройства, во время интервью будут использоваться именно они.
+          </div>
+
+          <div className="mt-4 rounded-lg border border-accent/25 bg-accent/8 p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={controlsDisabled || autoProbeRunning}
+                onClick={() => {
+                  void handleAutoProbeAudio();
+                }}
+                icon={
+                  autoProbeRunning ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-3.5 w-3.5" />
+                  )
+                }
+              >
+                {autoProbeRunning ? "Ищем устройства..." : "Автонастройка аудио"}
+              </Button>
+              <span className="text-xs leading-relaxed text-text-muted">
+                Проверяет реальные native-устройства, которые используются во время интервью.
+              </span>
+            </div>
+            {autoProbeMessage && (
+              <div className="mt-2 text-xs leading-relaxed text-text-secondary">
+                {autoProbeMessage}
+              </div>
+            )}
           </div>
 
           <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3">

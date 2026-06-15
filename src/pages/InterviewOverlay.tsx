@@ -22,13 +22,14 @@ import { useAppStore } from "@/stores/app";
 import { useHistoryStore } from "@/stores/history";
 import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import {
-  HARDCODED_PROXY_BASE_URL,
   buildLiveSttWebSocketUrl,
   formatProxyHintResponse,
+  PROXY_BASE_URL,
   requestLiveSttTranscribeLatest,
   requestProxyHint,
   submitAiFeedback,
   type AiFeedbackRating,
+  type LiveSttTranscribeLatestResponse,
 } from "@/lib/proxy";
 import { getLanguageLabel } from "@/lib/languages";
 import { logError, logInfo, logWarn } from "@/lib/diagnostics";
@@ -41,6 +42,7 @@ import {
   normalizeHotkeyKeys,
   normalizeHotkeyToken,
 } from "@/lib/hotkeys";
+import { cropBase64PngByRect, type CropRect } from "@/lib/imageCrop";
 import type {
   ChatMessage,
   LlmResponse,
@@ -49,6 +51,8 @@ import type {
 } from "@/lib/types";
 import type {
   AudioDeviceInfo,
+  AudioSignalProbeTrack,
+  ServerSttChunkTrack,
   SttDiagnosticEvent,
   SttResultEvent,
   VoskModelOption,
@@ -76,17 +80,35 @@ const STT_NO_TRANSCRIPT_HINT_TIMEOUT_MS = 18000;
 const STT_AUTO_RECOVERY_COOLDOWN_MS = 30000;
 const SCREENSHOT_PICKER_TIMEOUT_MS = 12000;
 const SCREENSHOT_STREAM_READY_TIMEOUT_MS = 4000;
+const SETTINGS_HYDRATION_WATCHDOG_MS = 2500;
 const STT_AUTOSTART_ENABLED = true;
 const STT_STRICT_AUDIO_MODE = true;
 const STT_ENGINE_SERVER_ONLY = true;
 const SERVER_STT_OPTIMISTIC_START = true;
-const SERVER_STT_STREAM_CHUNK_SECONDS = 2;
+const SERVER_STT_STREAM_CHUNK_SECONDS = 1;
 const SERVER_STT_LOOP_GAP_MS = 100;
 const SERVER_STT_RETRY_BASE_MS = 1200;
 const SERVER_STT_WS_READY_TIMEOUT_MS = 15000;
-const SERVER_STT_TRANSCRIBE_WINDOW_SECONDS = 18;
-const SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS = 4;
-const SERVER_STT_SAVE_DEBUG_AUDIO = true;
+const SERVER_STT_TRANSCRIBE_WINDOW_SECONDS = 12;
+const SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS = 0;
+const SERVER_STT_CONTEXT_HINT_MAX_CHARS = 420;
+const SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS = 150;
+const SERVER_STT_SAVE_DEBUG_AUDIO = false;
+const SERVER_STT_AUTO_TRANSCRIBE_ENABLED = false;
+const SERVER_STT_AUTO_TRANSCRIBE_INTERVAL_MS = 3200;
+const SERVER_STT_AUTO_TRANSCRIBE_WINDOW_SECONDS = 6;
+const SERVER_STT_LOCAL_SIGNAL_RMS_THRESHOLD = 70;
+const SERVER_STT_LOCAL_SIGNAL_PEAK_THRESHOLD = 700;
+const SERVER_STT_AUDIO_AUTOPROBE_AFTER_SILENT_CHUNKS = 5;
+const SERVER_STT_AUDIO_AUTOPROBE_COOLDOWN_MS = 30000;
+const TRANSCRIPT_MEMORY_MESSAGE_LIMIT = 16;
+const TRANSCRIPT_MEMORY_MAX_AGE_MS = 3 * 60 * 1000;
+const TRANSCRIPT_MEMORY_FALLBACK_WITH_SCREENSHOT_ONLY = true;
+
+type TranscriptAssessment = {
+  usable: boolean;
+  reason?: string;
+};
 
 type InterviewOverlayMode = "embedded" | "detached";
 
@@ -123,13 +145,6 @@ type ResolvedSttStartSelection = {
   systemAudioLabel: string;
   usedWindowsDefaultMic: boolean;
   usedWindowsDefaultSystem: boolean;
-};
-
-type CropRect = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
 };
 
 type SttWarmupUiState = {
@@ -183,6 +198,131 @@ function isKnownSubtitleCreditNoise(text: string): boolean {
     (lower.includes("субтитр") && lower.includes("корректор")) ||
     (lower.includes("subtitles") && lower.includes("editor"))
   );
+}
+
+const TECHNICAL_SINGLE_TERMS = new Set([
+  "acid",
+  "api",
+  "crud",
+  "docker",
+  "git",
+  "grpc",
+  "hibernate",
+  "http",
+  "https",
+  "java",
+  "javascript",
+  "jpa",
+  "json",
+  "jwt",
+  "k8s",
+  "kafka",
+  "kotlin",
+  "kubernetes",
+  "linux",
+  "mongodb",
+  "mvcc",
+  "mysql",
+  "nginx",
+  "node",
+  "oauth",
+  "orm",
+  "postgres",
+  "postgresql",
+  "python",
+  "react",
+  "redis",
+  "rest",
+  "spring",
+  "sql",
+  "tcp",
+  "tls",
+  "typescript",
+  "udp",
+]);
+
+const SPEECH_TEST_TOKENS = new Set([
+  "алло",
+  "проверка",
+  "раз",
+  "тест",
+  "cyclic",
+  "hello",
+  "one",
+  "test",
+  "testing",
+  "three",
+  "two",
+]);
+
+function tokenizeTranscript(text: string): string[] {
+  return text.match(/[A-Za-zА-Яа-яЁё0-9+#.]+/g) ?? [];
+}
+
+function isTechnicalSingleToken(token: string): boolean {
+  const normalized = token.replace(/^[^A-Za-zА-Яа-яЁё0-9+#.]+|[^A-Za-zА-Яа-яЁё0-9+#.]+$/g, "");
+  if (!normalized) {
+    return false;
+  }
+  const lower = normalized.toLowerCase();
+  if (TECHNICAL_SINGLE_TERMS.has(lower)) {
+    return true;
+  }
+  return /^[A-Z0-9+#.]{2,}$/.test(normalized);
+}
+
+function assessLiveTranscriptText(text: string): TranscriptAssessment {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return { usable: false, reason: "пустой текст" };
+  }
+  if (isKnownSubtitleCreditNoise(normalized)) {
+    return { usable: false, reason: "служебная фраза субтитров" };
+  }
+
+  const tokens = tokenizeTranscript(normalized);
+  if (tokens.length === 0) {
+    return { usable: false, reason: "нет слов" };
+  }
+
+  const lowerTokens = tokens.map((token) => token.toLowerCase());
+  const nonTestTokens = lowerTokens.filter((token) => !SPEECH_TEST_TOKENS.has(token));
+  if (nonTestTokens.length === 0 || (normalized.toLowerCase().includes("раз-раз") && tokens.length <= 4)) {
+    return { usable: false, reason: "похоже на проверку микрофона" };
+  }
+
+  if (tokens.length >= 2) {
+    return { usable: true };
+  }
+
+  if (isTechnicalSingleToken(tokens[0])) {
+    return { usable: true };
+  }
+
+  return {
+    usable: false,
+    reason: "один нетехнический фрагмент, похоже на ошибку распознавания",
+  };
+}
+
+function getTranscriptMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.filter(
+    (message) => message.source !== "ai_marker" && message.text.trim().length > 0,
+  );
+}
+
+function getRecentTranscriptMemoryMessages(messages: ChatMessage[]): ChatMessage[] {
+  const transcriptMessages = getTranscriptMessages(messages);
+  if (transcriptMessages.length === 0) {
+    return [];
+  }
+
+  const now = Date.now();
+  const recentMessages = transcriptMessages.filter(
+    (message) => now - message.timestamp <= TRANSCRIPT_MEMORY_MAX_AGE_MS,
+  );
+  const candidates = recentMessages.length > 0 ? recentMessages : transcriptMessages;
+  return candidates.slice(Math.max(0, candidates.length - TRANSCRIPT_MEMORY_MESSAGE_LIMIT));
 }
 
 function buildWarmupUiState(snapshot: SttWarmupSnapshot): SttWarmupUiState | null {
@@ -329,6 +469,10 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function toFriendlySttStartupError(error: unknown): string {
   const detail = toErrorDetail(error);
   const normalized = detail.toLowerCase();
@@ -372,6 +516,43 @@ function toFriendlySttStartupError(error: unknown): string {
   }
 
   return detail;
+}
+
+function toFriendlyLiveTrackDetail(detail: string): string {
+  const normalized = detail.trim().toLowerCase();
+  if (!normalized || normalized === "ok") {
+    return "ok";
+  }
+  if (normalized.includes("near silence")) {
+    return "Сигнал слишком тихий (почти тишина). Скажи громче или подними уровень микрофона.";
+  }
+  if (normalized.includes("too short")) {
+    return "Аудиофрагмент слишком короткий для распознавания.";
+  }
+  if (normalized.includes("empty transcript")) {
+    return "Распознавание прошло, но текст не получен.";
+  }
+  return detail;
+}
+
+function liveTrackHasLocalSignal(track: ServerSttChunkTrack): boolean {
+  return (
+    track.available &&
+    (track.rms >= SERVER_STT_LOCAL_SIGNAL_RMS_THRESHOLD ||
+      track.peak_abs >= SERVER_STT_LOCAL_SIGNAL_PEAK_THRESHOLD)
+  );
+}
+
+function formatLiveTrackDevice(track: ServerSttChunkTrack): string {
+  return track.device_name?.trim() || track.requested_device_id?.trim() || "устройство по умолчанию";
+}
+
+function formatProbeTrack(track: AudioSignalProbeTrack | null): string {
+  if (!track) {
+    return "не найдено";
+  }
+  const name = track.device?.name ?? track.device_name ?? track.device_id ?? "неизвестное устройство";
+  return `${name} (rms ${Math.round(track.rms)}, peak ${track.peak_abs})`;
 }
 
 function toFriendlyScreenshotError(error: unknown): string {
@@ -564,17 +745,40 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   useEffect(() => {
     const store = useSettingsStore as unknown as PersistStoreLike;
+    let finished = false;
+
+    const markHydrated = (source: string) => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      logInfo("settings.hydration", "Settings hydration ready", { source });
+      setSettingsHydrated(true);
+    };
+
     const hasHydrated = store.persist?.hasHydrated?.() ?? true;
     if (hasHydrated) {
-      setSettingsHydrated(true);
+      markHydrated("initial");
       return;
     }
 
     const unsubscribe = store.persist?.onFinishHydration?.(() => {
-      setSettingsHydrated(true);
+      markHydrated("finish");
     });
+    const watchdog = window.setTimeout(() => {
+      const snapshot = useSettingsStore.getState();
+      logWarn("settings.hydration", "Settings hydration event was not received; continuing", {
+        hasApiKey: Boolean(snapshot.apiKey.trim()),
+        provider: snapshot.provider,
+        baseUrlPreset: snapshot.baseUrlPreset,
+        elapsedMs: SETTINGS_HYDRATION_WATCHDOG_MS,
+      });
+      markHydrated("watchdog");
+    }, SETTINGS_HYDRATION_WATCHDOG_MS);
 
     return () => {
+      finished = true;
+      window.clearTimeout(watchdog);
       unsubscribe?.();
     };
   }, []);
@@ -781,6 +985,15 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     async (reason: "restart" | "language_switch" | "cleanup") => {
       if (STT_ENGINE_SERVER_ONLY) {
         sttAcceptingResultsRef.current = false;
+        const { isTauri, stopServerSttLiveCapture } = await import("@/lib/tauri");
+        if (isTauri()) {
+          await stopServerSttLiveCapture().catch((error) => {
+            logWarn("speech.stop", "Server live audio capture cleanup failed", {
+              reason,
+              detail: toErrorDetail(error),
+            });
+          });
+        }
         return;
       }
 
@@ -1361,6 +1574,61 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     [addMessage, updateMessage],
   );
 
+  const appendLiveSttTranscript = useCallback(
+    (latest: LiveSttTranscribeLatestResponse) => {
+      const rawSystemText = latest.systemAudio.text.trim();
+      const rawMicText = latest.microphone.text.trim();
+      const rejectedReasons: string[] = [];
+      let systemText = "";
+      let micText = "";
+
+      if (rawSystemText) {
+        const assessment = assessLiveTranscriptText(rawSystemText);
+        if (assessment.usable) {
+          systemText = rawSystemText;
+        } else {
+          rejectedReasons.push(`системный звук: ${assessment.reason ?? "сомнительный фрагмент"}`);
+          logWarn("speech.live.transcriptFilter", "Rejected unreliable system transcript", {
+            reason: assessment.reason,
+            preview: rawSystemText.slice(0, 160),
+          });
+        }
+      }
+      if (rawMicText) {
+        const assessment = assessLiveTranscriptText(rawMicText);
+        if (assessment.usable) {
+          micText = rawMicText;
+        } else {
+          rejectedReasons.push(`микрофон: ${assessment.reason ?? "сомнительный фрагмент"}`);
+          logWarn("speech.live.transcriptFilter", "Rejected unreliable microphone transcript", {
+            reason: assessment.reason,
+            preview: rawMicText.slice(0, 160),
+          });
+        }
+      }
+
+      if (systemText) {
+        handleSttResult({
+          source: "system",
+          text: systemText,
+          is_final: true,
+          confidence: 1,
+        });
+      }
+      if (micText) {
+        handleSttResult({
+          source: "mic",
+          text: micText,
+          is_final: true,
+          confidence: 1,
+        });
+      }
+
+      return { systemText, micText, rejectedReasons };
+    },
+    [handleSttResult],
+  );
+
   const handleSttDiagnostic = useCallback(
     (payload: SttDiagnosticEvent) => {
       const source = payload.source ?? "general";
@@ -1532,7 +1800,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       let disposed = false;
 
       async function setupServerStt() {
-        const { isTauri, captureServerSttChunk, getDeviceIdentity } = await import("@/lib/tauri");
+        const {
+          isTauri,
+          captureServerSttChunk,
+          getDeviceIdentity,
+          probeAudioDevices,
+          stopServerSttLiveCapture,
+        } = await import("@/lib/tauri");
         if (disposed) {
           return;
         }
@@ -1556,23 +1830,28 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         setSttWarmupUi(null);
         sttAcceptingResultsRef.current = true;
         serverSttLiveRef.current.socket?.close();
+        await stopServerSttLiveCapture().catch((error) => {
+          logWarn("speech.setup", "Server live audio capture reset failed before setup", {
+            detail: toErrorDetail(error),
+          });
+        });
         serverSttLiveRef.current = { socket: null, streamId: null };
         setIsServerLiveReady(false);
         if (SERVER_STT_OPTIMISTIC_START) {
           setIsSttStarting(false);
           setSttStartupStartedAt(null);
           setSttStartupElapsedMs(0);
-          setSttStatusText("Подключаем серверный live-поток аудио...");
+          setSttStatusText("Подключаем серверный аудиобуфер...");
           addMessage({
             id: crypto.randomUUID(),
             timestamp: Date.now(),
             source: "ai_marker",
-            text: "Подключаем live-поток к серверу. Текст будет формироваться по кнопке вопроса.",
+            text: "Подключаем аудиобуфер к серверу. Распознавание выполнится только по кнопке «Отправить».",
             isFinal: true,
           });
         } else {
           setSttStatusText(
-            "Подключаем серверный live-поток микрофона и системного звука...",
+            "Подключаем серверный аудиобуфер микрофона и системного звука...",
           );
           setSttStartupStartedAt(Date.now());
           setSttStartupElapsedMs(0);
@@ -1599,6 +1878,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           if (!liveLicenseKey) {
             throw new Error("Лицензионный ключ отсутствует.");
           }
+          const effectiveProxyBaseUrl =
+            currentSettings.customBaseUrl.trim() || PROXY_BASE_URL;
           const lang = resolveLanguageTag(currentSettings.primaryLanguage || "ru-RU");
           const identity = await getDeviceIdentity().catch(() => null);
           const wsUrl = buildLiveSttWebSocketUrl({
@@ -1606,7 +1887,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             lang,
             deviceFingerprint: identity?.fingerprint,
             deviceName: identity?.name,
-            baseUrl: HARDCODED_PROXY_BASE_URL,
+            baseUrl: effectiveProxyBaseUrl,
           });
 
           const connection = await withTimeout(
@@ -1697,7 +1978,193 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         let firstChunkSettled = false;
         let consecutiveErrors = 0;
         let startupNoticeShown = false;
+        let autoTranscribeInFlight = false;
+        let lastAutoTranscribeAt = Date.now();
+        let lastChunkLevelLogAt = 0;
+        let silentMicChunkCount = 0;
+        let silentSystemChunkCount = 0;
+        let audioAutoProbeInFlight = false;
+        let audioAutoProbeNoticeShown = false;
+        let lastAudioAutoProbeAt = 0;
         let connectedLanguage = resolveLanguageTag(initialSettings.primaryLanguage || "ru-RU");
+
+        const buildLiveContextHint = () => {
+          const liveSettings = useSettingsStore.getState();
+          return liveSettings.interviewContext
+            .trim()
+            .slice(0, SERVER_STT_CONTEXT_HINT_MAX_CHARS);
+        };
+
+        const maybeAutoRecoverAudioDevices = (reason: string) => {
+          if (audioAutoProbeInFlight) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastAudioAutoProbeAt < SERVER_STT_AUDIO_AUTOPROBE_COOLDOWN_MS) {
+            return;
+          }
+
+          audioAutoProbeInFlight = true;
+          lastAudioAutoProbeAt = now;
+          setSttStatusText("Проверяем реальные аудиоустройства. Продолжайте говорить обычным голосом...");
+          if (!audioAutoProbeNoticeShown) {
+            audioAutoProbeNoticeShown = true;
+            addMessage({
+              id: crypto.randomUUID(),
+              timestamp: Date.now(),
+              source: "ai_marker",
+              text:
+                "Сигнал в текущем аудиопотоке почти нулевой. Проверяю все микрофоны native-способом и переключусь на рабочий, если найду голос.",
+              isFinal: true,
+            });
+          }
+
+          const probeSettings = useSettingsStore.getState();
+          void probeAudioDevices({
+            microphoneDeviceId: probeSettings.microphoneDeviceId || undefined,
+            systemAudioDeviceId: probeSettings.systemAudioDeviceId || undefined,
+            durationSeconds: 1,
+            probeAllInputDevices: true,
+            probeAllOutputDevices: true,
+          })
+            .then((probe) => {
+              if (disposed || endingRef.current) {
+                return;
+              }
+
+              const settingsStore = useSettingsStore.getState();
+              const recommendedMic = probe.recommended_microphone;
+              const recommendedSystem = probe.recommended_system_audio;
+              let changed = false;
+              const applied: string[] = [];
+
+              if (
+                recommendedMic?.has_signal &&
+                recommendedMic.device?.id &&
+                recommendedMic.device.id !== settingsStore.microphoneDeviceId
+              ) {
+                settingsStore.setMicrophoneDeviceId(recommendedMic.device.id);
+                changed = true;
+                applied.push(`микрофон: ${formatProbeTrack(recommendedMic)}`);
+              }
+
+              if (
+                recommendedSystem?.has_signal &&
+                recommendedSystem.device?.id &&
+                recommendedSystem.device.id !== settingsStore.systemAudioDeviceId
+              ) {
+                settingsStore.setSystemAudioDeviceId(recommendedSystem.device.id);
+                changed = true;
+                applied.push(`системный звук: ${formatProbeTrack(recommendedSystem)}`);
+              }
+
+              logInfo("speech.live.audioAutoProbe", "Native audio auto-probe finished", {
+                reason,
+                changed,
+                recommendedMicrophone: recommendedMic,
+                recommendedSystemAudio: recommendedSystem,
+                notes: probe.notes,
+              });
+
+              if (changed) {
+                silentMicChunkCount = 0;
+                silentSystemChunkCount = 0;
+                setSttStatusText(`Аудиоустройства переключены: ${applied.join("; ")}.`);
+                addMessage({
+                  id: crypto.randomUUID(),
+                  timestamp: Date.now(),
+                  source: "ai_marker",
+                  text: `Автонастройка аудио применена: ${applied.join("; ")}.`,
+                  isFinal: true,
+                });
+              } else {
+                setSttStatusText(
+                  `Сигнал пока не найден. Текущий микрофон: ${
+                    recommendedMic ? formatProbeTrack(recommendedMic) : "нет уверенного сигнала"
+                  }.`,
+                );
+              }
+            })
+            .catch((error) => {
+              logWarn("speech.live.audioAutoProbe", "Native audio auto-probe failed", {
+                reason,
+                detail: toErrorDetail(error),
+              });
+            })
+            .finally(() => {
+              audioAutoProbeInFlight = false;
+            });
+        };
+
+        const maybeAutoTranscribeLatest = () => {
+          if (!SERVER_STT_AUTO_TRANSCRIBE_ENABLED || autoTranscribeInFlight) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastAutoTranscribeAt < SERVER_STT_AUTO_TRANSCRIBE_INTERVAL_MS) {
+            return;
+          }
+
+          const streamId = serverSttLiveRef.current.streamId;
+          if (!streamId) {
+            return;
+          }
+
+          const liveSettings = useSettingsStore.getState();
+          const liveLicenseKey = liveSettings.apiKey.trim();
+          if (!liveLicenseKey) {
+            return;
+          }
+
+          autoTranscribeInFlight = true;
+          lastAutoTranscribeAt = now;
+          void requestLiveSttTranscribeLatest({
+            licenseKey: liveLicenseKey,
+            streamId,
+            language: liveSettings.primaryLanguage,
+            baseUrl: liveSettings.customBaseUrl.trim() || PROXY_BASE_URL,
+            seconds: SERVER_STT_AUTO_TRANSCRIBE_WINDOW_SECONDS,
+            saveAudioDebug: false,
+            debugTag: "auto",
+            consumeAfterRead: true,
+            retainTailSeconds: SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS,
+            contextHint: buildLiveContextHint() || undefined,
+          })
+            .then((latest) => {
+              if (disposed || !useSessionStore.getState().isActive || endingRef.current) {
+                return;
+              }
+
+              const { systemText, micText } = appendLiveSttTranscript(latest);
+              logInfo("speech.live.autoTranscribe", "Auto-transcribed live STT window", {
+                streamId,
+                seconds: SERVER_STT_AUTO_TRANSCRIBE_WINDOW_SECONDS,
+                transcriptChars: latest.transcript.trim().length,
+                micChars: micText.length,
+                systemChars: systemText.length,
+                micBufferedMs: latest.microphone.bufferedMs,
+                systemBufferedMs: latest.systemAudio.bufferedMs,
+                micDetail: latest.microphone.detail,
+                systemDetail: latest.systemAudio.detail,
+              });
+
+              if (systemText || micText) {
+                setSttStatusText(
+                  "Распознавание активно. Транскрипт сессии обновляется в фоне.",
+                );
+              }
+            })
+            .catch((error) => {
+              const detail = toErrorDetail(error);
+              logWarn("speech.live.autoTranscribe", "Auto-transcribe live STT window failed", {
+                streamId,
+                detail,
+              });
+            })
+            .finally(() => {
+              autoTranscribeInFlight = false;
+            });
+        };
 
         await connectLiveSocket().then((connection) => {
           connectedLanguage = connection.lang;
@@ -1743,10 +2210,99 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               sttSignalSeenRef.current.system = true;
             }
 
+            const micDetailRaw = chunk.microphone.detail?.trim() || "";
+            const systemDetailRaw = chunk.system_audio.detail?.trim() || "";
+            const micDetailNormalized = micDetailRaw.toLowerCase();
+            const systemDetailNormalized = systemDetailRaw.toLowerCase();
+            const micHasLocalSignal = liveTrackHasLocalSignal(chunk.microphone);
+            const systemHasLocalSignal = liveTrackHasLocalSignal(chunk.system_audio);
+
+            silentMicChunkCount = micHasLocalSignal ? 0 : silentMicChunkCount + 1;
+            silentSystemChunkCount = systemHasLocalSignal ? 0 : silentSystemChunkCount + 1;
+
+            if (
+              liveSettings.microphoneDeviceId &&
+              micDetailNormalized.includes("selected microphone device is not available")
+            ) {
+              useSettingsStore.getState().setMicrophoneDeviceId("");
+              setSttStatusText(
+                "Выбранный микрофон недоступен. Переключились на системный по умолчанию, проверьте список устройств.",
+              );
+              await sleep(SERVER_STT_LOOP_GAP_MS);
+              continue;
+            }
+
+            if (
+              liveSettings.systemAudioDeviceId &&
+              systemDetailNormalized.includes("selected output device is not available")
+            ) {
+              useSettingsStore.getState().setSystemAudioDeviceId("");
+              setSttStatusText(
+                "Выбранное устройство системного звука недоступно. Переключились на системное по умолчанию.",
+              );
+              await sleep(SERVER_STT_LOOP_GAP_MS);
+              continue;
+            }
+
             const micPayload = chunk.microphone.wav_base64?.trim() || "";
             const systemPayload = chunk.system_audio.wav_base64?.trim() || "";
+            const levelLogNow = Date.now();
+            if (levelLogNow - lastChunkLevelLogAt >= 5000) {
+              lastChunkLevelLogAt = levelLogNow;
+              logInfo("speech.live.chunkCapture", "Captured live audio chunk levels", {
+                microphone: {
+                  available: chunk.microphone.available,
+                  device: formatLiveTrackDevice(chunk.microphone),
+                  durationMs: chunk.microphone.duration_ms,
+                  sampleRate: chunk.microphone.sample_rate,
+                  peakAbs: chunk.microphone.peak_abs,
+                  rms: Math.round(chunk.microphone.rms * 100) / 100,
+                  hasLocalSignal: micHasLocalSignal,
+                  wavBytesApprox: micPayload ? Math.round((micPayload.length * 3) / 4) : 0,
+                  detail: chunk.microphone.detail,
+                },
+                systemAudio: {
+                  available: chunk.system_audio.available,
+                  device: formatLiveTrackDevice(chunk.system_audio),
+                  durationMs: chunk.system_audio.duration_ms,
+                  sampleRate: chunk.system_audio.sample_rate,
+                  peakAbs: chunk.system_audio.peak_abs,
+                  rms: Math.round(chunk.system_audio.rms * 100) / 100,
+                  hasLocalSignal: systemHasLocalSignal,
+                  wavBytesApprox: systemPayload ? Math.round((systemPayload.length * 3) / 4) : 0,
+                  detail: chunk.system_audio.detail,
+                },
+              });
+            }
+
+            if (
+              silentMicChunkCount >= SERVER_STT_AUDIO_AUTOPROBE_AFTER_SILENT_CHUNKS &&
+              silentSystemChunkCount >= SERVER_STT_AUDIO_AUTOPROBE_AFTER_SILENT_CHUNKS
+            ) {
+              maybeAutoRecoverAudioDevices("mic and system tracks are locally silent");
+            } else if (
+              silentMicChunkCount >= SERVER_STT_AUDIO_AUTOPROBE_AFTER_SILENT_CHUNKS
+            ) {
+              maybeAutoRecoverAudioDevices("microphone track is locally silent");
+            }
+
             if (!micPayload && !systemPayload) {
-              setSttStatusText("Поток аудио активен, но речь пока не обнаружена.");
+              const micDetail = toFriendlyLiveTrackDetail(micDetailRaw);
+              const systemDetail = toFriendlyLiveTrackDetail(systemDetailRaw);
+
+              const detailParts: string[] = [];
+              if (!chunk.microphone.available && micDetail !== "ok") {
+                detailParts.push(`микрофон ${formatLiveTrackDevice(chunk.microphone)}: ${micDetail}`);
+              }
+              if (!chunk.system_audio.available && systemDetail !== "ok") {
+                detailParts.push(`системный звук ${formatLiveTrackDevice(chunk.system_audio)}: ${systemDetail}`);
+              }
+
+              setSttStatusText(
+                detailParts.length > 0
+                  ? `Аудио пока не поступает (${detailParts.join(" | ")}).`
+                  : "Поток аудио активен, но речь пока не обнаружена.",
+              );
               await sleep(SERVER_STT_LOOP_GAP_MS);
               continue;
             }
@@ -1759,10 +2315,23 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 lang: connectedLanguage,
               }),
             );
+            maybeAutoTranscribeLatest();
 
-            setSttStatusText(
-              `Серверный live-поток активен. Нажмите «Отправить», чтобы распознать последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд.`,
-            );
+            if (audioAutoProbeInFlight) {
+              setSttStatusText("Проверяем реальные аудиоустройства. Продолжайте говорить...");
+            } else if (!micHasLocalSignal && !systemHasLocalSignal) {
+              setSttStatusText(
+                `Аудиобуфер пишет почти тишину. Микрофон: ${formatLiveTrackDevice(chunk.microphone)}, системный звук: ${formatLiveTrackDevice(chunk.system_audio)}.`,
+              );
+            } else if (!micHasLocalSignal) {
+              setSttStatusText(
+                `Системный звук есть, микрофон почти тихий: ${formatLiveTrackDevice(chunk.microphone)}.`,
+              );
+            } else {
+              setSttStatusText(
+                `Аудиобуфер активен. Нажмите «Отправить», чтобы распознать последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд.`,
+              );
+            }
             if (!startupNoticeShown) {
               startupNoticeShown = true;
               addMessage({
@@ -1770,7 +2339,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 timestamp: Date.now(),
                 source: "ai_marker",
                 text:
-                  "Поток аудио отправляется на сервер. По кнопке «Отправить» берём последние 30 секунд и формируем ответ.",
+                  `Аудио пишется в серверный буфер. STT-запрос выполняется только по кнопке «Отправить» и берёт последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд.`,
                 isFinal: true,
               });
             }
@@ -1821,6 +2390,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         }
 
         closeLiveSocket();
+        await stopServerSttLiveCapture().catch((error) => {
+          logWarn("speech.setup", "Server live audio capture cleanup failed after loop", {
+            detail: toErrorDetail(error),
+          });
+        });
       }
 
       void setupServerStt();
@@ -1829,6 +2403,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         disposed = true;
         sttAcceptingResultsRef.current = false;
         serverSttLiveRef.current.socket?.close();
+        void import("@/lib/tauri").then(({ stopServerSttLiveCapture }) =>
+          stopServerSttLiveCapture().catch((error) => {
+            logWarn("speech.setup", "Server live audio capture cleanup failed on dispose", {
+              detail: toErrorDetail(error),
+            });
+          }),
+        );
         serverSttLiveRef.current = { socket: null, streamId: null };
         setIsServerLiveReady(false);
         setIsSttStarting(false);
@@ -2049,6 +2630,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   }, [
     addMessage,
     activateSafeMode,
+    appendLiveSttTranscript,
     ensureActiveSttLanguage,
     handleSttDiagnostic,
     handleSttResult,
@@ -2171,23 +2753,32 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       setLastLlmError(null);
 
       let contextMessages = contextBuffer;
+      let rejectedLiveTranscriptReasons: string[] = [];
       const manualQuestionText = manualQuestion.trim();
       if (STT_ENGINE_SERVER_ONLY && !withScreenshot && manualQuestionText.length === 0) {
         const streamId = serverSttLiveRef.current.streamId;
         if (streamId) {
           try {
             setSttStatusText(
-              `Готовим последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд речи для запроса...`,
+              "Дочитываем свежий аудио-фрагмент перед запросом...",
             );
+            if (SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS > 0) {
+              await sleep(SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS);
+            }
+            const contextHint = settings.interviewContext.trim();
             const latest = await requestLiveSttTranscribeLatest({
               licenseKey: settings.apiKey,
               streamId,
               language: settings.primaryLanguage,
+              baseUrl: settings.customBaseUrl.trim() || PROXY_BASE_URL,
               seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
               saveAudioDebug: SERVER_STT_SAVE_DEBUG_AUDIO,
               debugTag: "send",
               consumeAfterRead: true,
               retainTailSeconds: SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS,
+              contextHint: contextHint
+                ? contextHint.slice(0, SERVER_STT_CONTEXT_HINT_MAX_CHARS)
+                : undefined,
             });
             if (latest.debugMicPath || latest.debugSystemPath) {
               logInfo("llm.request", "Saved live STT debug audio", {
@@ -2203,33 +2794,51 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 isFinal: true,
               });
             }
-            const systemText = latest.systemAudio.text.trim();
-            const micText = latest.microphone.text.trim();
-
-            if (systemText) {
-              handleSttResult({
-                source: "system",
-                text: systemText,
-                is_final: true,
-                confidence: 1,
-              });
-            }
-            if (micText) {
-              handleSttResult({
-                source: "mic",
-                text: micText,
-                is_final: true,
-                confidence: 1,
-              });
-            }
+            const { systemText, micText, rejectedReasons } = appendLiveSttTranscript(latest);
+            rejectedLiveTranscriptReasons = rejectedReasons;
+            logInfo("speech.live.transcribeLatest", "Received live STT transcript window", {
+              streamId,
+              seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
+              transcriptChars: latest.transcript.trim().length,
+              transcriptPreview: latest.transcript.trim().slice(0, 200),
+              microphone: {
+                available: latest.microphone.available,
+                bufferedMs: latest.microphone.bufferedMs,
+                textChars: micText.length,
+                textPreview: micText.slice(0, 200),
+                detail: latest.microphone.detail,
+              },
+              systemAudio: {
+                available: latest.systemAudio.available,
+                bufferedMs: latest.systemAudio.bufferedMs,
+                textChars: systemText.length,
+                textPreview: systemText.slice(0, 200),
+                detail: latest.systemAudio.detail,
+              },
+            });
 
             if (!systemText && !micText) {
+              const details = [...rejectedReasons];
+              if (details.length === 0) {
+                const micDetail = toFriendlyLiveTrackDetail(latest.microphone.detail || "");
+                const systemDetail = toFriendlyLiveTrackDetail(latest.systemAudio.detail || "");
+                if (micDetail !== "ok") {
+                  details.push(`микрофон: ${micDetail}`);
+                }
+                const shouldReportSystemDetail =
+                  latest.systemAudio.available || latest.systemAudio.bufferedMs >= 800;
+                if (shouldReportSystemDetail && systemDetail !== "ok") {
+                  details.push(`системный звук: ${systemDetail}`);
+                }
+              }
               addMessage({
                 id: crypto.randomUUID(),
                 timestamp: Date.now(),
                 source: "ai_marker",
                 text:
-                  `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.`,
+                  details.length > 0
+                    ? `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек речь не распознана. Детали: ${details.join(" | ")}.`
+                    : `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.`,
                 isFinal: true,
               });
             }
@@ -2248,16 +2857,48 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               id: crypto.randomUUID(),
               timestamp: Date.now(),
               source: "ai_marker",
-              text: `Не удалось распознать последние 30 секунд: ${detail}`,
+              text: `Не удалось распознать последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд: ${detail}`,
               isFinal: true,
+            });
+          } finally {
+            serverSttLiveRef.current.socket?.close();
+            serverSttLiveRef.current = { socket: null, streamId: null };
+            setIsServerLiveReady(false);
+            setServerSttRestartNonce((value) => value + 1);
+            logInfo("speech.live.reset", "Restarting live STT stream after send to clear buffers", {
+              streamId,
             });
           }
         }
       }
 
-      const transcriptCandidateMessages = contextMessages.filter(
-        (message) => message.source !== "ai_marker" && message.text.trim().length > 0,
-      );
+      let transcriptCandidateMessages = getTranscriptMessages(contextMessages);
+      if (!manualQuestionText && transcriptCandidateMessages.length === 0) {
+        const canUseTranscriptMemory =
+          withScreenshot && TRANSCRIPT_MEMORY_FALLBACK_WITH_SCREENSHOT_ONLY;
+        const rememberedMessages = canUseTranscriptMemory
+          ? getRecentTranscriptMemoryMessages(useSessionStore.getState().messages)
+          : [];
+        if (rememberedMessages.length > 0) {
+          transcriptCandidateMessages = rememberedMessages;
+          contextMessages = rememberedMessages;
+          setSttStatusText(
+            "Свежий аудио-фрагмент пустой. Используем последние распознанные реплики сессии.",
+          );
+          logInfo("llm.request", "Using transcript memory after empty live STT window", {
+            transcriptMessages: rememberedMessages.length,
+            oldestAgeMs: Date.now() - rememberedMessages[0].timestamp,
+            newestAgeMs:
+              Date.now() - rememberedMessages[rememberedMessages.length - 1].timestamp,
+          });
+        } else if (rejectedLiveTranscriptReasons.length > 0) {
+          logWarn("llm.request", "Skipped transcript memory fallback after rejected live STT", {
+            rejectedReasons: rejectedLiveTranscriptReasons,
+          });
+        } else if (!canUseTranscriptMemory) {
+          logInfo("llm.request", "Skipped transcript memory fallback for audio-only request");
+        }
+      }
       const intentSourceText =
         manualQuestionText || transcriptCandidateMessages.map((message) => message.text).join("\n");
       const requestIntent = resolveRequestIntentMode(
@@ -2398,12 +3039,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             appendToQuestion(
               "Скриншот приложен. Если вопрос относится к коду или ошибке на экране, учитывай это в ответе.",
             );
-            if (settings.imageHandlingMode === "send_image") {
-              imageBase64Png = screenshotBase64;
-              logInfo("llm.screenshot", "Screenshot attached as image", {
-                base64Length: screenshotBase64.length,
-              });
-            } else {
+            imageBase64Png = screenshotBase64;
+            logInfo("llm.screenshot", "Screenshot attached as image", {
+              base64Length: screenshotBase64.length,
+              handlingMode: settings.imageHandlingMode,
+            });
+
+            if (settings.imageHandlingMode === "ocr_text") {
               const ocrText = await tryExtractOcrText(screenshotBase64);
               if (ocrText) {
                 appendToQuestion(`Текст/код со скриншота:\n${ocrText.slice(0, 2500)}`);
@@ -2441,13 +3083,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         logInfo("assistant.request", "Sending request to service", {
           withScreenshot,
           hasImage: Boolean(imageBase64Png),
-          baseUrl: HARDCODED_PROXY_BASE_URL,
+          baseUrl: settings.customBaseUrl.trim() || PROXY_BASE_URL,
         });
         const response = await withTimeout(
           requestProxyHint({
             licenseKey: settings.apiKey,
             baseUrlPreset: "custom",
-            customBaseUrl: HARDCODED_PROXY_BASE_URL,
+            customBaseUrl: settings.customBaseUrl.trim() || PROXY_BASE_URL,
             question: requestQuestion,
             language: settings.primaryLanguage,
             imageBase64Png,
@@ -2536,10 +3178,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     [
       addMessage,
       appendLlmText,
+      appendLiveSttTranscript,
       contextBuffer,
       finishLlmResponse,
       flushContextBuffer,
-      handleSttResult,
       intentModeOverride,
       isLlmLoading,
       manualQuestion,
@@ -3733,7 +4375,7 @@ function looksLikeTheoryQuestion(text: string): boolean {
 
   return (
     /\?$/.test(normalized) ||
-    /(^|[\s.,:;!?()[\]{}"'«»])(что такое|объясни|расскажи|зачем|как работает|какие|какой|какая|какое|уровни|виды|типы|отличие|разница|принципы|концепц|архитектур|транзакц|изоляц|индекс|postgres|postgresql|постгрес|постгрей|пас грей|пасгрей|база данных|бд)(?=$|[\s.,:;!?()[\]{}"'«»])/.test(
+    /(^|[\s.,:;!?()[\]{}"'«»])(что такое|объясни|расскажи|зачем|как работает|какие|какой|какая|какое|уровни|виды|типы|отличие|разница|принципы|концепц|архитектур)(?=$|[\s.,:;!?()[\]{}"'«»])/.test(
       normalized,
     )
   );
@@ -3790,7 +4432,7 @@ function buildInterviewPrompt({
   const normalizedContext = interviewContext.trim();
   const contextBlock = normalizedContext
     ? `Контекст интервью:\n${normalizedContext}\n\n`
-    : "Контекст интервью:\nТехническое собеседование по разработке программного обеспечения.\n\n";
+    : "";
   const manualIntent = inferManualIntentMode(manualQuestion);
   const manualBlock = manualQuestion.trim()
     ? `Ручная просьба:\n${manualQuestion.trim()}\n\nПредварительный routing по ручной просьбе: ${manualIntent.mode} (${manualIntent.reason}). Если это не AUTO, считай его приоритетнее OCR и изображения.\n\n`
@@ -3815,9 +4457,9 @@ function buildInterviewPrompt({
 - "почему падает этот тест?" + stack trace => DEBUG.
 - "проверь этот код" + код => CODE_REVIEW.
 - только код без задачи => CODE_REVIEW.
-- "что такое индексы в БД?" => THEORY.
-- "уровни изоляции транзакций в PostgreSQL" => THEORY.
-- "уровни изоляции транзакций в пас грейся" => THEORY, распознай как PostgreSQL.`;
+- "что такое этот подход?" => THEORY.
+- "какие бывают режимы работы?" => THEORY.
+- "объясни разницу между двумя подходами" => THEORY.`;
 
   const screenshotBlock = screenshotMode
     ? `Режим скриншота:
@@ -3835,7 +4477,7 @@ function buildInterviewPrompt({
 
   return `${contextBlock}${manualBlock}${forcedIntentBlock}Важно:
 - в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;
-- если слово распознано неточно, интерпретируй его в пользу технического смысла: например "пас грейся", "постгрей" или "постгрес" = PostgreSQL;
+- если слово распознано неточно, интерпретируй его в пользу технического смысла и контекста разговора;
 - не пиши академические определения и длинные теоретические абзацы;
 - ответ должен быть прикладным и пригодным для устного ответа на собеседовании;
 - отвечай кратко, но с конкретикой: код, причина, патч или готовая формулировка.\n\n${intentRules}\n\n${screenshotBlock}Формат ответа строго:
@@ -3916,73 +4558,6 @@ async function captureScreenshotAsBase64Png(): Promise<string> {
   } finally {
     stream.getTracks().forEach((track) => track.stop());
   }
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-async function cropBase64PngByRect(
-  imageBase64: string,
-  rect: CropRect,
-  imageElement: HTMLImageElement,
-): Promise<string> {
-  const displayWidth = imageElement.clientWidth;
-  const displayHeight = imageElement.clientHeight;
-  const naturalWidth = imageElement.naturalWidth;
-  const naturalHeight = imageElement.naturalHeight;
-
-  if (!displayWidth || !displayHeight || !naturalWidth || !naturalHeight) {
-    return imageBase64;
-  }
-
-  const scaleX = naturalWidth / displayWidth;
-  const scaleY = naturalHeight / displayHeight;
-
-  const sourceX = clamp(Math.round(rect.x * scaleX), 0, naturalWidth - 1);
-  const sourceY = clamp(Math.round(rect.y * scaleY), 0, naturalHeight - 1);
-  const sourceWidth = clamp(
-    Math.round(rect.width * scaleX),
-    1,
-    naturalWidth - sourceX,
-  );
-  const sourceHeight = clamp(
-    Math.round(rect.height * scaleY),
-    1,
-    naturalHeight - sourceY,
-  );
-
-  const image = await loadBase64Png(imageBase64);
-  const canvas = document.createElement("canvas");
-  canvas.width = sourceWidth;
-  canvas.height = sourceHeight;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    return imageBase64;
-  }
-  ctx.drawImage(
-    image,
-    sourceX,
-    sourceY,
-    sourceWidth,
-    sourceHeight,
-    0,
-    0,
-    sourceWidth,
-    sourceHeight,
-  );
-  const croppedDataUrl = canvas.toDataURL("image/png");
-  const croppedBase64 = croppedDataUrl.split(",")[1];
-  return croppedBase64 || imageBase64;
-}
-
-async function loadBase64Png(imageBase64: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("Failed to load screenshot image for crop."));
-    image.src = `data:image/png;base64,${imageBase64}`;
-  });
 }
 
 async function tryExtractOcrText(

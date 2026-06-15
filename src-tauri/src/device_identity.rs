@@ -50,7 +50,9 @@ fn platform_machine_seed() -> Option<String> {
     for line in stdout.lines() {
         let parts = line.split_whitespace().collect::<Vec<_>>();
         if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("MachineGuid") {
-            return parts.last().map(|value| format!("windows-machine-guid:{}", value));
+            return parts
+                .last()
+                .map(|value| format!("windows-machine-guid:{}", value));
         }
     }
 

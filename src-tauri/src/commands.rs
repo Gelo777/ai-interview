@@ -17,11 +17,11 @@ use cpal::{SampleFormat, StreamConfig};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::WebviewUrl;
 use tauri::{Emitter, Manager};
@@ -39,12 +39,29 @@ const VOSK_STT_STARTUP_COMMAND_TIMEOUT_SECS: u64 = 360;
 const STT_STOP_COMMAND_TIMEOUT_SECS: u64 = 70;
 const WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD: f32 = 0.010;
 const WHISPER_CHUNK_SILENCE_RMS_THRESHOLD: f32 = 0.0035;
+const WHISPER_CHUNK_TARGET_PEAK: f32 = 0.060;
+const WHISPER_CHUNK_MAX_GAIN: f32 = 6.0;
 const PROXY_LICENSE_TIMEOUT_SECS: u64 = 20;
 const PROXY_STT_CONNECT_TIMEOUT_SECS: u64 = 5;
 const PROXY_STT_TIMEOUT_SECS: u64 = 20;
 const SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS: u64 = 10;
+const SERVER_STT_LIVE_RING_BUFFER_SECONDS: usize = 30;
+const SERVER_STT_MIC_FRAME_MS: usize = 20;
+const SERVER_STT_MIC_PREROLL_MS: usize = 80;
+const SERVER_STT_MIC_HANGOVER_MS: usize = 500;
+const SERVER_STT_MIC_KEEPALIVE_MS: usize = 120;
+const SERVER_STT_MIC_NOISE_EMA_ALPHA: f32 = 0.02;
+const SERVER_STT_MIC_ADAPTIVE_MULTIPLIER: f32 = 3.0;
+const SERVER_STT_MIC_ADAPTIVE_MIN_FLOOR: f32 = 20.0;
+const SERVER_STT_MIC_TARGET_RMS: f64 = 4200.0;
+const SERVER_STT_MIC_MIN_RMS_FOR_GAIN: f64 = 45.0;
+const SERVER_STT_MIC_MAX_GAIN: f64 = 10.0;
+const AUDIO_PROBE_MIN_RMS: f64 = 70.0;
+const AUDIO_PROBE_MIN_PEAK_ABS: i16 = 700;
 const SETTINGS_STATE_KEY: &str = "ai-interview-settings";
 static SERVER_STT_PREFERRED_ENDPOINT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SERVER_STT_LIVE_CAPTURE_RUNTIME: OnceLock<Mutex<Option<ServerSttLiveCaptureRuntime>>> =
+    OnceLock::new();
 
 fn app_window_url(_app: &tauri::AppHandle) -> WebviewUrl {
     #[cfg(debug_assertions)]
@@ -394,8 +411,11 @@ fn normalize_optional_device_id(value: Option<String>) -> Option<String> {
 #[tauri::command]
 pub fn check_permissions(request: Option<AudioDeviceSelectionRequest>) -> PermissionCheck {
     let request = request.unwrap_or_default();
-    let has_mic = audio::has_input_device(request.microphone_device_id.as_deref());
-    let has_output = audio::has_output_device(request.system_audio_device_id.as_deref());
+    let has_mic =
+        audio::resolve_input_device_with_fallback(request.microphone_device_id.as_deref()).is_ok();
+    let has_output =
+        audio::resolve_output_device_with_fallback(request.system_audio_device_id.as_deref())
+            .is_ok();
 
     PermissionCheck {
         microphone: if has_mic {
@@ -562,7 +582,11 @@ pub struct CapturedAudioTrack {
     pub sample_rate: Option<u32>,
     pub sample_count: usize,
     pub duration_ms: u64,
+    pub peak_abs: i16,
+    pub rms: f64,
     pub file_path: Option<String>,
+    #[serde(skip)]
+    pub wav_bytes: Option<Vec<u8>>,
     pub available: bool,
     pub detail: String,
 }
@@ -585,15 +609,49 @@ struct CaptureStreamHandle {
     device_name: String,
 }
 
+struct ServerSttLiveCaptureShared {
+    samples: VecDeque<i16>,
+    total_samples: u64,
+    stream_error: Option<String>,
+}
+
+struct ServerSttLiveCaptureTrack {
+    source: &'static str,
+    requested_device_id: Option<String>,
+    device_name: String,
+    sample_rate: u32,
+    stream: cpal::Stream,
+    shared: Arc<Mutex<ServerSttLiveCaptureShared>>,
+    max_samples: usize,
+    last_read_sample: u64,
+}
+
+struct ServerSttLiveCaptureRuntime {
+    microphone_device_id: Option<String>,
+    system_audio_device_id: Option<String>,
+    microphone: Option<ServerSttLiveCaptureTrack>,
+    microphone_detail: String,
+    system_audio: Option<ServerSttLiveCaptureTrack>,
+    system_audio_detail: String,
+}
+
 fn downmix_f32_to_i16_mono(data: &[f32], channels: usize) -> Vec<i16> {
     if channels == 0 {
         return Vec::new();
     }
     data.chunks(channels)
         .map(|frame| {
-            let sum = frame.iter().copied().sum::<f32>();
-            let mono = (sum / channels as f32).clamp(-1.0, 1.0);
-            (mono * i16::MAX as f32) as i16
+            let dominant = frame
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    left.abs()
+                        .partial_cmp(&right.abs())
+                        .unwrap_or(Ordering::Equal)
+                })
+                .unwrap_or(0.0)
+                .clamp(-1.0, 1.0);
+            (dominant * i16::MAX as f32) as i16
         })
         .collect()
 }
@@ -604,8 +662,11 @@ fn downmix_i16_to_i16_mono(data: &[i16], channels: usize) -> Vec<i16> {
     }
     data.chunks(channels)
         .map(|frame| {
-            let sum = frame.iter().map(|sample| *sample as i32).sum::<i32>();
-            (sum / channels as i32) as i16
+            frame
+                .iter()
+                .copied()
+                .max_by_key(|sample| sample.unsigned_abs())
+                .unwrap_or(0)
         })
         .collect()
 }
@@ -616,11 +677,11 @@ fn downmix_u16_to_i16_mono(data: &[u16], channels: usize) -> Vec<i16> {
     }
     data.chunks(channels)
         .map(|frame| {
-            let sum = frame
+            frame
                 .iter()
                 .map(|sample| (*sample as i32) - 32768)
-                .sum::<i32>();
-            (sum / channels as i32) as i16
+                .max_by_key(|sample| sample.unsigned_abs())
+                .unwrap_or(0) as i16
         })
         .collect()
 }
@@ -722,9 +783,450 @@ fn build_capture_stream_handle(
     })
 }
 
-fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) -> Result<(), String> {
-    let mut file = std::fs::File::create(path)
-        .map_err(|err| format!("Failed to create WAV file '{}': {}", path.display(), err))?;
+fn server_stt_live_capture_runtime_cell() -> &'static Mutex<Option<ServerSttLiveCaptureRuntime>> {
+    SERVER_STT_LIVE_CAPTURE_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn push_server_stt_live_samples(
+    shared: &Arc<Mutex<ServerSttLiveCaptureShared>>,
+    max_samples: usize,
+    mono_samples: &[i16],
+) {
+    if mono_samples.is_empty() {
+        return;
+    }
+
+    if let Ok(mut guard) = shared.lock() {
+        if mono_samples.len() >= max_samples {
+            guard.samples.clear();
+            guard.samples.extend(
+                mono_samples[mono_samples.len() - max_samples..]
+                    .iter()
+                    .copied(),
+            );
+        } else {
+            let overflow = guard
+                .samples
+                .len()
+                .saturating_add(mono_samples.len())
+                .saturating_sub(max_samples);
+            for _ in 0..overflow {
+                guard.samples.pop_front();
+            }
+            guard.samples.extend(mono_samples.iter().copied());
+        }
+        guard.total_samples = guard
+            .total_samples
+            .saturating_add(mono_samples.len() as u64);
+    }
+}
+
+fn build_server_stt_live_capture_track(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    source: &'static str,
+    requested_device_id: Option<String>,
+    device_name: String,
+    detail_prefix: String,
+) -> Result<ServerSttLiveCaptureTrack, String> {
+    let channels = config.channels as usize;
+    let sample_rate = config.sample_rate;
+    let max_samples = (sample_rate as usize)
+        .saturating_mul(SERVER_STT_LIVE_RING_BUFFER_SECONDS)
+        .max(sample_rate as usize);
+    let shared = Arc::new(Mutex::new(ServerSttLiveCaptureShared {
+        samples: VecDeque::with_capacity(max_samples.min(sample_rate as usize * 4)),
+        total_samples: 0,
+        stream_error: None,
+    }));
+
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let callback_shared = Arc::clone(&shared);
+            let error_shared = Arc::clone(&shared);
+            let label_owned = detail_prefix.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _| {
+                        let mono = downmix_f32_to_i16_mono(data, channels);
+                        push_server_stt_live_samples(&callback_shared, max_samples, &mono);
+                    },
+                    move |err| {
+                        if let Ok(mut guard) = error_shared.lock() {
+                            guard.stream_error =
+                                Some(format!("{} stream error: {}", label_owned, err));
+                        }
+                    },
+                    None,
+                )
+                .map_err(|err| format!("Failed to build {} stream: {}", detail_prefix, err))?
+        }
+        SampleFormat::I16 => {
+            let callback_shared = Arc::clone(&shared);
+            let error_shared = Arc::clone(&shared);
+            let label_owned = detail_prefix.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _| {
+                        let mono = downmix_i16_to_i16_mono(data, channels);
+                        push_server_stt_live_samples(&callback_shared, max_samples, &mono);
+                    },
+                    move |err| {
+                        if let Ok(mut guard) = error_shared.lock() {
+                            guard.stream_error =
+                                Some(format!("{} stream error: {}", label_owned, err));
+                        }
+                    },
+                    None,
+                )
+                .map_err(|err| format!("Failed to build {} stream: {}", detail_prefix, err))?
+        }
+        SampleFormat::U16 => {
+            let callback_shared = Arc::clone(&shared);
+            let error_shared = Arc::clone(&shared);
+            let label_owned = detail_prefix.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[u16], _| {
+                        let mono = downmix_u16_to_i16_mono(data, channels);
+                        push_server_stt_live_samples(&callback_shared, max_samples, &mono);
+                    },
+                    move |err| {
+                        if let Ok(mut guard) = error_shared.lock() {
+                            guard.stream_error =
+                                Some(format!("{} stream error: {}", label_owned, err));
+                        }
+                    },
+                    None,
+                )
+                .map_err(|err| format!("Failed to build {} stream: {}", detail_prefix, err))?
+        }
+        other => {
+            return Err(format!(
+                "Unsupported sample format for {} stream: {:?}",
+                detail_prefix, other
+            ));
+        }
+    };
+
+    Ok(ServerSttLiveCaptureTrack {
+        source,
+        requested_device_id,
+        device_name,
+        sample_rate,
+        stream,
+        shared,
+        max_samples,
+        last_read_sample: 0,
+    })
+}
+
+fn start_server_stt_live_capture_runtime(
+    microphone_device_id: Option<String>,
+    system_audio_device_id: Option<String>,
+) -> Result<ServerSttLiveCaptureRuntime, String> {
+    let mut microphone: Option<ServerSttLiveCaptureTrack> = None;
+    let microphone_detail: String;
+    let mut system_audio: Option<ServerSttLiveCaptureTrack> = None;
+    let system_audio_detail: String;
+
+    match audio::resolve_input_device_with_fallback(microphone_device_id.as_deref()) {
+        Ok((device, warning)) => {
+            let device_name = audio::resolve_device_name(&device);
+            match device.default_input_config() {
+                Ok(supported) => {
+                    let detail_prefix = format!("microphone '{}'", device_name);
+                    match build_server_stt_live_capture_track(
+                        &device,
+                        &supported.config(),
+                        supported.sample_format(),
+                        "mic",
+                        microphone_device_id.clone(),
+                        device_name.clone(),
+                        detail_prefix,
+                    ) {
+                        Ok(track) => {
+                            track.stream.play().map_err(|err| {
+                                format!("Failed to start live microphone stream: {}", err)
+                            })?;
+                            microphone_detail = match warning {
+                                Some(warn) => {
+                                    format!("{} Live microphone buffer '{}'.", warn, device_name)
+                                }
+                                None => format!("Live microphone buffer '{}'.", device_name),
+                            };
+                            microphone = Some(track);
+                        }
+                        Err(err) => {
+                            microphone_detail = err;
+                        }
+                    }
+                }
+                Err(err) => {
+                    microphone_detail = format!(
+                        "Failed to read microphone format '{}': {}",
+                        device_name, err
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            microphone_detail = err;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match audio::resolve_output_device_with_fallback(system_audio_device_id.as_deref()) {
+            Ok((device, warning)) => {
+                let device_name = audio::resolve_device_name(&device);
+                match device.default_output_config() {
+                    Ok(supported) => {
+                        let detail_prefix = format!("system audio '{}'", device_name);
+                        match build_server_stt_live_capture_track(
+                            &device,
+                            &supported.config(),
+                            supported.sample_format(),
+                            "system",
+                            system_audio_device_id.clone(),
+                            device_name.clone(),
+                            detail_prefix,
+                        ) {
+                            Ok(track) => {
+                                track.stream.play().map_err(|err| {
+                                    format!("Failed to start live system-audio stream: {}", err)
+                                })?;
+                                system_audio_detail = match warning {
+                                    Some(warn) => {
+                                        format!(
+                                            "{} Live system-audio buffer '{}'.",
+                                            warn, device_name
+                                        )
+                                    }
+                                    None => format!("Live system-audio buffer '{}'.", device_name),
+                                };
+                                system_audio = Some(track);
+                            }
+                            Err(err) => {
+                                system_audio_detail = err;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        system_audio_detail = format!(
+                            "Failed to read output format '{}' for loopback capture: {}",
+                            device_name, err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                system_audio_detail = err;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = system_audio_device_id;
+        system_audio_detail =
+            "Live system-audio capture is currently available only on Windows.".to_string();
+    }
+
+    if microphone.is_none() && system_audio.is_none() {
+        return Err(format!(
+            "No audio source is available for live capture. Mic: {} | System: {}",
+            microphone_detail, system_audio_detail
+        ));
+    }
+
+    Ok(ServerSttLiveCaptureRuntime {
+        microphone_device_id,
+        system_audio_device_id,
+        microphone,
+        microphone_detail,
+        system_audio,
+        system_audio_detail,
+    })
+}
+
+fn read_server_stt_live_capture_track(
+    track: &mut ServerSttLiveCaptureTrack,
+    apply_server_stt_mic_conditioning: bool,
+) -> CapturedAudioTrack {
+    let (mut sample_data, stream_error_text, first_sample_index, total_samples) =
+        match track.shared.lock() {
+            Ok(guard) => {
+                let first_sample_index = guard
+                    .total_samples
+                    .saturating_sub(guard.samples.len() as u64);
+                let start_sample = track.last_read_sample.max(first_sample_index);
+                let offset = start_sample
+                    .saturating_sub(first_sample_index)
+                    .min(guard.samples.len() as u64) as usize;
+                let sample_data = guard
+                    .samples
+                    .iter()
+                    .skip(offset)
+                    .copied()
+                    .collect::<Vec<_>>();
+                (
+                    sample_data,
+                    guard.stream_error.clone(),
+                    first_sample_index,
+                    guard.total_samples,
+                )
+            }
+            Err(_) => {
+                return unavailable_captured_track(
+                    track.source,
+                    track.requested_device_id.clone(),
+                    format!("Failed to read live '{}' ring buffer.", track.source),
+                );
+            }
+        };
+
+    track.last_read_sample = total_samples;
+
+    if apply_server_stt_mic_conditioning && track.source == "mic" {
+        let (conditioned, _voiced_detected) =
+            condition_server_stt_mic_chunk(&sample_data, track.sample_rate);
+        sample_data = conditioned;
+    }
+
+    let duration_ms = if track.sample_rate == 0 {
+        0
+    } else {
+        ((sample_data.len() as f64 / track.sample_rate as f64) * 1000.0) as u64
+    };
+    let peak_abs = audio_peak_abs_i16(&sample_data);
+    let rms = audio_rms_i16(&sample_data);
+    let wav_bytes = if sample_data.is_empty() {
+        None
+    } else {
+        Some(build_pcm16_mono_wav_bytes(track.sample_rate, &sample_data))
+    };
+
+    let detail = if let Some(err) = stream_error_text {
+        format!("Live ring buffer captured with stream warnings: {}", err)
+    } else if sample_data.is_empty() {
+        format!(
+            "No new samples in live ring buffer for '{}'. firstSample={} totalSamples={} maxSamples={}",
+            track.device_name, first_sample_index, total_samples, track.max_samples
+        )
+    } else {
+        format!("Live ring buffer '{}'.", track.device_name)
+    };
+
+    CapturedAudioTrack {
+        source: track.source.to_string(),
+        requested_device_id: track.requested_device_id.clone(),
+        device_name: Some(track.device_name.clone()),
+        sample_rate: Some(track.sample_rate),
+        sample_count: sample_data.len(),
+        duration_ms,
+        peak_abs,
+        rms,
+        file_path: None,
+        wav_bytes,
+        available: !sample_data.is_empty(),
+        detail,
+    }
+}
+
+fn capture_server_stt_chunk_blocking(
+    app: &tauri::AppHandle,
+    microphone_device_id: Option<String>,
+    system_audio_device_id: Option<String>,
+    duration_seconds: u32,
+) -> Result<CaptureAudioSampleResult, String> {
+    let captured_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let output_dir = app
+        .path()
+        .app_data_dir()
+        .map(|dir| {
+            dir.join("diagnostics")
+                .join("audio-capture")
+                .join(format!("live-{}", captured_at_unix_ms))
+        })
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    {
+        let cell = server_stt_live_capture_runtime_cell();
+        let mut guard = cell
+            .lock()
+            .map_err(|_| "Failed to lock live server STT audio runtime.".to_string())?;
+        let rebuild = guard
+            .as_ref()
+            .map(|runtime| {
+                runtime.microphone_device_id != microphone_device_id
+                    || runtime.system_audio_device_id != system_audio_device_id
+            })
+            .unwrap_or(true);
+        if rebuild {
+            *guard = Some(start_server_stt_live_capture_runtime(
+                microphone_device_id.clone(),
+                system_audio_device_id.clone(),
+            )?);
+        }
+    }
+
+    std::thread::sleep(Duration::from_secs(duration_seconds as u64));
+
+    let cell = server_stt_live_capture_runtime_cell();
+    let mut guard = cell
+        .lock()
+        .map_err(|_| "Failed to lock live server STT audio runtime.".to_string())?;
+    let runtime = guard
+        .as_mut()
+        .ok_or_else(|| "Live server STT audio runtime is not started.".to_string())?;
+
+    let microphone = if let Some(track) = runtime.microphone.as_mut() {
+        read_server_stt_live_capture_track(track, true)
+    } else {
+        unavailable_captured_track(
+            "mic",
+            microphone_device_id,
+            runtime.microphone_detail.clone(),
+        )
+    };
+    let system_audio = if let Some(track) = runtime.system_audio.as_mut() {
+        read_server_stt_live_capture_track(track, false)
+    } else {
+        unavailable_captured_track(
+            "system",
+            system_audio_device_id,
+            runtime.system_audio_detail.clone(),
+        )
+    };
+
+    Ok(CaptureAudioSampleResult {
+        output_dir,
+        duration_seconds,
+        microphone,
+        system_audio,
+        captured_at_unix_ms,
+    })
+}
+
+fn stop_server_stt_live_capture_runtime() -> Result<(), String> {
+    let cell = server_stt_live_capture_runtime_cell();
+    let mut guard = cell
+        .lock()
+        .map_err(|_| "Failed to lock live server STT audio runtime.".to_string())?;
+    *guard = None;
+    Ok(())
+}
+
+fn build_pcm16_mono_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
     let channels: u16 = 1;
     let bits_per_sample: u16 = 16;
     let block_align: u16 = channels * (bits_per_sample / 8);
@@ -732,35 +1234,535 @@ fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) -> Resul
     let data_len = (samples.len() as u32).saturating_mul(2);
     let riff_chunk_len = 36u32.saturating_add(data_len);
 
-    file.write_all(b"RIFF").map_err(|err| err.to_string())?;
-    file.write_all(&riff_chunk_len.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(b"WAVE").map_err(|err| err.to_string())?;
-
-    file.write_all(b"fmt ").map_err(|err| err.to_string())?;
-    file.write_all(&16u32.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(&1u16.to_le_bytes())
-        .map_err(|err| err.to_string())?; // PCM
-    file.write_all(&channels.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(&sample_rate.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(&byte_rate.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(&block_align.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-    file.write_all(&bits_per_sample.to_le_bytes())
-        .map_err(|err| err.to_string())?;
-
-    file.write_all(b"data").map_err(|err| err.to_string())?;
-    file.write_all(&data_len.to_le_bytes())
-        .map_err(|err| err.to_string())?;
+    let mut bytes = Vec::with_capacity(44usize.saturating_add(samples.len().saturating_mul(2)));
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_chunk_len.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
     for sample in samples {
-        file.write_all(&sample.to_le_bytes())
-            .map_err(|err| err.to_string())?;
+        bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    file.flush().map_err(|err| err.to_string())
+    bytes
+}
+
+#[cfg(test)]
+mod audio_recording_tests {
+    use super::{
+        audio_has_productive_signal, audio_peak_abs_i16, audio_rms_i16,
+        build_pcm16_mono_wav_bytes, condition_server_stt_mic_chunk,
+    };
+
+    const DRIVE_VIDEO_AUDIO_FIXTURES: &[(&str, &[u8])] = &[
+        (
+            "drive-clip-0000-0012.wav",
+            include_bytes!("../../tests/fixtures/audio/drive-clip-0000-0012.wav"),
+        ),
+        (
+            "drive-clip-0060-0072.wav",
+            include_bytes!("../../tests/fixtures/audio/drive-clip-0060-0072.wav"),
+        ),
+    ];
+
+    #[derive(Debug)]
+    struct FixtureWav {
+        sample_rate: u32,
+        samples: Vec<i16>,
+    }
+
+    fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    fn read_i16_le(bytes: &[u8], offset: usize) -> i16 {
+        i16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn parse_pcm16_mono_wav(bytes: &[u8]) -> FixtureWav {
+        assert!(bytes.len() >= 44, "fixture is too short to be a wav file");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+
+        let mut offset = 12usize;
+        let mut sample_rate = None;
+        let mut data_offset = None;
+        let mut data_len = None;
+
+        while offset + 8 <= bytes.len() {
+            let chunk_id = &bytes[offset..offset + 4];
+            let chunk_len = read_u32_le(bytes, offset + 4) as usize;
+            let payload_offset = offset + 8;
+            let payload_end = payload_offset.saturating_add(chunk_len);
+            assert!(
+                payload_end <= bytes.len(),
+                "wav chunk extends past fixture bytes"
+            );
+
+            match chunk_id {
+                b"fmt " => {
+                    assert!(chunk_len >= 16, "fmt chunk is too short");
+                    assert_eq!(read_u16_le(bytes, payload_offset), 1, "expected PCM wav");
+                    assert_eq!(read_u16_le(bytes, payload_offset + 2), 1, "expected mono wav");
+                    sample_rate = Some(read_u32_le(bytes, payload_offset + 4));
+                    assert_eq!(
+                        read_u16_le(bytes, payload_offset + 14),
+                        16,
+                        "expected 16-bit wav"
+                    );
+                }
+                b"data" => {
+                    data_offset = Some(payload_offset);
+                    data_len = Some(chunk_len);
+                }
+                _ => {}
+            }
+
+            offset = payload_end + (chunk_len % 2);
+        }
+
+        let sample_rate = sample_rate.expect("fixture wav has no fmt chunk");
+        let data_offset = data_offset.expect("fixture wav has no data chunk");
+        let data_len = data_len.expect("fixture wav has no data length");
+        assert_eq!(data_len % 2, 0, "pcm16 payload must be sample-aligned");
+
+        let samples = (data_offset..data_offset + data_len)
+            .step_by(2)
+            .map(|index| read_i16_le(bytes, index))
+            .collect::<Vec<_>>();
+
+        FixtureWav {
+            sample_rate,
+            samples,
+        }
+    }
+
+    #[test]
+    fn in_memory_recording_wav_has_valid_pcm16_mono_header_and_samples() {
+        let wav = build_pcm16_mono_wav_bytes(48_000, &[0, 1024, -1024]);
+
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(read_u32_le(&wav, 4), 42);
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(read_u32_le(&wav, 16), 16);
+        assert_eq!(read_u16_le(&wav, 20), 1);
+        assert_eq!(read_u16_le(&wav, 22), 1);
+        assert_eq!(read_u32_le(&wav, 24), 48_000);
+        assert_eq!(read_u32_le(&wav, 28), 96_000);
+        assert_eq!(read_u16_le(&wav, 32), 2);
+        assert_eq!(read_u16_le(&wav, 34), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(read_u32_le(&wav, 40), 6);
+        assert_eq!(read_u16_le(&wav, 44), 0);
+        assert_eq!(read_u16_le(&wav, 46), 1024);
+        assert_eq!(read_u16_le(&wav, 48), (-1024i16) as u16);
+    }
+
+    #[test]
+    fn in_memory_recording_wav_supports_empty_audio_payload() {
+        let wav = build_pcm16_mono_wav_bytes(16_000, &[]);
+
+        assert_eq!(wav.len(), 44);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(read_u32_le(&wav, 4), 36);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(read_u32_le(&wav, 40), 0);
+    }
+
+    #[test]
+    fn drive_video_audio_fixtures_are_valid_recording_input() {
+        for (fixture_name, bytes) in DRIVE_VIDEO_AUDIO_FIXTURES {
+            let wav = parse_pcm16_mono_wav(bytes);
+            let peak_abs = audio_peak_abs_i16(&wav.samples);
+            let rms = audio_rms_i16(&wav.samples);
+            let rebuilt = build_pcm16_mono_wav_bytes(wav.sample_rate, &wav.samples);
+            let rebuilt_wav = parse_pcm16_mono_wav(&rebuilt);
+
+            assert_eq!(wav.sample_rate, 16_000, "{fixture_name}");
+            assert_eq!(wav.samples.len(), 192_000, "{fixture_name}");
+            assert_eq!(rebuilt_wav.sample_rate, wav.sample_rate, "{fixture_name}");
+            assert_eq!(rebuilt_wav.samples, wav.samples, "{fixture_name}");
+            assert!(
+                audio_has_productive_signal(peak_abs, rms),
+                "{fixture_name}: expected productive signal, peak_abs={peak_abs}, rms={rms:.2}"
+            );
+            assert!(
+                peak_abs >= 8_000,
+                "{fixture_name}: expected real speech-level peaks, peak_abs={peak_abs}"
+            );
+            assert!(
+                rms >= 1_500.0,
+                "{fixture_name}: expected non-silent RMS, rms={rms:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn drive_video_audio_windows_do_not_trip_silence_detection() {
+        let eight_seconds = 8 * 16_000;
+
+        for (fixture_name, bytes) in DRIVE_VIDEO_AUDIO_FIXTURES {
+            let wav = parse_pcm16_mono_wav(bytes);
+            let windows = [
+                ("first-8s", &wav.samples[..eight_seconds]),
+                ("last-8s", &wav.samples[wav.samples.len() - eight_seconds..]),
+            ];
+
+            for (window_name, samples) in windows {
+                let peak_abs = audio_peak_abs_i16(samples);
+                let rms = audio_rms_i16(samples);
+
+                assert!(
+                    audio_has_productive_signal(peak_abs, rms),
+                    "{fixture_name}/{window_name}: should not be treated as silence, peak_abs={peak_abs}, rms={rms:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drive_video_microphone_conditioning_preserves_real_speech() {
+        for (fixture_name, bytes) in DRIVE_VIDEO_AUDIO_FIXTURES {
+            let wav = parse_pcm16_mono_wav(bytes);
+            let (conditioned, voiced_detected) =
+                condition_server_stt_mic_chunk(&wav.samples, wav.sample_rate);
+            let conditioned_peak = audio_peak_abs_i16(&conditioned);
+            let conditioned_rms = audio_rms_i16(&conditioned);
+
+            assert!(voiced_detected, "{fixture_name}: expected voiced speech");
+            assert!(
+                conditioned.len() >= wav.sample_rate as usize,
+                "{fixture_name}: conditioning should keep at least 1s of speech"
+            );
+            assert!(
+                audio_has_productive_signal(conditioned_peak, conditioned_rms),
+                "{fixture_name}: conditioned speech should remain productive, peak_abs={conditioned_peak}, rms={conditioned_rms:.2}"
+            );
+        }
+    }
+}
+
+fn audio_rms_i16(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let squared_sum = samples
+        .iter()
+        .map(|sample| {
+            let value = *sample as f64;
+            value * value
+        })
+        .sum::<f64>();
+    (squared_sum / samples.len() as f64).sqrt()
+}
+
+fn audio_peak_abs_i16(samples: &[i16]) -> i16 {
+    samples
+        .iter()
+        .copied()
+        .map(|sample| sample.saturating_abs())
+        .max()
+        .unwrap_or(0)
+}
+
+fn audio_signal_score(peak_abs: i16, rms: f64) -> f64 {
+    rms + (peak_abs as f64 / 20.0)
+}
+
+fn audio_has_productive_signal(peak_abs: i16, rms: f64) -> bool {
+    rms >= AUDIO_PROBE_MIN_RMS || peak_abs >= AUDIO_PROBE_MIN_PEAK_ABS
+}
+
+fn resolve_probe_device(
+    source: &str,
+    device_selector: Option<&str>,
+    allow_fallback: bool,
+) -> Result<(cpal::Device, Option<String>), String> {
+    match source {
+        "mic" => {
+            if allow_fallback {
+                return audio::resolve_input_device_with_fallback(device_selector);
+            }
+            match normalize_optional_device_id(device_selector.map(String::from)) {
+                Some(selector) => audio::find_input_device(Some(&selector))
+                    .map(|device| (device, None))
+                    .ok_or_else(|| {
+                        format!("Selected microphone device is not available: {}", selector)
+                    }),
+                None => audio::find_input_device(None)
+                    .map(|device| (device, None))
+                    .ok_or_else(|| "Microphone input device is not available".to_string()),
+            }
+        }
+        "system" => {
+            if allow_fallback {
+                return audio::resolve_output_device_with_fallback(device_selector);
+            }
+            match normalize_optional_device_id(device_selector.map(String::from)) {
+                Some(selector) => audio::find_output_device(Some(&selector))
+                    .map(|device| (device, None))
+                    .ok_or_else(|| {
+                        format!("Selected output device is not available: {}", selector)
+                    }),
+                None => audio::find_output_device(None)
+                    .map(|device| (device, None))
+                    .ok_or_else(|| {
+                        "Default output device is not available for loopback".to_string()
+                    }),
+            }
+        }
+        other => Err(format!("Unknown audio probe source: {}", other)),
+    }
+}
+
+fn unavailable_captured_track(
+    source: &str,
+    requested_device_id: Option<String>,
+    detail: String,
+) -> CapturedAudioTrack {
+    CapturedAudioTrack {
+        source: source.to_string(),
+        requested_device_id,
+        device_name: None,
+        sample_rate: None,
+        sample_count: 0,
+        duration_ms: 0,
+        peak_abs: 0,
+        rms: 0.0,
+        file_path: None,
+        wav_bytes: None,
+        available: false,
+        detail,
+    }
+}
+
+fn capture_audio_track_signal_blocking(
+    source: &'static str,
+    device_selector: Option<String>,
+    duration_seconds: u32,
+    allow_fallback: bool,
+    apply_server_stt_mic_conditioning: bool,
+) -> CapturedAudioTrack {
+    let requested_device_id = normalize_optional_device_id(device_selector);
+    let (device, warning) =
+        match resolve_probe_device(source, requested_device_id.as_deref(), allow_fallback) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                return unavailable_captured_track(source, requested_device_id, err);
+            }
+        };
+    let device_name = audio::resolve_device_name(&device);
+    let config_result = if source == "mic" {
+        device
+            .default_input_config()
+            .map(|supported| (supported.config(), supported.sample_format()))
+            .map_err(|err| {
+                format!(
+                    "Failed to read microphone format '{}': {}",
+                    device_name, err
+                )
+            })
+    } else {
+        device
+            .default_output_config()
+            .map(|supported| (supported.config(), supported.sample_format()))
+            .map_err(|err| {
+                format!(
+                    "Failed to read output format '{}' for loopback capture: {}",
+                    device_name, err
+                )
+            })
+    };
+    let (stream_config, sample_format) = match config_result {
+        Ok(config) => config,
+        Err(err) => {
+            return unavailable_captured_track(source, requested_device_id, err);
+        }
+    };
+    let label = if source == "mic" {
+        format!("microphone '{}'", device_name)
+    } else {
+        format!("system audio '{}'", device_name)
+    };
+    let handle =
+        match build_capture_stream_handle(&device, &stream_config, sample_format, source, &label) {
+            Ok(handle) => handle,
+            Err(err) => {
+                return unavailable_captured_track(source, requested_device_id, err);
+            }
+        };
+
+    if let Err(err) = handle.stream.play() {
+        return unavailable_captured_track(
+            source,
+            requested_device_id,
+            format!("Failed to start '{}' capture stream: {}", source, err),
+        );
+    }
+
+    std::thread::sleep(Duration::from_secs(duration_seconds as u64));
+
+    let sample_rate = handle.sample_rate;
+    let CaptureStreamHandle {
+        stream,
+        samples,
+        stream_error,
+        ..
+    } = handle;
+    drop(stream);
+
+    let mut sample_data = samples
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    if apply_server_stt_mic_conditioning && source == "mic" {
+        let (conditioned, _voiced_detected) =
+            condition_server_stt_mic_chunk(&sample_data, sample_rate);
+        sample_data = conditioned;
+    }
+    let stream_error_text = stream_error.lock().ok().and_then(|guard| (*guard).clone());
+    let duration_ms = if sample_rate == 0 {
+        0
+    } else {
+        ((sample_data.len() as f64 / sample_rate as f64) * 1000.0) as u64
+    };
+    let peak_abs = audio_peak_abs_i16(&sample_data);
+    let rms = audio_rms_i16(&sample_data);
+    let detail = match (warning, stream_error_text) {
+        (_, Some(err)) => format!("Captured with stream warnings: {}", err),
+        (Some(warn), None) => format!("{} Captured from '{}'.", warn, device_name),
+        (None, None) => format!("Captured from '{}'.", device_name),
+    };
+
+    CapturedAudioTrack {
+        source: source.to_string(),
+        requested_device_id,
+        device_name: Some(device_name),
+        sample_rate: Some(sample_rate),
+        sample_count: sample_data.len(),
+        duration_ms,
+        peak_abs,
+        rms,
+        file_path: None,
+        wav_bytes: None,
+        available: true,
+        detail,
+    }
+}
+
+fn ceil_ms_to_samples(sample_rate: u32, duration_ms: usize) -> usize {
+    (((sample_rate as usize).saturating_mul(duration_ms)).saturating_add(999) / 1000).max(1)
+}
+
+fn ceil_ms_to_frames(duration_ms: usize, frame_ms: usize) -> usize {
+    if frame_ms == 0 {
+        return 0;
+    }
+    (duration_ms.saturating_add(frame_ms).saturating_sub(1) / frame_ms).max(1)
+}
+
+fn condition_server_stt_mic_chunk(samples: &[i16], sample_rate: u32) -> (Vec<i16>, bool) {
+    if samples.is_empty() || sample_rate == 0 {
+        return (samples.to_vec(), false);
+    }
+
+    let frame_len = ceil_ms_to_samples(sample_rate, SERVER_STT_MIC_FRAME_MS);
+    let preroll_frames = ceil_ms_to_frames(SERVER_STT_MIC_PREROLL_MS, SERVER_STT_MIC_FRAME_MS);
+    let hangover_frames = ceil_ms_to_frames(SERVER_STT_MIC_HANGOVER_MS, SERVER_STT_MIC_FRAME_MS);
+    let keepalive_samples = ceil_ms_to_samples(sample_rate, SERVER_STT_MIC_KEEPALIVE_MS);
+
+    let frame_rms: Vec<f64> = samples.chunks(frame_len).map(audio_rms_i16).collect();
+    if frame_rms.is_empty() {
+        return (vec![0; keepalive_samples], false);
+    }
+
+    let mut voiced_frames = vec![false; frame_rms.len()];
+    let mut noise_floor = SERVER_STT_MIC_ADAPTIVE_MIN_FLOOR as f64;
+    let alpha = SERVER_STT_MIC_NOISE_EMA_ALPHA as f64;
+    let min_floor = SERVER_STT_MIC_ADAPTIVE_MIN_FLOOR as f64;
+    let adaptive_multiplier = SERVER_STT_MIC_ADAPTIVE_MULTIPLIER as f64;
+    let mut hangover_left = 0usize;
+
+    for (index, rms) in frame_rms.iter().copied().enumerate() {
+        let threshold = (noise_floor * adaptive_multiplier).max(min_floor);
+        let raw_voiced = rms >= threshold;
+        let voiced = if raw_voiced {
+            hangover_left = hangover_frames;
+            true
+        } else if hangover_left > 0 {
+            hangover_left = hangover_left.saturating_sub(1);
+            true
+        } else {
+            false
+        };
+        voiced_frames[index] = voiced;
+
+        if !raw_voiced {
+            noise_floor = ((1.0 - alpha) * noise_floor) + (alpha * rms.max(1.0));
+        } else {
+            let capped = rms.min(noise_floor * 2.0 + min_floor);
+            noise_floor = ((1.0 - alpha * 0.25) * noise_floor) + ((alpha * 0.25) * capped);
+        }
+        noise_floor = noise_floor.max(1.0);
+    }
+
+    if preroll_frames > 0 {
+        let mut expanded = voiced_frames.clone();
+        for index in 0..voiced_frames.len() {
+            if !voiced_frames[index] {
+                continue;
+            }
+            let start = index.saturating_sub(preroll_frames);
+            for item in expanded.iter_mut().take(index).skip(start) {
+                *item = true;
+            }
+        }
+        voiced_frames = expanded;
+    }
+
+    let mut voiced_samples: Vec<i16> = Vec::with_capacity(samples.len());
+    for (frame_index, frame_samples) in samples.chunks(frame_len).enumerate() {
+        if voiced_frames.get(frame_index).copied().unwrap_or(false) {
+            voiced_samples.extend_from_slice(frame_samples);
+        }
+    }
+
+    let voiced_detected = !voiced_samples.is_empty();
+    let mut conditioned = if voiced_detected {
+        voiced_samples
+    } else {
+        samples.to_vec()
+    };
+
+    if conditioned.len() < keepalive_samples {
+        conditioned.resize(keepalive_samples, 0);
+    }
+
+    let rms = audio_rms_i16(&conditioned);
+    if rms > 0.0 {
+        let stabilized_rms = rms.max(SERVER_STT_MIC_MIN_RMS_FOR_GAIN);
+        let gain = (SERVER_STT_MIC_TARGET_RMS / stabilized_rms).clamp(1.0, SERVER_STT_MIC_MAX_GAIN);
+        apply_gain_i16_in_place(&mut conditioned, gain as f32);
+    }
+
+    (conditioned, voiced_detected)
 }
 
 fn capture_audio_sample_blocking(
@@ -768,19 +1770,25 @@ fn capture_audio_sample_blocking(
     microphone_device_id: Option<String>,
     system_audio_device_id: Option<String>,
     duration_seconds: u32,
+    save_to_disk: bool,
     open_output_dir: bool,
+    apply_server_stt_mic_conditioning: bool,
 ) -> Result<CaptureAudioSampleResult, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
     let base_output_dir = app_data_dir.join("diagnostics").join("audio-capture");
-    std::fs::create_dir_all(&base_output_dir)
-        .map_err(|err| format!("Не удалось создать папку для аудио-теста: {}", err))?;
+    if save_to_disk {
+        std::fs::create_dir_all(&base_output_dir)
+            .map_err(|err| format!("Не удалось создать папку для аудио-теста: {}", err))?;
+    }
     let captured_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let output_dir = base_output_dir.join(format!("capture-{}", captured_at_unix_ms));
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|err| format!("Failed to create audio capture folder: {}", err))?;
+    if save_to_disk {
+        std::fs::create_dir_all(&output_dir)
+            .map_err(|err| format!("Failed to create audio capture folder: {}", err))?;
+    }
 
     let mut microphone_track = CapturedAudioTrack {
         source: "mic".to_string(),
@@ -789,7 +1797,10 @@ fn capture_audio_sample_blocking(
         sample_rate: None,
         sample_count: 0,
         duration_ms: 0,
+        peak_abs: 0,
+        rms: 0.0,
         file_path: None,
+        wav_bytes: None,
         available: false,
         detail: "Microphone capture was not started.".to_string(),
     };
@@ -800,15 +1811,18 @@ fn capture_audio_sample_blocking(
         sample_rate: None,
         sample_count: 0,
         duration_ms: 0,
+        peak_abs: 0,
+        rms: 0.0,
         file_path: None,
+        wav_bytes: None,
         available: false,
         detail: "System audio capture was not started.".to_string(),
     };
 
     let mut stream_handles: Vec<CaptureStreamHandle> = Vec::new();
 
-    match audio::resolve_input_device(microphone_device_id.as_deref()) {
-        Ok(device) => {
+    match audio::resolve_input_device_with_fallback(microphone_device_id.as_deref()) {
+        Ok((device, warning)) => {
             let device_name = audio::resolve_device_name(&device);
             match device.default_input_config() {
                 Ok(supported) => {
@@ -824,8 +1838,12 @@ fn capture_audio_sample_blocking(
                             microphone_track.available = true;
                             microphone_track.device_name = Some(device_name.clone());
                             microphone_track.sample_rate = Some(handle.sample_rate);
-                            microphone_track.detail =
-                                format!("Capturing microphone '{}'.", device_name);
+                            microphone_track.detail = match warning {
+                                Some(warn) => {
+                                    format!("{} Capturing microphone '{}'.", warn, device_name)
+                                }
+                                None => format!("Capturing microphone '{}'.", device_name),
+                            };
                             stream_handles.push(handle);
                         }
                         Err(err) => {
@@ -848,8 +1866,8 @@ fn capture_audio_sample_blocking(
 
     #[cfg(target_os = "windows")]
     {
-        match audio::resolve_output_device(system_audio_device_id.as_deref()) {
-            Ok(device) => {
+        match audio::resolve_output_device_with_fallback(system_audio_device_id.as_deref()) {
+            Ok((device, warning)) => {
                 let device_name = audio::resolve_device_name(&device);
                 match device.default_output_config() {
                     Ok(supported) => {
@@ -865,8 +1883,13 @@ fn capture_audio_sample_blocking(
                                 system_audio_track.available = true;
                                 system_audio_track.device_name = Some(device_name.clone());
                                 system_audio_track.sample_rate = Some(handle.sample_rate);
-                                system_audio_track.detail =
-                                    format!("Capturing system audio '{}'.", device_name);
+                                system_audio_track.detail = match warning {
+                                    Some(warn) => format!(
+                                        "{} Capturing system audio '{}'.",
+                                        warn, device_name
+                                    ),
+                                    None => format!("Capturing system audio '{}'.", device_name),
+                                };
                                 stream_handles.push(handle);
                             }
                             Err(err) => {
@@ -926,19 +1949,38 @@ fn capture_audio_sample_blocking(
 
         drop(stream);
 
-        let sample_data = samples
+        let mut sample_data = samples
             .lock()
             .map_err(|_| format!("Failed to finalize '{}' capture buffer", source))?
             .clone();
+        if apply_server_stt_mic_conditioning && source == "mic" {
+            let (conditioned, _voiced_detected) =
+                condition_server_stt_mic_chunk(&sample_data, sample_rate);
+            sample_data = conditioned;
+        }
         let stream_error_text = stream_error.lock().ok().and_then(|guard| (*guard).clone());
         let duration_ms = if sample_rate == 0 {
             0
         } else {
             ((sample_data.len() as f64 / sample_rate as f64) * 1000.0) as u64
         };
-        let file_name = format!("{}.wav", source);
-        let file_path = output_dir.join(file_name);
-        write_pcm16_mono_wav(&file_path, sample_rate, &sample_data)?;
+        let peak_abs = audio_peak_abs_i16(&sample_data);
+        let rms = audio_rms_i16(&sample_data);
+        let wav_bytes = build_pcm16_mono_wav_bytes(sample_rate, &sample_data);
+        let file_path_string = if save_to_disk {
+            let file_name = format!("{}.wav", source);
+            let file_path = output_dir.join(file_name);
+            std::fs::write(&file_path, &wav_bytes).map_err(|err| {
+                format!(
+                    "Failed to write WAV file '{}': {}",
+                    file_path.display(),
+                    err
+                )
+            })?;
+            Some(file_path.to_string_lossy().to_string())
+        } else {
+            None
+        };
 
         let detail = if let Some(err) = stream_error_text {
             format!("Captured with stream warnings: {}", err)
@@ -946,14 +1988,16 @@ fn capture_audio_sample_blocking(
             format!("Captured from '{}'.", device_name)
         };
 
-        let file_path_string = Some(file_path.to_string_lossy().to_string());
         if source == "mic" {
             microphone_track.available = true;
             microphone_track.device_name = Some(device_name);
             microphone_track.sample_rate = Some(sample_rate);
             microphone_track.sample_count = sample_data.len();
             microphone_track.duration_ms = duration_ms;
+            microphone_track.peak_abs = peak_abs;
+            microphone_track.rms = rms;
             microphone_track.file_path = file_path_string;
+            microphone_track.wav_bytes = Some(wav_bytes);
             microphone_track.detail = detail;
         } else if source == "system" {
             system_audio_track.available = true;
@@ -961,7 +2005,10 @@ fn capture_audio_sample_blocking(
             system_audio_track.sample_rate = Some(sample_rate);
             system_audio_track.sample_count = sample_data.len();
             system_audio_track.duration_ms = duration_ms;
+            system_audio_track.peak_abs = peak_abs;
+            system_audio_track.rms = rms;
             system_audio_track.file_path = file_path_string;
+            system_audio_track.wav_bytes = Some(wav_bytes);
             system_audio_track.detail = detail;
         }
     }
@@ -986,9 +2033,7 @@ pub async fn capture_audio_sample(
     request: Option<CaptureAudioSampleRequest>,
 ) -> Result<CaptureAudioSampleResult, String> {
     if stt_runtime::is_global_session_running() {
-        return Err(
-            "Сначала завершите активное интервью, затем запустите тест аудио.".to_string(),
-        );
+        return Err("Сначала завершите активное интервью, затем запустите тест аудио.".to_string());
     }
 
     let request = request.unwrap_or_default();
@@ -1004,7 +2049,9 @@ pub async fn capture_audio_sample(
             microphone_device_id,
             system_audio_device_id,
             duration_seconds,
+            true,
             open_output_dir,
+            false,
         )
     });
 
@@ -1255,6 +2302,17 @@ fn audio_peak_and_rms_f32(samples: &[i16]) -> (f32, f32) {
     (peak, rms)
 }
 
+fn apply_gain_i16_in_place(samples: &mut [i16], gain: f32) {
+    if gain <= 1.0 {
+        return;
+    }
+    for sample in samples {
+        let scaled = (*sample as f32) * gain;
+        let clamped = scaled.clamp(i16::MIN as f32, i16::MAX as f32);
+        *sample = clamped.round() as i16;
+    }
+}
+
 fn looks_like_subtitle_credit_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("редактор субтитр")
@@ -1268,7 +2326,7 @@ fn transcribe_wav_with_whisper(
     language: &str,
 ) -> Result<TranscribedAudioTrack, String> {
     let (input_sample_rate, mono_samples) = read_wav_pcm16_mono(file_path)?;
-    let mono_samples_16k = resample_mono_i16_linear(&mono_samples, input_sample_rate, 16000);
+    let mut mono_samples_16k = resample_mono_i16_linear(&mono_samples, input_sample_rate, 16000);
     let source = if file_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1280,6 +2338,12 @@ fn transcribe_wav_with_whisper(
     } else {
         "mic".to_string()
     };
+
+    let (raw_peak, _raw_rms) = audio_peak_and_rms_f32(&mono_samples_16k);
+    if raw_peak > 0.0 && raw_peak < WHISPER_CHUNK_TARGET_PEAK {
+        let gain = (WHISPER_CHUNK_TARGET_PEAK / raw_peak).min(WHISPER_CHUNK_MAX_GAIN);
+        apply_gain_i16_in_place(&mut mono_samples_16k, gain);
+    }
 
     let (peak, rms) = audio_peak_and_rms_f32(&mono_samples_16k);
     if peak < WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD && rms < WHISPER_CHUNK_SILENCE_RMS_THRESHOLD {
@@ -1323,7 +2387,7 @@ fn transcribe_wav_with_whisper(
     params.set_no_context(true);
     params.set_suppress_nst(true);
     params.set_logprob_thold(-1.0);
-    params.set_no_speech_thold(0.65);
+    params.set_no_speech_thold(0.50);
     params.set_n_threads(4);
 
     state
@@ -1499,10 +2563,267 @@ pub async fn transcribe_captured_audio(
     match tokio::time::timeout(Duration::from_secs(180), task).await {
         Ok(join_result) => join_result
             .map_err(|join_err| format!("Failed to join WAV transcription task: {}", join_err))?,
-        Err(_) => Err(
-            "WAV transcription timed out. Try a shorter capture."
-                .to_string(),
-        ),
+        Err(_) => Err("WAV transcription timed out. Try a shorter capture.".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AudioAutoProbeRequest {
+    pub duration_seconds: Option<u32>,
+    pub microphone_device_id: Option<String>,
+    pub system_audio_device_id: Option<String>,
+    pub probe_all_input_devices: Option<bool>,
+    pub probe_all_output_devices: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioSignalProbeTrack {
+    pub source: String,
+    pub device: Option<audio::AudioDeviceInfo>,
+    pub requested_device_id: Option<String>,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub duration_ms: u64,
+    pub peak_abs: i16,
+    pub rms: f64,
+    pub signal_score: f64,
+    pub has_signal: bool,
+    pub available: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioAutoProbeResult {
+    pub duration_seconds: u32,
+    pub microphone_candidates: Vec<AudioSignalProbeTrack>,
+    pub system_audio_candidates: Vec<AudioSignalProbeTrack>,
+    pub recommended_microphone: Option<AudioSignalProbeTrack>,
+    pub recommended_system_audio: Option<AudioSignalProbeTrack>,
+    pub notes: Vec<String>,
+    pub probed_at_unix_ms: u64,
+}
+
+fn push_unique_audio_candidate(
+    candidates: &mut Vec<audio::AudioDeviceInfo>,
+    seen: &mut HashSet<String>,
+    device: Option<audio::AudioDeviceInfo>,
+) {
+    let Some(device) = device else {
+        return;
+    };
+    if seen.insert(device.id.clone()) {
+        candidates.push(device);
+    }
+}
+
+fn build_probe_candidates(
+    devices: &[audio::AudioDeviceInfo],
+    selected_device_id: Option<&str>,
+    probe_all: bool,
+) -> Vec<audio::AudioDeviceInfo> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let selected = selected_device_id.and_then(|selector| {
+        devices
+            .iter()
+            .find(|device| device.id == selector || device.name == selector)
+            .cloned()
+    });
+    let default = devices.iter().find(|device| device.is_default).cloned();
+
+    push_unique_audio_candidate(&mut candidates, &mut seen, selected);
+    push_unique_audio_candidate(&mut candidates, &mut seen, default);
+
+    if probe_all {
+        for device in devices {
+            push_unique_audio_candidate(&mut candidates, &mut seen, Some(device.clone()));
+        }
+    }
+
+    candidates
+}
+
+fn to_audio_signal_probe_track(
+    source: &str,
+    device: Option<audio::AudioDeviceInfo>,
+    captured: CapturedAudioTrack,
+) -> AudioSignalProbeTrack {
+    let peak_abs = captured.peak_abs;
+    let rms = captured.rms;
+    AudioSignalProbeTrack {
+        source: source.to_string(),
+        requested_device_id: captured.requested_device_id,
+        device_id: device
+            .as_ref()
+            .map(|candidate| candidate.id.clone())
+            .or_else(|| captured.device_name.clone()),
+        device_name: captured
+            .device_name
+            .clone()
+            .or_else(|| device.as_ref().map(|candidate| candidate.name.clone())),
+        device,
+        sample_rate: captured.sample_rate,
+        duration_ms: captured.duration_ms,
+        peak_abs,
+        rms,
+        signal_score: audio_signal_score(peak_abs, rms),
+        has_signal: captured.available && audio_has_productive_signal(peak_abs, rms),
+        available: captured.available,
+        detail: captured.detail,
+    }
+}
+
+fn choose_best_signal_candidate(
+    candidates: &[AudioSignalProbeTrack],
+) -> Option<AudioSignalProbeTrack> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.available && candidate.has_signal)
+        .max_by(|left, right| {
+            left.signal_score
+                .partial_cmp(&right.signal_score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .cloned()
+}
+
+fn choose_available_candidate(
+    candidates: &[AudioSignalProbeTrack],
+    selected_device_id: Option<&str>,
+) -> Option<AudioSignalProbeTrack> {
+    if let Some(selected) = selected_device_id {
+        if let Some(candidate) = candidates.iter().find(|candidate| {
+            candidate.available
+                && candidate
+                    .device
+                    .as_ref()
+                    .map(|device| device.id == selected || device.name == selected)
+                    .unwrap_or(false)
+        }) {
+            return Some(candidate.clone());
+        }
+    }
+
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.available
+                && candidate
+                    .device
+                    .as_ref()
+                    .map(|device| device.is_default)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.available)
+                .cloned()
+        })
+}
+
+#[tauri::command]
+pub async fn probe_audio_devices(
+    request: Option<AudioAutoProbeRequest>,
+) -> Result<AudioAutoProbeResult, String> {
+    let request = request.unwrap_or_default();
+    let duration_seconds = request.duration_seconds.unwrap_or(1).clamp(1, 3);
+    let selected_microphone_id = normalize_optional_device_id(request.microphone_device_id);
+    let selected_system_audio_id = normalize_optional_device_id(request.system_audio_device_id);
+    let probe_all_input_devices = request.probe_all_input_devices.unwrap_or(false);
+    let probe_all_output_devices = request.probe_all_output_devices.unwrap_or(false);
+
+    let probe_task = tauri::async_runtime::spawn_blocking(move || {
+        let input_devices = audio::list_input_devices();
+        let output_devices = audio::list_output_devices();
+        let microphone_candidates = build_probe_candidates(
+            &input_devices,
+            selected_microphone_id.as_deref(),
+            probe_all_input_devices,
+        );
+        let system_audio_candidates = build_probe_candidates(
+            &output_devices,
+            selected_system_audio_id.as_deref(),
+            probe_all_output_devices,
+        );
+
+        let mut microphone_results = Vec::new();
+        for device in microphone_candidates {
+            let captured = capture_audio_track_signal_blocking(
+                "mic",
+                Some(device.id.clone()),
+                duration_seconds,
+                false,
+                false,
+            );
+            microphone_results.push(to_audio_signal_probe_track("mic", Some(device), captured));
+        }
+
+        let mut system_audio_results = Vec::new();
+        for device in system_audio_candidates {
+            let captured = capture_audio_track_signal_blocking(
+                "system",
+                Some(device.id.clone()),
+                duration_seconds,
+                false,
+                false,
+            );
+            system_audio_results.push(to_audio_signal_probe_track(
+                "system",
+                Some(device),
+                captured,
+            ));
+        }
+
+        let recommended_microphone = choose_best_signal_candidate(&microphone_results);
+        let recommended_system_audio =
+            choose_best_signal_candidate(&system_audio_results).or_else(|| {
+                choose_available_candidate(
+                    &system_audio_results,
+                    selected_system_audio_id.as_deref(),
+                )
+            });
+        let mut notes = Vec::new();
+
+        if input_devices.is_empty() {
+            notes.push("No microphone-capable input devices were detected.".to_string());
+        } else if recommended_microphone.is_none() {
+            notes
+                .push("No microphone produced a clear signal during the probe window.".to_string());
+        }
+
+        if output_devices.is_empty() {
+            notes.push("No output devices were detected for system audio capture.".to_string());
+        } else if !system_audio_results
+            .iter()
+            .any(|candidate| candidate.has_signal)
+        {
+            notes.push(
+                "No output device produced measurable loopback audio during the probe window."
+                    .to_string(),
+            );
+        }
+
+        Ok(AudioAutoProbeResult {
+            duration_seconds,
+            microphone_candidates: microphone_results,
+            system_audio_candidates: system_audio_results,
+            recommended_microphone,
+            recommended_system_audio,
+            notes,
+            probed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0),
+        })
+    });
+
+    match tokio::time::timeout(Duration::from_secs(40), probe_task).await {
+        Ok(join_result) => join_result
+            .map_err(|join_err| format!("Failed to join audio probe task: {}", join_err))?,
+        Err(_) => Err("Audio device probe timed out.".to_string()),
     }
 }
 
@@ -1516,8 +2837,12 @@ pub struct ServerSttChunkCaptureRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerSttChunkTrack {
     pub source: String,
+    pub requested_device_id: Option<String>,
+    pub device_name: Option<String>,
     pub sample_rate: Option<u32>,
     pub duration_ms: u64,
+    pub peak_abs: i16,
+    pub rms: f64,
     pub wav_base64: Option<String>,
     pub available: bool,
     pub detail: String,
@@ -1533,16 +2858,24 @@ pub struct ServerSttChunkCaptureResult {
 
 fn to_server_stt_chunk_track(
     source: &str,
+    requested_device_id: Option<String>,
+    device_name: Option<String>,
     sample_rate: Option<u32>,
     duration_ms: u64,
+    peak_abs: i16,
+    rms: f64,
     wav_base64: Option<String>,
     available: bool,
     detail: String,
 ) -> ServerSttChunkTrack {
     ServerSttChunkTrack {
         source: source.to_string(),
+        requested_device_id,
+        device_name,
         sample_rate,
         duration_ms,
+        peak_abs,
+        rms,
         wav_base64,
         available,
         detail,
@@ -1556,8 +2889,7 @@ pub async fn capture_server_stt_chunk(
 ) -> Result<ServerSttChunkCaptureResult, String> {
     if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
         return Err(
-            "Stop active local speech session before server audio streaming capture."
-                .to_string(),
+            "Stop active local speech session before server audio streaming capture.".to_string(),
         );
     }
 
@@ -1568,12 +2900,11 @@ pub async fn capture_server_stt_chunk(
     let app_handle = app.clone();
 
     let capture_task = tauri::async_runtime::spawn_blocking(move || {
-        capture_audio_sample_blocking(
+        capture_server_stt_chunk_blocking(
             &app_handle,
             microphone_device_id,
             system_audio_device_id,
             duration_seconds,
-            false,
         )
     });
 
@@ -1590,10 +2921,6 @@ pub async fn capture_server_stt_chunk(
         }
     };
 
-    let capture_dir = capture_result.output_dir.clone();
-    let mic_path = capture_result.microphone.file_path.clone();
-    let system_path = capture_result.system_audio.file_path.clone();
-
     let mic_has_audio = capture_result.microphone.available
         && capture_result.microphone.sample_count > 0
         && capture_result.microphone.duration_ms > 0;
@@ -1605,36 +2932,34 @@ pub async fn capture_server_stt_chunk(
     let mut system_base64: Option<String> = None;
 
     if mic_has_audio {
-        if let Some(path) = mic_path.as_deref() {
-            let bytes = std::fs::read(path)
-                .map_err(|err| format!("Failed to read captured mic chunk '{}': {}", path, err))?;
+        if let Some(bytes) = capture_result.microphone.wav_bytes.as_deref() {
             mic_base64 = Some(BASE64_STANDARD.encode(bytes));
+        } else {
+            return Err("Captured microphone track has no in-memory WAV payload.".to_string());
         }
     }
 
     if system_has_audio {
-        if let Some(path) = system_path.as_deref() {
-            let bytes = std::fs::read(path).map_err(|err| {
-                format!(
-                    "Failed to read captured system-audio chunk '{}': {}",
-                    path, err
-                )
-            })?;
+        if let Some(bytes) = capture_result.system_audio.wav_bytes.as_deref() {
             system_base64 = Some(BASE64_STANDARD.encode(bytes));
+        } else {
+            return Err("Captured system-audio track has no in-memory WAV payload.".to_string());
         }
     }
-
-    let _ = std::fs::remove_dir_all(&capture_dir);
 
     Ok(ServerSttChunkCaptureResult {
         duration_seconds,
         microphone: to_server_stt_chunk_track(
             "mic",
+            capture_result.microphone.requested_device_id,
+            capture_result.microphone.device_name,
             capture_result.microphone.sample_rate,
             capture_result.microphone.duration_ms,
+            capture_result.microphone.peak_abs,
+            capture_result.microphone.rms,
             mic_base64,
             mic_has_audio,
-            if mic_has_audio {
+            if mic_has_audio && capture_result.microphone.detail.trim().is_empty() {
                 "ok".to_string()
             } else {
                 capture_result.microphone.detail
@@ -1642,11 +2967,15 @@ pub async fn capture_server_stt_chunk(
         ),
         system_audio: to_server_stt_chunk_track(
             "system",
+            capture_result.system_audio.requested_device_id,
+            capture_result.system_audio.device_name,
             capture_result.system_audio.sample_rate,
             capture_result.system_audio.duration_ms,
+            capture_result.system_audio.peak_abs,
+            capture_result.system_audio.rms,
             system_base64,
             system_has_audio,
-            if system_has_audio {
+            if system_has_audio && capture_result.system_audio.detail.trim().is_empty() {
                 "ok".to_string()
             } else {
                 capture_result.system_audio.detail
@@ -1657,6 +2986,11 @@ pub async fn capture_server_stt_chunk(
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0),
     })
+}
+
+#[tauri::command]
+pub fn stop_server_stt_live_capture() -> Result<(), String> {
+    stop_server_stt_live_capture_runtime()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1711,9 +3045,7 @@ fn to_server_stt_track(
 ) -> ServerSttTrack {
     match track {
         Some(value) => ServerSttTrack {
-            source: value
-                .source
-                .unwrap_or_else(|| fallback_source.to_string()),
+            source: value.source.unwrap_or_else(|| fallback_source.to_string()),
             file_path,
             text: value.text.unwrap_or_default().trim().to_string(),
             available: value.available.unwrap_or(false),
@@ -1736,8 +3068,7 @@ pub async fn capture_and_transcribe_server_stt(
 ) -> Result<ServerSttCaptureResult, String> {
     if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
         return Err(
-            "Stop active local speech session before server transcription capture."
-                .to_string(),
+            "Stop active local speech session before server transcription capture.".to_string(),
         );
     }
 
@@ -1747,11 +3078,7 @@ pub async fn capture_and_transcribe_server_stt(
         return Err("License key is required.".to_string());
     }
 
-    let base_url = request
-        .base_url
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
+    let base_url = request.base_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() {
         return Err("Proxy base URL is required.".to_string());
     }
@@ -1773,19 +3100,20 @@ pub async fn capture_and_transcribe_server_stt(
             system_audio_device_id,
             duration_seconds,
             false,
+            false,
+            true,
         )
     });
 
     let capture_result = match tokio::time::timeout(
-        Duration::from_secs(
-            duration_seconds as u64 + SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS,
-        ),
+        Duration::from_secs(duration_seconds as u64 + SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS),
         capture_task,
     )
     .await
     {
-        Ok(join_result) => join_result
-            .map_err(|join_err| format!("Failed to join server STT capture task: {}", join_err))??,
+        Ok(join_result) => join_result.map_err(|join_err| {
+            format!("Failed to join server STT capture task: {}", join_err)
+        })??,
         Err(_) => {
             return Err("Server STT capture timed out. Try a shorter duration.".to_string());
         }
@@ -1806,21 +3134,28 @@ pub async fn capture_and_transcribe_server_stt(
     let mut system_bytes: Option<Vec<u8>> = None;
 
     if mic_has_audio {
-        let Some(path) = mic_path.as_deref() else {
-            return Err("Captured microphone track has no file path.".to_string());
+        let bytes = if let Some(bytes) = capture_result.microphone.wav_bytes.clone() {
+            bytes
+        } else if let Some(path) = mic_path.as_deref() {
+            std::fs::read(path)
+                .map_err(|err| format!("Failed to read captured mic audio '{}': {}", path, err))?
+        } else {
+            return Err("Captured microphone track has no in-memory WAV payload.".to_string());
         };
-        let bytes = std::fs::read(path)
-            .map_err(|err| format!("Failed to read captured mic audio '{}': {}", path, err))?;
         mic_bytes = Some(bytes);
         attached_parts += 1;
     }
 
     if system_has_audio {
-        let Some(path) = system_path.as_deref() else {
-            return Err("Captured system audio track has no file path.".to_string());
+        let bytes = if let Some(bytes) = capture_result.system_audio.wav_bytes.clone() {
+            bytes
+        } else if let Some(path) = system_path.as_deref() {
+            std::fs::read(path).map_err(|err| {
+                format!("Failed to read captured system audio '{}': {}", path, err)
+            })?
+        } else {
+            return Err("Captured system audio track has no in-memory WAV payload.".to_string());
         };
-        let bytes = std::fs::read(path)
-            .map_err(|err| format!("Failed to read captured system audio '{}': {}", path, err))?;
         system_bytes = Some(bytes);
         attached_parts += 1;
     }
@@ -1858,22 +3193,16 @@ pub async fn capture_and_transcribe_server_stt(
         });
     }
 
-    let mut url_candidates = vec![format!("{}/api/v1/stt/transcribe", base_url)];
-    let normalized_base = base_url.to_ascii_lowercase();
-    if normalized_base.contains("leonovcare.ru") {
-        let fallback = "http://85.198.82.221:8080/api/v1/stt/transcribe".to_string();
-        if !url_candidates.iter().any(|entry| entry == &fallback) {
-            url_candidates.push(fallback);
-        }
-    } else if normalized_base.contains("85.198.82.221:8080") {
-        let fallback = "https://leonovcare.ru/api/v1/stt/transcribe".to_string();
-        if !url_candidates.iter().any(|entry| entry == &fallback) {
-            url_candidates.push(fallback);
-        }
-    }
+    let mut url_candidates = vec![
+        format!("{}/api/v2/stt/transcribe", base_url),
+        format!("{}/api/v1/stt/transcribe", base_url),
+    ];
+    url_candidates.dedup();
 
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(PROXY_STT_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(
+            PROXY_STT_CONNECT_TIMEOUT_SECS,
+        ))
         .timeout(std::time::Duration::from_secs(PROXY_STT_TIMEOUT_SECS))
         .build()
         .map_err(|err| format!("Failed to build HTTP client for server STT: {}", err))?;
@@ -1957,26 +3286,29 @@ pub async fn capture_and_transcribe_server_stt(
     }
 
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|err| {
-            let _ = std::fs::remove_dir_all(&capture_dir);
-            format!("Failed to read server STT response: {} (via {}).", err, selected_url)
-        })?;
+    let body = response.text().await.map_err(|err| {
+        let _ = std::fs::remove_dir_all(&capture_dir);
+        format!(
+            "Failed to read server STT response: {} (via {}).",
+            err, selected_url
+        )
+    })?;
 
     let parsed = if status.is_success() {
-        serde_json::from_str::<ProxySttTranscribeResponse>(&body)
-            .map_err(|err| {
-                let _ = std::fs::remove_dir_all(&capture_dir);
-                format!(
-                    "Server STT returned invalid JSON: {} (via {}).",
-                    err, selected_url
-                )
-            })?
+        serde_json::from_str::<ProxySttTranscribeResponse>(&body).map_err(|err| {
+            let _ = std::fs::remove_dir_all(&capture_dir);
+            format!(
+                "Server STT returned invalid JSON: {} (via {}).",
+                err, selected_url
+            )
+        })?
     } else {
         let detail = extract_proxy_error_message(&body).unwrap_or_else(|| {
-            format!("Server STT failed with HTTP {} (via {}).", status.as_u16(), selected_url)
+            format!(
+                "Server STT failed with HTTP {} (via {}).",
+                status.as_u16(),
+                selected_url
+            )
         });
         let _ = std::fs::remove_dir_all(&capture_dir);
         return Err(detail);
@@ -2406,7 +3738,12 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
         .and_then(|path| validate_vosk_model_layout(path).err());
     let model_usable = model_path_string.is_some() && model_layout_error.is_none();
 
-    let detail = match (&runtime.available, &model_path_string, &active_model_id, &model_layout_error) {
+    let detail = match (
+        &runtime.available,
+        &model_path_string,
+        &active_model_id,
+        &model_layout_error,
+    ) {
         (_, Some(_), Some(_), Some(error)) => {
             format!(
                 "Русский профиль распознавания поврежден или установлен не полностью. Переустановите его в настройках. {}",
@@ -2417,7 +3754,9 @@ pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
             format!("Распознавание готово. Активный профиль: {}.", model_id)
         }
         (false, _, _, _) => runtime.detail.clone(),
-        (_, None, _, _) => "Русский профиль распознавания не установлен. Установите его в настройках.".to_string(),
+        (_, None, _, _) => {
+            "Русский профиль распознавания не установлен. Установите его в настройках.".to_string()
+        }
         _ => "Vosk is not ready.".to_string(),
     };
 
@@ -2436,7 +3775,9 @@ fn resolve_vosk_model_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let base_dir = models_base_dir(app)?;
     let model_id = read_active_release_model_id(&base_dir)
         .or_else(|| installed_release_model_ids(&base_dir).into_iter().next())
-        .ok_or_else(|| "Русский профиль распознавания не установлен. Установите его в настройках.".to_string())?;
+        .ok_or_else(|| {
+            "Русский профиль распознавания не установлен. Установите его в настройках.".to_string()
+        })?;
     let model_path = base_dir.join(&model_id);
     if !model_path.is_dir() {
         return Err(format!(
@@ -2660,7 +4001,8 @@ fn friendly_stt_detail(detail: &str) -> String {
     }
     if lowered.contains("failed to load") {
         if lowered.contains("model") {
-            return "Русский профиль распознавания не загрузился. Переустановите его в настройках.".to_string();
+            return "Русский профиль распознавания не загрузился. Переустановите его в настройках."
+                .to_string();
         }
         return "Компоненты распознавания найдены, но не загрузились. Переустановите их в настройках.".to_string();
     }
@@ -2862,16 +4204,14 @@ struct VoskModelCatalogEntry {
     default_baseline: bool,
 }
 
-const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)] = &[
-    (
-        "vosk-model-ru-0.42",
-        "Russian (Large)",
-        "ru-RU",
-        VoskModelVariant::Large,
-        1848,
-        "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-ru-0.42.zip",
-    ),
-];
+const FALLBACK_MODEL_CATALOG: &[(&str, &str, &str, VoskModelVariant, u32, &str)] = &[(
+    "vosk-model-ru-0.42",
+    "Russian (Large)",
+    "ru-RU",
+    VoskModelVariant::Large,
+    1848,
+    "https://e-rd.ru/downloads/ai-interview/vosk/models/vosk-model-ru-0.42.zip",
+)];
 const RUSSIAN_LARGE_MODEL_ID: &str = "vosk-model-ru-0.42";
 const LEGACY_NON_RUSSIAN_MODEL_IDS: &[&str] = &["vosk-model-small-en-us-0.15"];
 
@@ -2978,7 +4318,11 @@ fn cleanup_models_outside_languages(
     let allowed_families = catalog
         .latest_by_family
         .iter()
-        .filter(|entry| target_languages.iter().any(|language| language == &entry.language))
+        .filter(|entry| {
+            target_languages
+                .iter()
+                .any(|language| language == &entry.language)
+        })
         .map(|entry| entry.family_key.clone())
         .collect::<Vec<_>>();
 
@@ -3408,7 +4752,9 @@ pub fn set_active_vosk_model(app: tauri::AppHandle, model_id: String) -> Result<
     let base_dir = models_base_dir(&app)?;
     let normalized_model_id = model_id.trim();
     if !is_release_vosk_model_id(normalized_model_id) {
-        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+        return Err(
+            "Этот профиль больше не используется. Установите точный русский профиль.".to_string(),
+        );
     }
     let model_dir = base_dir.join(normalized_model_id);
     if !model_dir.is_dir() {
@@ -3426,7 +4772,9 @@ pub fn switch_stt_model(app: tauri::AppHandle, model_id: String) -> Result<(), S
     let base_dir = models_base_dir(&app)?;
     let normalized = model_id.trim();
     if !is_release_vosk_model_id(normalized) {
-        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+        return Err(
+            "Этот профиль больше не используется. Установите точный русский профиль.".to_string(),
+        );
     }
     let model_dir = base_dir.join(normalized);
     if !model_dir.is_dir() {
@@ -3597,7 +4945,9 @@ pub async fn download_vosk_model(
 ) -> Result<String, String> {
     install_control::reset_cancel();
     if !is_release_vosk_model_id(model_id.trim()) {
-        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+        return Err(
+            "Этот профиль больше не используется. Установите точный русский профиль.".to_string(),
+        );
     }
     let cleanup_model_ids = cleanup_model_ids.unwrap_or_default();
     download_vosk_model_internal(&app, &url, &model_id, true, &cleanup_model_ids).await
@@ -3612,7 +4962,9 @@ pub async fn install_vosk_model_from_zip(
 ) -> Result<String, String> {
     install_control::reset_cancel();
     if !is_release_vosk_model_id(model_id.trim()) {
-        return Err("Этот профиль больше не используется. Установите точный русский профиль.".to_string());
+        return Err(
+            "Этот профиль больше не используется. Установите точный русский профиль.".to_string(),
+        );
     }
     let cleanup_model_ids = cleanup_model_ids.unwrap_or_default();
     let archive_path = PathBuf::from(archive_path.trim());
@@ -3634,7 +4986,9 @@ pub async fn install_vosk_model_from_zip(
     }
 
     let models_dir = models_base_dir(&app)?;
-    let archive_size = std::fs::metadata(&archive_path).ok().map(|metadata| metadata.len());
+    let archive_size = std::fs::metadata(&archive_path)
+        .ok()
+        .map(|metadata| metadata.len());
     install_vosk_model_archive(
         &app,
         &archive_path,
@@ -3843,8 +5197,8 @@ fn install_vosk_model_archive(
             e
         )
     })?;
-    let mut archive =
-        zip::ZipArchive::new(archive_file).map_err(|e| format!("Некорректный ZIP-файл профиля: {}", e))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
+        .map_err(|e| format!("Некорректный ZIP-файл профиля: {}", e))?;
     let archive_len = archive.len().max(1);
 
     for i in 0..archive.len() {
@@ -3872,8 +5226,8 @@ fn install_vosk_model_archive(
         }
         if emit_progress && (i % 12 == 0 || i + 1 == archive_len) {
             let extracted_ratio = (i + 1) as f32 / archive_len as f32;
-            let percent = extracting_start_percent
-                + ((100.0 - extracting_start_percent) * extracted_ratio);
+            let percent =
+                extracting_start_percent + ((100.0 - extracting_start_percent) * extracted_ratio);
             emit_vosk_model_progress(
                 app,
                 progress_bytes,
@@ -3918,8 +5272,8 @@ fn install_vosk_model_archive(
 
 fn validate_vosk_model_layout(model_dir: &Path) -> Result<(), String> {
     let has_model_config = model_dir.join("conf").join("model.conf").is_file();
-    let has_acoustic_model = model_dir.join("am").join("final.mdl").is_file()
-        || model_dir.join("final.mdl").is_file();
+    let has_acoustic_model =
+        model_dir.join("am").join("final.mdl").is_file() || model_dir.join("final.mdl").is_file();
     let has_graph = model_dir.join("graph").join("HCLG.fst").is_file()
         || (model_dir.join("graph").join("HCLr.fst").is_file()
             && model_dir.join("graph").join("Gr.fst").is_file());
@@ -4084,7 +5438,8 @@ fn write_active_model_id(base_dir: &Path, model_id: &str) -> Result<(), String> 
 fn clear_active_model_id(base_dir: &Path) -> Result<(), String> {
     let marker = active_model_marker_path(base_dir);
     if marker.exists() {
-        std::fs::remove_file(marker).map_err(|e| format!("Не удалось сбросить активный профиль: {}", e))?;
+        std::fs::remove_file(marker)
+            .map_err(|e| format!("Не удалось сбросить активный профиль: {}", e))?;
     }
     Ok(())
 }

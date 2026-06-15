@@ -31,15 +31,20 @@ function AudioTrackResult({
   icon,
   title,
   track,
+  testId,
 }: {
   icon: ReactNode;
   title: string;
   track: CapturedAudioTrack;
+  testId: string;
 }) {
   const isOk = track.available && Boolean(track.file_path);
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.035] p-4">
+    <div
+      className="rounded-2xl border border-white/10 bg-white/[0.035] p-4"
+      data-testid={testId}
+    >
       <div className="flex items-center gap-2">
         <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06]">
           {icon}
@@ -154,6 +159,7 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
           <Button
             onClick={runAudioCheck}
             disabled={running}
+            data-testid="audio-quality-record-button"
             icon={
               running ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -176,7 +182,10 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
         </div>
 
         {error && (
-          <div className="rounded-2xl border border-danger/35 bg-danger/10 px-4 py-3 text-sm leading-relaxed text-danger">
+          <div
+            className="rounded-2xl border border-danger/35 bg-danger/10 px-4 py-3 text-sm leading-relaxed text-danger"
+            data-testid="audio-quality-error"
+          >
             {error}
           </div>
         )}
@@ -187,11 +196,13 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
               icon={<Mic className="h-4 w-4 text-accent" />}
               title="Микрофон"
               track={result.microphone}
+              testId="audio-quality-microphone-result"
             />
             <AudioTrackResult
               icon={<Volume2 className="h-4 w-4 text-interviewer" />}
               title="Системный звук"
               track={result.system_audio}
+              testId="audio-quality-system-result"
             />
           </div>
         )}

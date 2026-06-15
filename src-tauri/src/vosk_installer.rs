@@ -54,12 +54,27 @@ pub async fn list_versions() -> Result<Vec<VoskRuntimeVersion>, String> {
             .get(VOSK_RUNTIME_MIRROR_RELEASES_URL)
             .send()
             .await
-            .map_err(|e| format!("Не удалось получить список компонентов распознавания: {}", e))?
+            .map_err(|e| {
+                format!(
+                    "Не удалось получить список компонентов распознавания: {}",
+                    e
+                )
+            })?
             .error_for_status()
-            .map_err(|e| format!("Не удалось загрузить список компонентов распознавания: {}", e))?
+            .map_err(|e| {
+                format!(
+                    "Не удалось загрузить список компонентов распознавания: {}",
+                    e
+                )
+            })?
             .json::<Vec<VoskRuntimeVersion>>()
             .await
-            .map_err(|e| format!("Не удалось прочитать список компонентов распознавания: {}", e))
+            .map_err(|e| {
+                format!(
+                    "Не удалось прочитать список компонентов распознавания: {}",
+                    e
+                )
+            })
     }
     .await
     .unwrap_or_else(|_| fallback_runtime_versions());
@@ -85,7 +100,9 @@ pub async fn install_runtime(
     install_control::reset_cancel();
     let versions = list_versions().await?;
     if versions.is_empty() {
-        return Err("Для этой платформы не найдены совместимые компоненты распознавания.".to_string());
+        return Err(
+            "Для этой платформы не найдены совместимые компоненты распознавания.".to_string(),
+        );
     }
 
     let requested = requested_version.map(|v| normalize_tag(v.trim()));
@@ -291,7 +308,8 @@ fn runtime_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .join("runtime")
         .join("vosk")
         .join(platform_dir_name());
-    fs::create_dir_all(&base).map_err(|e| format!("Не удалось создать папку компонентов: {}", e))?;
+    fs::create_dir_all(&base)
+        .map_err(|e| format!("Не удалось создать папку компонентов: {}", e))?;
     Ok(base)
 }
 

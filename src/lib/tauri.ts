@@ -77,6 +77,8 @@ export interface CapturedAudioTrack {
   sample_rate: number | null;
   sample_count: number;
   duration_ms: number;
+  peak_abs: number;
+  rms: number;
   file_path: string | null;
   available: boolean;
   detail: string;
@@ -121,8 +123,12 @@ export interface ServerSttChunkCaptureRequest extends AudioDeviceSelectionReques
 
 export interface ServerSttChunkTrack {
   source: string;
+  requested_device_id: string | null;
+  device_name: string | null;
   sample_rate: number | null;
   duration_ms: number;
+  peak_abs: number;
+  rms: number;
   wav_base64: string | null;
   available: boolean;
   detail: string;
@@ -133,6 +139,38 @@ export interface ServerSttChunkCaptureResult {
   microphone: ServerSttChunkTrack;
   system_audio: ServerSttChunkTrack;
   captured_at_unix_ms: number;
+}
+
+export interface AudioAutoProbeRequest extends AudioDeviceSelectionRequest {
+  durationSeconds?: number;
+  probeAllInputDevices?: boolean;
+  probeAllOutputDevices?: boolean;
+}
+
+export interface AudioSignalProbeTrack {
+  source: string;
+  device: AudioDeviceInfo | null;
+  requested_device_id: string | null;
+  device_id: string | null;
+  device_name: string | null;
+  sample_rate: number | null;
+  duration_ms: number;
+  peak_abs: number;
+  rms: number;
+  signal_score: number;
+  has_signal: boolean;
+  available: boolean;
+  detail: string;
+}
+
+export interface AudioAutoProbeResult {
+  duration_seconds: number;
+  microphone_candidates: AudioSignalProbeTrack[];
+  system_audio_candidates: AudioSignalProbeTrack[];
+  recommended_microphone: AudioSignalProbeTrack | null;
+  recommended_system_audio: AudioSignalProbeTrack | null;
+  notes: string[];
+  probed_at_unix_ms: number;
 }
 
 export interface ServerSttCaptureRequest extends AudioDeviceSelectionRequest {
@@ -444,6 +482,28 @@ export async function transcribeCapturedAudio(
   });
 }
 
+export async function probeAudioDevices(
+  request?: AudioAutoProbeRequest,
+): Promise<AudioAutoProbeResult> {
+  return invoke("probe_audio_devices", {
+    request: {
+      ...normalizeAudioDeviceSelection(request),
+      duration_seconds:
+        typeof request?.durationSeconds === "number"
+          ? Math.round(request.durationSeconds)
+          : undefined,
+      probe_all_input_devices:
+        typeof request?.probeAllInputDevices === "boolean"
+          ? request.probeAllInputDevices
+          : undefined,
+      probe_all_output_devices:
+        typeof request?.probeAllOutputDevices === "boolean"
+          ? request.probeAllOutputDevices
+          : undefined,
+    },
+  });
+}
+
 export async function captureAndTranscribeServerStt(
   request: ServerSttCaptureRequest,
 ): Promise<ServerSttCaptureResult> {
@@ -473,6 +533,10 @@ export async function captureServerSttChunk(
           : undefined,
     },
   });
+}
+
+export async function stopServerSttLiveCapture(): Promise<void> {
+  return invoke("stop_server_stt_live_capture");
 }
 
 export async function getSttStatus(): Promise<SttStatus> {
