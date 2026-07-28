@@ -91,7 +91,7 @@ export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
       view: "dashboard",
-      settingsTab: "llm",
+      settingsTab: "audio",
       settingsFocus: null,
       isInterviewActive: false,
       permissions: {

@@ -22,7 +22,16 @@ export function normalizeHistoryRetentionDays(value: unknown): number | null {
 
 export function formatHistoryRetentionLabel(days: number | null): string {
   if (days === null) {
-    return "Forever";
+    return "Бессрочно";
   }
-  return `${days} day${days === 1 ? "" : "s"}`;
+  return `${days} ${pluralizeDays(days)}`;
+}
+
+function pluralizeDays(days: number): string {
+  const mod100 = days % 100;
+  const mod10 = days % 10;
+  if (mod100 >= 11 && mod100 <= 14) return "дней";
+  if (mod10 === 1) return "день";
+  if (mod10 >= 2 && mod10 <= 4) return "дня";
+  return "дней";
 }

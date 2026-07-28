@@ -78,3 +78,8 @@ export function getLanguageLabel(code: PrimaryLanguage): string {
     "English"
   );
 }
+
+/** Two-letter code for compact indicators: "ru-RU" -> "RU". */
+export function getLanguageShortLabel(code: PrimaryLanguage): string {
+  return code.split("-")[0].toUpperCase();
+}

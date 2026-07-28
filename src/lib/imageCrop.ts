@@ -97,11 +97,75 @@ export async function cropBase64PngByRect(
   return croppedBase64 || imageBase64;
 }
 
+/**
+ * Clipboard screenshots come straight off the display and can be 4K-sized, so
+ * the longest edge is capped before the payload goes to the service.
+ */
+const MAX_ATTACHED_IMAGE_EDGE = 1600;
+
+export function calculateAttachedImageSize(
+  naturalWidth: number,
+  naturalHeight: number,
+): { width: number; height: number } {
+  const longestEdge = Math.max(naturalWidth, naturalHeight);
+  if (longestEdge <= 0) {
+    return { width: 0, height: 0 };
+  }
+
+  const scale = Math.min(1, MAX_ATTACHED_IMAGE_EDGE / longestEdge);
+  return {
+    width: Math.max(1, Math.round(naturalWidth * scale)),
+    height: Math.max(1, Math.round(naturalHeight * scale)),
+  };
+}
+
+/** Re-encodes any clipboard image (JPEG, WebP, ...) into the base64 PNG the service expects. */
+export async function blobToBase64Png(blob: Blob): Promise<string> {
+  const dataUrl = await readBlobAsDataUrl(blob);
+  const image = await loadImageFromSrc(dataUrl);
+  const { width, height } = calculateAttachedImageSize(
+    image.naturalWidth,
+    image.naturalHeight,
+  );
+  if (!width || !height) {
+    throw new Error("Изображение из буфера обмена пустое.");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Не удалось подготовить изображение из буфера обмена.");
+  }
+
+  ctx.drawImage(image, 0, 0, width, height);
+  const base64 = canvas.toDataURL("image/png").split(",")[1];
+  if (!base64) {
+    throw new Error("Не удалось прочитать изображение из буфера обмена.");
+  }
+  return base64;
+}
+
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () =>
+      reject(new Error("Не удалось прочитать изображение из буфера обмена."));
+    reader.readAsDataURL(blob);
+  });
+}
+
 async function loadBase64Png(imageBase64: string): Promise<HTMLImageElement> {
+  return loadImageFromSrc(`data:image/png;base64,${imageBase64}`);
+}
+
+async function loadImageFromSrc(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("Failed to load screenshot image for crop."));
-    image.src = `data:image/png;base64,${imageBase64}`;
+    image.onerror = () => reject(new Error("Failed to load image."));
+    image.src = src;
   });
 }

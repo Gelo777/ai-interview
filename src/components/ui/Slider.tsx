@@ -1,3 +1,5 @@
+import type { CSSProperties } from "react";
+
 interface Props {
   value: number;
   min: number;
@@ -24,11 +26,14 @@ export function Slider({
   return (
     <div className={disabled ? "opacity-50" : ""}>
       {label && (
-        <div className="flex justify-between items-center mb-2">
+        <div className="mb-2.5 flex items-center justify-between">
           <span className="text-sm text-text-secondary">{label}</span>
-          <span className="text-sm font-mono text-accent">
-            {value}
-            {unit && <span className="text-text-muted ml-1">{unit}</span>}
+          <span className="font-mono text-sm font-semibold text-accent">
+            {/* key remounts the number on change so the pop replays */}
+            <span key={value} className="value-pop">
+              {value}
+            </span>
+            {unit && <span className="ml-1 text-text-muted">{unit}</span>}
           </span>
         </div>
       )}
@@ -40,17 +45,22 @@ export function Slider({
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
         disabled={disabled}
-        className="w-full h-1.5 rounded-full appearance-none cursor-pointer
-          [&::-webkit-slider-thumb]:appearance-none
-          [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4
-          [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent
-          [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:cursor-pointer
-          [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-bg-primary
+        className="slider-track h-2 w-full cursor-pointer appearance-none rounded-full
+          [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:w-5
+          [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:cursor-pointer
+          [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-[3px]
+          [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-accent
+          [&::-webkit-slider-thumb]:shadow-[0_4px_12px_-2px_rgba(61,91,255,0.7)]
+          [&::-webkit-slider-thumb]:transition-transform hover:[&::-webkit-slider-thumb]:scale-110
+          active:[&::-webkit-slider-thumb]:scale-[1.18]
           focus:outline-none focus:ring-2 focus:ring-accent/30 focus:ring-offset-2 focus:ring-offset-bg-primary
           disabled:cursor-not-allowed"
-        style={{
-          background: `linear-gradient(to right, var(--color-accent) ${pct}%, var(--color-bg-tertiary) ${pct}%)`,
-        }}
+        style={
+          {
+            "--slider-fill": `${pct}%`,
+            background: `linear-gradient(to right, #3d5bff var(--slider-fill), #7a5cff var(--slider-fill), var(--color-bg-tertiary) var(--slider-fill))`,
+          } as CSSProperties
+        }
       />
     </div>
   );

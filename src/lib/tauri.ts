@@ -119,6 +119,8 @@ export interface TranscribeCapturedAudioResult {
 
 export interface ServerSttChunkCaptureRequest extends AudioDeviceSelectionRequest {
   durationSeconds?: number;
+  /** Sub-second drain interval for dictation; wins over durationSeconds. */
+  durationMs?: number;
 }
 
 export interface ServerSttChunkTrack {
@@ -136,6 +138,7 @@ export interface ServerSttChunkTrack {
 
 export interface ServerSttChunkCaptureResult {
   duration_seconds: number;
+  duration_ms: number;
   microphone: ServerSttChunkTrack;
   system_audio: ServerSttChunkTrack;
   captured_at_unix_ms: number;
@@ -394,6 +397,14 @@ export async function clearLicense(): Promise<LicenseStatus> {
   return invoke("clear_license");
 }
 
+export async function getLicenseAccessToken(): Promise<string | null> {
+  return invoke("get_license_access_token");
+}
+
+export async function getLicenseKey(): Promise<string | null> {
+  return invoke("get_license_key");
+}
+
 export async function getProxyLicenseStatus(
   request: ProxyLicenseStatusRequest,
 ): Promise<ProxyLicenseStatusResponse> {
@@ -530,6 +541,10 @@ export async function captureServerSttChunk(
       duration_seconds:
         typeof request?.durationSeconds === "number"
           ? Math.round(request.durationSeconds)
+          : undefined,
+      duration_ms:
+        typeof request?.durationMs === "number"
+          ? Math.round(request.durationMs)
           : undefined,
     },
   });

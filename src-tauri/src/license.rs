@@ -65,6 +65,7 @@ pub struct LicenseActivationResult {
 #[derive(Serialize)]
 struct ActivateLicensePayload {
     license_key: String,
+    device_fingerprint: String,
     app_version: String,
     platform: String,
     arch: String,
@@ -114,12 +115,14 @@ pub async fn activate_license(
     }
 
     let proxy_url = normalize_proxy_url(&request.proxy_url)?;
+    let device_identity = crate::device_identity::resolve();
     let payload = ActivateLicensePayload {
         license_key: license_key.clone(),
+        device_fingerprint: device_identity.fingerprint,
         app_version: app.package_info().version.to_string(),
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        device_name: resolve_device_name(),
+        device_name: device_identity.name,
     };
 
     let client = reqwest::Client::builder()
@@ -146,7 +149,14 @@ pub async fn activate_license(
         let message = extract_message_from_text(&body)
             .unwrap_or_else(|| format!("Сервис вернул HTTP {}", status_code.as_u16()));
         persist_error_state(app, &proxy_url, &message)?;
-        return Err(message);
+        // Префиксуем машинный код ошибки (error.code), чтобы фронтенд мог точно
+        // классифицировать статус активации (device_mismatch/expired/invalid),
+        // а не разбирать человекочитаемый текст. Код скрывается в UI, если он
+        // сопоставлен с локализованным сообщением.
+        return match extract_code_from_text(&body) {
+            Some(code) => Err(format!("{}: {}", code, message)),
+            None => Err(message),
+        };
     }
 
     let parsed: ProxyActivationEnvelope = serde_json::from_str(&body)
@@ -215,6 +225,10 @@ pub fn clear_license(app: &tauri::AppHandle) -> Result<LicenseStatus, String> {
 
 pub fn get_license_access_token() -> Result<Option<String>, String> {
     secret_store::get_license_access_token()
+}
+
+pub fn get_license_key() -> Result<Option<String>, String> {
+    secret_store::get_license_key()
 }
 
 pub fn get_license_proxy_config(
@@ -370,14 +384,6 @@ fn normalize_status(raw: &str) -> &str {
     }
 }
 
-fn resolve_device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown-device".to_string())
-}
-
 fn extract_message_from_text(body: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(body).ok()?;
     extract_message_from_json(&parsed)
@@ -391,13 +397,49 @@ fn extract_message_from_json(value: &Value) -> Option<String> {
     }
 }
 
-fn extract_message_from_map(map: &Map<String, Value>) -> Option<String> {
-    for key in ["message", "error", "detail"] {
-        if let Some(Value::String(text)) = map.get(key) {
-            let trimmed = text.trim();
+/// Извлекает машинный код ошибки из конверта бэкенда: `{"error":{"code",...}}`
+/// (текущая форма) или top-level `{"code": ...}` (запас).
+fn extract_code_from_text(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    let obj = parsed.as_object()?;
+    if let Some(Value::Object(nested)) = obj.get("error") {
+        if let Some(Value::String(code)) = nested.get("code") {
+            let trimmed = code.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
             }
+        }
+    }
+    if let Some(Value::String(code)) = obj.get("code") {
+        let trimmed = code.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn extract_message_from_map(map: &Map<String, Value>) -> Option<String> {
+    for key in ["message", "error", "detail"] {
+        match map.get(key) {
+            // Legacy shape: top-level string value (e.g. {"message": "..."}).
+            Some(Value::String(text)) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            // Current backend shape: {"error": {"code", "message", ...}} where the
+            // value is a nested object — descend into `message`.
+            Some(Value::Object(nested)) => {
+                if let Some(Value::String(text)) = nested.get("message") {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None

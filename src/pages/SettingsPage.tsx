@@ -4,6 +4,7 @@ import {
   Brain,
   Mic,
   Volume2,
+  Languages,
   Copy,
   Loader2,
   RotateCcw,
@@ -21,19 +22,27 @@ import { Select } from "@/components/ui/Select";
 import { Slider } from "@/components/ui/Slider";
 import { Badge } from "@/components/ui/Badge";
 import { StatusIndicator } from "@/components/ui/StatusIndicator";
-import { useSettingsStore } from "@/stores/settings";
+import { AudioQualityCheck } from "@/components/dashboard/AudioQualityCheck";
+import {
+  AUDIO_HINT_WINDOW_MAX_SECONDS,
+  AUDIO_HINT_WINDOW_MIN_SECONDS,
+  useSettingsStore,
+} from "@/stores/settings";
 import { useAppStore } from "@/stores/app";
 import { useHistoryStore } from "@/stores/history";
 import { useDiagnosticsStore } from "@/stores/diagnostics";
-import { PROXY_BASE_URL } from "@/lib/proxy";
-import { useApiKeyValidation } from "@/hooks/useApiKeyValidation";
-import { refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
+import { PROXY_BASE_URL, validateLicenseKeyDetailed } from "@/lib/proxy";
+import {
+  refreshCloudReadinessNow,
+  refreshLocalReadinessNow,
+} from "@/hooks/useReadinessMonitor";
 import {
   createTransferProgressTracker,
   formatTransferDiagnostics,
   updateTransferProgressTracker,
 } from "@/lib/installProgress";
 import { APP_LANGUAGE_OPTIONS, getLanguageLabel } from "@/lib/languages";
+import { useT } from "@/lib/i18n";
 import {
   buildDiagnosticsReport,
   copyDiagnosticsReportToClipboard,
@@ -63,6 +72,8 @@ import {
   resolveSttQualityProfile,
 } from "@/lib/sttProfiles";
 import type {
+  DictationSource,
+  DictationTrigger,
   HotkeyAction,
   PrimaryLanguage,
   SettingsFocusTarget,
@@ -80,8 +91,8 @@ import type {
 } from "@/lib/tauri";
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Key }[] = [
-  { id: "llm", label: "Ключ", icon: Key },
   { id: "audio", label: "Аудио", icon: Volume2 },
+  { id: "language", label: "Язык", icon: Languages },
   { id: "speech", label: "Распознавание", icon: Brain },
 ];
 
@@ -121,12 +132,13 @@ export function SettingsPage() {
     setSettingsTab,
     clearSettingsFocus,
   } = useAppStore();
+  const t = useT();
   const [tab, setTab] = useState<SettingsTab>(settingsTab);
   const [activeFocus, setActiveFocus] = useState<SettingsFocusTarget | null>(null);
-  const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : "неизвестно";
+  const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : t("неизвестно");
 
   useEffect(() => {
-    const availableTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "speech";
+    const availableTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "audio";
     setTab(availableTab);
     if (availableTab !== settingsTab) {
       setSettingsTab(availableTab);
@@ -154,234 +166,217 @@ export function SettingsPage() {
     };
   }, [clearSettingsFocus, settingsFocus, tab]);
 
+  const tabBarRef = useRef<HTMLDivElement>(null);
+  const [tabIndicator, setTabIndicator] = useState({ left: 0, width: 0, ready: false });
+
+  useEffect(() => {
+    const measure = () => {
+      const el = tabBarRef.current?.querySelector<HTMLElement>(`[data-tab="${tab}"]`);
+      if (el) {
+        setTabIndicator({ left: el.offsetLeft, width: el.offsetWidth, ready: true });
+      }
+    };
+    measure();
+    const settle = window.setTimeout(measure, 150);
+    window.addEventListener("resize", measure);
+    return () => {
+      window.clearTimeout(settle);
+      window.removeEventListener("resize", measure);
+    };
+  }, [tab]);
+
   return (
-    <div className="max-w-5xl p-6">
+    <div className="mx-auto max-w-5xl px-5 py-8 sm:px-8">
       <div className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-text-primary">Настройки</h1>
-        <p className="mt-2 text-sm leading-7 text-text-muted">
-          Основные настройки перед запуском интервью.
+        <h1 className="font-display text-[1.9rem] font-bold leading-[1.05] tracking-[-0.03em] text-text-primary">
+          {t("Настройки")}
+        </h1>
+        <p className="mt-1.5 text-sm leading-6 text-text-secondary">
+          {t("Основные настройки перед запуском интервью.")}
           {isInterviewActive && (
-            <span className="text-warning ml-2">
-              Во время собеседования настройки заблокированы.
+            <span className="ml-2 text-warning">
+              {t("Во время собеседования настройки заблокированы.")}
             </span>
           )}
+          <span className="ml-2 font-mono text-xs text-text-muted">v{appVersionLabel}</span>
         </p>
-        <p className="mt-1 text-xs text-text-muted">App version: {appVersionLabel}</p>
       </div>
 
-      <div className="mb-6 flex gap-1.5 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-1.5">
-        {TABS.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            onClick={() => {
-              setTab(id);
-              setSettingsTab(id);
-            }}
-            className={`
-              flex items-center gap-1.5 whitespace-nowrap rounded-xl px-3.5 py-2 text-xs font-medium
-              transition-colors cursor-pointer
-              ${tab === id
-                ? "border border-white/12 bg-[linear-gradient(135deg,rgba(87,208,255,0.2),rgba(115,183,255,0.14))] text-text-primary"
-                : "text-text-muted hover:bg-white/[0.05] hover:text-text-secondary"}
-            `}
-          >
-            <Icon className="w-3.5 h-3.5" />
-            {label}
-          </button>
-        ))}
+      <div ref={tabBarRef} className="relative mb-6 flex w-fit gap-1 rounded-2xl bg-bg-tertiary p-1 ring-1 ring-black/[0.05]">
+        <span
+          className="pointer-events-none absolute top-1 bottom-1 rounded-xl bg-bg-card ring-[1.5px] ring-accent/35 shadow-[0_1px_2px_rgba(20,22,40,0.08),0_5px_16px_-6px_rgba(59,91,219,0.4)] transition-all duration-300 ease-[cubic-bezier(0.34,1.28,0.6,1)]"
+          style={{
+            left: tabIndicator.left,
+            width: tabIndicator.width,
+            opacity: tabIndicator.ready ? 1 : 0,
+          }}
+        />
+        {TABS.map(({ id, label, icon: Icon }) => {
+          const active = tab === id;
+          return (
+            <button
+              key={id}
+              data-tab={id}
+              onClick={() => {
+                setTab(id);
+                setSettingsTab(id);
+              }}
+              className={`relative z-10 flex shrink-0 cursor-pointer items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors duration-200 ${
+                active ? "text-accent" : "text-text-muted hover:text-text-secondary"
+              }`}
+            >
+              <Icon className={`h-4 w-4 shrink-0 transition-colors ${active ? "text-accent" : ""}`} />
+              {t(label)}
+            </button>
+          );
+        })}
       </div>
 
       <div>
-        {tab === "llm" && <LlmSettings disabled={isInterviewActive} focusTarget={activeFocus} />}
         {tab === "audio" && (
-          <AudioSettings disabled={isInterviewActive} focusTarget={activeFocus} />
+          <div className="space-y-5">
+            <AudioSettings disabled={isInterviewActive} focusTarget={activeFocus} />
+            <DictationSettings />
+          </div>
         )}
-        {tab === "speech" && (
-          <ServerSpeechSettings
+        {tab === "language" && (
+          <LanguageSettings
             disabled={isInterviewActive}
             focusTarget={activeFocus}
+            section="language"
           />
         )}
+        {tab === "speech" && <ServerSpeechSettings />}
       </div>
     </div>
   );
 }
 
-function ServerSpeechSettings({
-  disabled,
-  focusTarget,
-}: {
-  disabled: boolean;
-  focusTarget: SettingsFocusTarget | null;
-}) {
-  return (
-    <div className="space-y-5">
-      <div id="language-models" className={getFocusSectionClass(focusTarget === "language-models")}>
-        <Card
-          title="Серверное распознавание речи"
-          description="Live STT теперь выполняется на сервере. Локальные модели на устройстве больше не устанавливаются."
-        >
-          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-            <p>
-              Для запуска распознавания достаточно:
-              <span className="text-text-primary"> рабочего лицензионного ключа</span>,
-              микрофона и системного звука.
-            </p>
-            <p className="mt-2">
-              Установка Vosk/Whisper на клиенте отключена, поэтому проблемы со скачиванием моделей
-              больше не блокируют запуск helper.
-            </p>
-          </div>
+/**
+ * Behaviour of the dictation button in the interview overlay. Unlike device or
+ * model settings these stay editable during an interview: they only change how
+ * the button reacts, not the capture pipeline.
+ */
+function DictationSettings() {
+  const { dictationTrigger, dictationSource, setDictationTrigger, setDictationSource } =
+    useSettingsStore();
+  const t = useT();
 
-          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning-muted p-3">
-            <Info className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-            <p className="text-xs leading-relaxed text-warning">
-              Качество и стабильность распознавания теперь зависят в основном от сети и доступности
-              proxy backend.
-            </p>
-          </div>
+  const triggerOptions: Array<{ value: DictationTrigger; title: string; hint: string }> = [
+    {
+      value: "toggle",
+      title: t("Нажатие включает и выключает"),
+      hint: t("Клик по микрофону начинает запись, повторный клик её завершает."),
+    },
+    {
+      value: "push",
+      title: t("Запись, пока кнопка зажата"),
+      hint: t("Микрофон пишет, пока держите кнопку, и останавливается, когда отпустите."),
+    },
+  ];
 
-          <div className="mt-4">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => {
-                void refreshLocalReadinessNow();
-              }}
-              disabled={disabled}
-              icon={<RotateCcw className="h-3.5 w-3.5" />}
-            >
-              Обновить статус аудио
-            </Button>
-          </div>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
-function LlmSettings({
-  disabled,
-  focusTarget,
-}: {
-  disabled: boolean;
-  focusTarget: SettingsFocusTarget | null;
-}) {
-  const {
-    apiKey,
-    setApiKey,
-    interviewContext,
-    setInterviewContext,
-  } = useSettingsStore();
-
-  const [showKey, setShowKey] = useState(false);
-  const { validating, valid, detail } = useApiKeyValidation(
-    apiKey,
-    "custom",
-    PROXY_BASE_URL,
-    disabled,
-  );
-
-  const hasApiKey = apiKey.trim().length > 0;
+  const sourceOptions: Array<{ value: DictationSource; title: string; hint: string }> = [
+    {
+      value: "mic",
+      title: t("Только микрофон"),
+      hint: t("В строку ввода попадает то, что говорите вы."),
+    },
+    {
+      value: "system",
+      title: t("Только звук компьютера"),
+      hint: t("Речь из звонка или видео: удобно, чтобы поймать вопрос собеседника."),
+    },
+    {
+      value: "both",
+      title: t("Микрофон и звук компьютера"),
+      hint: t("Обе дорожки смешиваются в один текст."),
+    },
+  ];
 
   return (
-    <div className="space-y-5">
-      <div id="llm-api-key" className={getFocusSectionClass(focusTarget === "llm-api-key")}>
-        <Card
-          title="Лицензионный ключ"
-          description="Введите лицензионный ключ из бота. Остальное приложение настроит автоматически."
-        >
-          <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-            Не нужно выбирать провайдера, режим или адрес сервиса.
-            Приложение проверит ключ и подключится к рабочей конфигурации.
+    <Card
+      title={t("Диктовка")}
+      description={t("Кнопка микрофона в интервью: текст появляется в строке ввода по мере речи.")}
+    >
+      <div className="space-y-4">
+        <div className="space-y-3">
+          <div className="text-xs font-medium uppercase tracking-[0.08em] text-text-muted">
+            {t("Поведение кнопки")}
           </div>
-
-          <div className="relative mt-4">
-            <input
-              type={showKey ? "text" : "password"}
-              value={apiKey}
-              onChange={(e) => {
-                setApiKey(e.target.value);
-              }}
-              disabled={disabled}
-              placeholder="Введите лицензионный ключ"
-              className="w-full bg-bg-input border border-border rounded-lg px-3 py-2.5 pr-20
-              text-sm text-text-primary placeholder:text-text-muted
-              focus:border-accent focus:outline-none transition-colors
-              disabled:opacity-50"
-            />
-            <button
-              onClick={() => setShowKey(!showKey)}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-secondary"
+          {triggerOptions.map((option) => (
+            <label
+              key={option.value}
+              className="flex cursor-pointer items-center gap-3 rounded-lg border border-border p-3 transition-colors hover:border-border-active"
             >
-              {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-            </button>
-          </div>
-          <div className="flex items-center gap-3 mt-3 min-h-7">
-            {validating && (
-              <Badge variant="warning">
-                <Loader2 className="w-3 h-3 animate-spin" /> Проверяем...
-              </Badge>
-            )}
-            {valid === true && (
-              <Badge variant="success">
-                <CheckCircle className="w-3 h-3" /> Ключ принят
-              </Badge>
-            )}
-            {valid === false && <Badge variant="danger">Ключ не прошел проверку</Badge>}
-          </div>
-          {valid === false && detail && (
-            <p className="mt-2 text-sm leading-6 text-danger">
-              {detail}
-            </p>
-          )}
-
-        </Card>
-      </div>
-
-      <div
-        id="llm-interview-context"
-        className={getFocusSectionClass(focusTarget === "llm-interview-context")}
-      >
-        <Card
-          title="Технический контекст интервью"
-          description="Помогает сервису лучше понимать тему собеседования и исправлять типичные ошибки распознавания речи."
-        >
-          <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 text-sm leading-7 text-text-secondary">
-            Полезно заранее указать стек или тему. Например:{" "}
-            <span className="text-text-primary">
-              Backend interview, concurrency, databases, caching, system design
-            </span>
-            . Тогда сервис будет понимать, что речь идет о разработке, и осторожнее интерпретировать спорные слова вроде{" "}
-            <span className="text-text-primary">framework / library / API</span>.
-          </div>
-
-          <div className="mt-4 space-y-2">
-            <label className="block text-xs text-text-muted">Контекст</label>
-            <textarea
-              value={interviewContext}
-              onChange={(e) => setInterviewContext(e.target.value)}
-              disabled={disabled}
-              rows={4}
-              placeholder="Например: backend interview. Темы: concurrency, API, databases, caching, system design."
-              className="w-full resize-y bg-bg-input border border-border rounded-lg px-3 py-2.5
-              text-sm text-text-primary placeholder:text-text-muted
-              focus:border-accent focus:outline-none transition-colors
-              disabled:opacity-50"
-            />
-          </div>
-        </Card>
-      </div>
-
-      {!hasApiKey && (
-        <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
-          <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
-          <p className="text-xs text-warning leading-relaxed">
-            Пока нет лицензионного ключа. Для запуска нужен только ключ из бота.
-          </p>
+              <input
+                type="radio"
+                name="dictation-trigger"
+                checked={dictationTrigger === option.value}
+                onChange={() => setDictationTrigger(option.value)}
+                className="accent-accent"
+              />
+              <div>
+                <div className="text-sm font-medium">{option.title}</div>
+                <div className="text-xs text-text-muted">{option.hint}</div>
+              </div>
+            </label>
+          ))}
         </div>
-      )}
 
+        <div className="space-y-3">
+          <div className="text-xs font-medium uppercase tracking-[0.08em] text-text-muted">
+            {t("Что слушать")}
+          </div>
+          {sourceOptions.map((option) => (
+            <label
+              key={option.value}
+              className="flex cursor-pointer items-center gap-3 rounded-lg border border-border p-3 transition-colors hover:border-border-active"
+            >
+              <input
+                type="radio"
+                name="dictation-source"
+                checked={dictationSource === option.value}
+                onChange={() => setDictationSource(option.value)}
+                className="accent-accent"
+              />
+              <div>
+                <div className="text-sm font-medium">{option.title}</div>
+                <div className="text-xs text-text-muted">{option.hint}</div>
+              </div>
+            </label>
+          ))}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function ServerSpeechSettings() {
+  const t = useT();
+  const audioHintWindowSeconds = useSettingsStore((s) => s.audioHintWindowSeconds);
+  const setAudioHintWindowSeconds = useSettingsStore((s) => s.setAudioHintWindowSeconds);
+  return (
+    <div className="space-y-5">
+      <Card
+        title={t("Аудио-подсказка «последние секунды»")}
+        description={t(
+          "Кнопка в оверлее отправляет в помощник хвост записи выбранной длины — сколько последних секунд обрезать.",
+        )}
+      >
+        <Slider
+          label={t("Окно обрезки")}
+          value={audioHintWindowSeconds}
+          min={AUDIO_HINT_WINDOW_MIN_SECONDS}
+          max={AUDIO_HINT_WINDOW_MAX_SECONDS}
+          step={1}
+          onChange={setAudioHintWindowSeconds}
+          unit={t("сек")}
+        />
+        <p className="mt-3 text-xs leading-relaxed text-text-muted">
+          {t("Действует сразу, менять можно прямо во время интервью.")}
+        </p>
+      </Card>
+      <AudioQualityCheck />
     </div>
   );
 }
@@ -389,6 +384,7 @@ function LlmSettings({
 function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
   const entries = useDiagnosticsStore((state) => state.entries);
   const clearEntries = useDiagnosticsStore((state) => state.clearEntries);
+  const t = useT();
   const [copied, setCopied] = useState(false);
 
   const stats = useMemo(() => {
@@ -422,14 +418,14 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
   return (
     <div className="space-y-5">
       <Card
-        title="Журнал приложения"
-        description="Служебные события приложения для разбора ошибок запуска, аудио и обращений к сервису."
+        title={t("Журнал приложения")}
+        description={t("Служебные события приложения для разбора ошибок запуска, аудио и обращений к сервису.")}
       >
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="muted">Событий: {entries.length}</Badge>
-          <Badge variant="danger">Ошибки: {stats.error}</Badge>
-          <Badge variant="warning">Предупреждения: {stats.warn}</Badge>
-          <Badge variant="muted">Инфо: {stats.info}</Badge>
+          <Badge variant="muted">{t("Событий: {count}", { count: entries.length })}</Badge>
+          <Badge variant="danger">{t("Ошибки: {count}", { count: stats.error })}</Badge>
+          <Badge variant="warning">{t("Предупреждения: {count}", { count: stats.warn })}</Badge>
+          <Badge variant="muted">{t("Инфо: {count}", { count: stats.info })}</Badge>
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
@@ -441,7 +437,7 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
             }}
             icon={<Copy className="w-3.5 h-3.5" />}
           >
-            {copied ? "Сообщение скопировано" : "Копировать отчет"}
+            {copied ? t("Сообщение скопировано") : t("Копировать отчет")}
           </Button>
           <Button
             variant="ghost"
@@ -450,28 +446,25 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
             icon={<Trash2 className="w-3.5 h-3.5" />}
             disabled={disabled || entries.length === 0}
           >
-            Очистить журнал
+            {t("Очистить журнал")}
           </Button>
         </div>
 
         <p className="mt-4 text-xs text-text-muted leading-relaxed">
-          После воспроизведения проблемы откройте эту вкладку, нажмите
-          "Копировать отчет" и отправьте текст. Так проще найти точный этап
-          сбоя и не гадать по симптомам.
+          {t('После воспроизведения проблемы откройте эту вкладку, нажмите "Копировать отчет" и отправьте текст. Так проще найти точный этап сбоя и не гадать по симптомам.')}
         </p>
 
-        <div className="mt-4 max-h-[420px] space-y-2 overflow-y-auto rounded-xl border border-white/10 bg-bg-primary/30 p-2">
+        <div className="mt-4 max-h-[420px] space-y-2 overflow-y-auto rounded-xl border border-border bg-bg-tertiary/40 p-2">
           {visibleEntries.length === 0 && (
-            <div className="rounded-lg border border-dashed border-white/10 p-3 text-xs text-text-muted">
-              Логов пока нет. Выполните действие (например, старт интервью или
-              отправка подсказки) и откройте вкладку снова.
+            <div className="rounded-lg border border-dashed border-border p-3 text-xs text-text-muted">
+              {t("Логов пока нет. Выполните действие (например, старт интервью или отправка подсказки) и откройте вкладку снова.")}
             </div>
           )}
 
           {visibleEntries.map((entry) => (
             <div
               key={entry.id}
-              className="rounded-lg border border-white/8 bg-black/20 p-3"
+              className="rounded-lg border border-border bg-bg-card p-3"
             >
               <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs">
                 <Badge
@@ -488,7 +481,7 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
                 <span className="text-text-muted">
                   {new Date(entry.timestamp).toLocaleString("ru-RU")}
                 </span>
-                <span className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
+                <span className="rounded bg-black/[0.05] px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
                   {entry.scope}
                 </span>
               </div>
@@ -504,7 +497,7 @@ function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
 
         {entries.length > visibleEntries.length && (
           <p className="mt-3 text-xs text-text-muted">
-            Показаны последние {visibleEntries.length} записей из {entries.length}.
+            {t("Показаны последние {shown} записей из {total}.", { shown: visibleEntries.length, total: entries.length })}
           </p>
         )}
       </Card>
@@ -1062,6 +1055,19 @@ function buildAudioDebugReport(params: {
   return lines.join("\n");
 }
 
+function describeAudioPermission(status: string): { dot: string; text: string; chip: string } {
+  switch (status) {
+    case "granted":
+      return { dot: "bg-success", text: "готово", chip: "border-success/30 bg-success-muted text-success" };
+    case "denied":
+      return { dot: "bg-danger", text: "нет доступа", chip: "border-danger/35 bg-danger-muted text-danger" };
+    case "checking":
+      return { dot: "bg-text-muted animate-pulse", text: "проверка", chip: "border-border bg-bg-tertiary text-text-muted" };
+    default:
+      return { dot: "bg-warning", text: "не проверено", chip: "border-warning/35 bg-warning-muted text-warning" };
+  }
+}
+
 function AudioSettings({
   disabled,
   focusTarget,
@@ -1076,6 +1082,7 @@ function AudioSettings({
     setSystemAudioDeviceId,
   } = useSettingsStore();
   const permissions = useAppStore((state) => state.permissions);
+  const t = useT();
   const [audioDevices, setAudioDevices] = useState<AudioDeviceInfo[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
   const [audioDeviceLoadError, setAudioDeviceLoadError] = useState<string | null>(null);
@@ -1129,7 +1136,7 @@ function AudioSettings({
       setAudioDeviceLoadError(
         error instanceof Error
           ? error.message
-          : "Не удалось загрузить список аудиоустройств.",
+          : t("Не удалось загрузить список аудиоустройств."),
       );
     } finally {
       setLoadingDevices(false);
@@ -1181,7 +1188,7 @@ function AudioSettings({
     if (!micTestActive || micSilentDurationMs < 1800) {
       return null;
     }
-    return "Сигнал почти нулевой уже несколько секунд. Проверьте нужный микрофон, mute и уровень входа в Windows.";
+    return t("Сигнал почти нулевой уже несколько секунд. Проверьте нужный микрофон, mute и уровень входа в Windows.");
   }, [micSilentDurationMs, micTestActive]);
 
   const refreshAudioDebugSnapshot = useCallback(
@@ -1283,14 +1290,14 @@ function AudioSettings({
 
     setAutoProbeRunning(true);
     setAutoProbeMessage(
-      "Говорите обычную фразу 2-3 секунды. Если нужно проверить системный звук, включите звук встречи или видео.",
+      t("Говорите обычную фразу 2-3 секунды. Если нужно проверить системный звук, включите звук встречи или видео."),
     );
 
     try {
       await new Promise((resolve) => window.setTimeout(resolve, 350));
       const { isTauri, probeAudioDevices } = await import("@/lib/tauri");
       if (!isTauri()) {
-        throw new Error("Автонастройка доступна только в desktop-приложении.");
+        throw new Error(t("Автонастройка доступна только в desktop-приложении."));
       }
 
       const result = await probeAudioDevices({
@@ -1308,14 +1315,22 @@ function AudioSettings({
       if (recommendedMic?.has_signal && recommendedMic.device?.id) {
         setMicrophoneDeviceId(recommendedMic.device.id);
         applied.push(
-          `микрофон: ${recommendedMic.device.name} (rms ${Math.round(recommendedMic.rms)}, peak ${recommendedMic.peak_abs})`,
+          t("микрофон: {name} (rms {rms}, peak {peak})", {
+            name: recommendedMic.device.name,
+            rms: Math.round(recommendedMic.rms),
+            peak: recommendedMic.peak_abs,
+          }),
         );
       }
 
       if (recommendedSystem?.has_signal && recommendedSystem.device?.id) {
         setSystemAudioDeviceId(recommendedSystem.device.id);
         applied.push(
-          `системный звук: ${recommendedSystem.device.name} (rms ${Math.round(recommendedSystem.rms)}, peak ${recommendedSystem.peak_abs})`,
+          t("системный звук: {name} (rms {rms}, peak {peak})", {
+            name: recommendedSystem.device.name,
+            rms: Math.round(recommendedSystem.rms),
+            peak: recommendedSystem.peak_abs,
+          }),
         );
       }
 
@@ -1326,15 +1341,19 @@ function AudioSettings({
       });
 
       if (applied.length > 0) {
-        setAutoProbeMessage(`Автонастройка применена: ${applied.join("; ")}.`);
+        setAutoProbeMessage(t("Автонастройка применена: {items}.", { items: applied.join("; ") }));
       } else {
         const bestMic = result.microphone_candidates
           .filter((candidate) => candidate.available)
           .sort((left, right) => right.signal_score - left.signal_score)[0];
         setAutoProbeMessage(
           bestMic
-            ? `Голос не найден. Самый сильный микрофон: ${bestMic.device_name ?? bestMic.device?.name ?? "неизвестно"} (rms ${Math.round(bestMic.rms)}, peak ${bestMic.peak_abs}). Проверьте mute или повторите, говоря в нужный микрофон.`
-            : "Голос не найден ни на одном микрофоне. Проверьте доступ Windows к микрофону и mute.",
+            ? t("Голос не найден. Самый сильный микрофон: {name} (rms {rms}, peak {peak}). Проверьте mute или повторите, говоря в нужный микрофон.", {
+                name: bestMic.device_name ?? bestMic.device?.name ?? t("неизвестно"),
+                rms: Math.round(bestMic.rms),
+                peak: bestMic.peak_abs,
+              })
+            : t("Голос не найден ни на одном микрофоне. Проверьте доступ Windows к микрофону и mute."),
         );
       }
 
@@ -1344,7 +1363,7 @@ function AudioSettings({
       }, 250);
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Не удалось выполнить автонастройку аудио.";
+        error instanceof Error ? error.message : t("Не удалось выполнить автонастройку аудио.");
       setAutoProbeMessage(message);
       logWarn("audio.autoProbe", "Native audio auto-probe failed", error);
     } finally {
@@ -1435,7 +1454,7 @@ function AudioSettings({
     setMicAverageLevel(0);
     setMicSilentDurationMs(0);
     setMicLevel(0);
-    setMicTestMessage("Выбрано другое устройство. Запустите проверку микрофона снова.");
+    setMicTestMessage(t("Выбрано другое устройство. Запустите проверку микрофона снова."));
   }, [microphoneDeviceId, micTestActive, stopMicTest]);
 
   useEffect(() => {
@@ -1455,7 +1474,7 @@ function AudioSettings({
       logInfo("audio.speakerTest", "Выбор устройства вывода изменился, тест остановлен");
     }
     setSpeakerTestDebugInfo(null);
-    setSpeakerTestMessage("Выбрано другое устройство. Запустите проверку динамика снова.");
+    setSpeakerTestMessage(t("Выбрано другое устройство. Запустите проверку динамика снова."));
   }, [speakerTestRunning, stopSpeakerTest, systemAudioDeviceId]);
 
   const startMicTest = useCallback(async () => {
@@ -1471,7 +1490,7 @@ function AudioSettings({
     setMicPeakLevel(0);
     setMicAverageLevel(0);
     setMicSilentDurationMs(0);
-    setMicTestMessage("Запрашиваем доступ к микрофону...");
+    setMicTestMessage(t("Запрашиваем доступ к микрофону..."));
     setMicTestDebugInfo(null);
 
     try {
@@ -1480,10 +1499,10 @@ function AudioSettings({
         !navigator.mediaDevices ||
         typeof navigator.mediaDevices.getUserMedia !== "function"
       ) {
-        throw new Error("Проверка микрофона недоступна в этой среде");
+        throw new Error(t("Проверка микрофона недоступна в этой среде"));
       }
       if (!microphoneUsesWindowsDefault && !selectedMicrophoneDevice) {
-        throw new Error("Выбранный микрофон недоступен");
+        throw new Error(t("Выбранный микрофон недоступен"));
       }
 
       const selectedMicrophone =
@@ -1504,7 +1523,7 @@ function AudioSettings({
           .webkitAudioContext ?? null);
       if (!AudioContextCtor) {
         stream.getTracks().forEach((track) => track.stop());
-        throw new Error("Проверка аудио недоступна в этой среде");
+        throw new Error(t("Проверка аудио недоступна в этой среде"));
       }
 
       const audioContext = new AudioContextCtor();
@@ -1573,10 +1592,12 @@ function AudioSettings({
       });
       setMicTestMessage(
         !microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched
-          ? `Проверка запущена, но окно приложения использует другое устройство: ${track?.label ?? "неизвестно"}.`
+          ? t("Проверка запущена, но окно приложения использует другое устройство: {device}.", {
+              device: track?.label ?? t("неизвестно"),
+            })
           : selectedMicrophone
-          ? `Проверка запущена: ${selectedMicrophone}`
-          : "Проверка запущена. Скажите что-нибудь в микрофон.",
+          ? t("Проверка запущена: {device}", { device: selectedMicrophone })
+          : t("Проверка запущена. Скажите что-нибудь в микрофон."),
       );
       if (!microphoneUsesWindowsDefault && selectedMicrophone && !selectionMatched) {
         logWarn(
@@ -1592,7 +1613,7 @@ function AudioSettings({
       }
     } catch (error) {
       stopMicTest();
-      setMicTestMessage(`Ошибка проверки микрофона: ${toAudioTestErrorMessage(error)}`);
+      setMicTestMessage(t("Ошибка проверки микрофона: {error}", { error: toAudioTestErrorMessage(error) }));
       logWarn("audio.micTest", "Проверка микрофона завершилась ошибкой", error);
     }
   }, [
@@ -1609,7 +1630,7 @@ function AudioSettings({
     }
     stopSpeakerTest();
     setSpeakerTestRunning(true);
-    setSpeakerTestMessage("Воспроизводим тестовый звук...");
+    setSpeakerTestMessage(t("Воспроизводим тестовый звук..."));
     setSpeakerTestDebugInfo(null);
 
     try {
@@ -1618,10 +1639,10 @@ function AudioSettings({
         ((window as unknown as { webkitAudioContext?: typeof AudioContext })
           .webkitAudioContext ?? null);
       if (!AudioContextCtor) {
-        throw new Error("Проверка аудио недоступна в этой среде");
+        throw new Error(t("Проверка аудио недоступна в этой среде"));
       }
       if (!systemAudioUsesWindowsDefault && !selectedSystemAudioDevice) {
-        throw new Error("Выбранный динамик недоступен");
+        throw new Error(t("Выбранный динамик недоступен"));
       }
 
       const selectedOutputName =
@@ -1632,7 +1653,7 @@ function AudioSettings({
         selectedOutputName,
       );
       if (!systemAudioUsesWindowsDefault && !preferredSinkId) {
-        throw new Error("Выбранный динамик недоступен в окне приложения");
+        throw new Error(t("Выбранный динамик недоступен в окне приложения"));
       }
 
       const context = new AudioContextCtor();
@@ -1647,7 +1668,7 @@ function AudioSettings({
       };
       const setSinkIdSupported = typeof withSink.setSinkId === "function";
       if (!systemAudioUsesWindowsDefault && !setSinkIdSupported) {
-        throw new Error("Выбор конкретного динамика недоступен");
+        throw new Error(t("Выбор конкретного динамика недоступен"));
       }
       if (preferredSinkId && setSinkIdSupported) {
         await withSink.setSinkId(preferredSinkId);
@@ -1698,13 +1719,13 @@ function AudioSettings({
         stopSpeakerTest();
         setSpeakerTestMessage(
           selectedOutputName
-            ? `Тест завершен: ${selectedOutputName}`
-            : "Тест завершен. Если звук не слышен, проверьте громкость и устройство вывода Windows.",
+            ? t("Тест завершен: {device}", { device: selectedOutputName })
+            : t("Тест завершен. Если звук не слышен, проверьте громкость и устройство вывода Windows."),
         );
       }, 1100);
     } catch (error) {
       stopSpeakerTest();
-      setSpeakerTestMessage(`Ошибка проверки динамика: ${toAudioTestErrorMessage(error)}`);
+      setSpeakerTestMessage(t("Ошибка проверки динамика: {error}", { error: toAudioTestErrorMessage(error) }));
       logWarn("audio.speakerTest", "Проверка динамика завершилась ошибкой", error);
     }
   }, [
@@ -1715,6 +1736,9 @@ function AudioSettings({
     stopSpeakerTest,
   ]);
 
+  const micStatus = describeAudioPermission(permissions.microphone);
+  const sysStatus = describeAudioPermission(permissions.systemAudio);
+
   return (
     <div className="space-y-5">
       <div
@@ -1722,25 +1746,19 @@ function AudioSettings({
         className={getFocusSectionClass(focusTarget === "audio-devices")}
       >
         <Card
-          title="Аудиоустройства"
-          description="Здесь выбираются микрофон и устройство вывода, которое приложение слушает как системный звук."
+          title={t("Аудиоустройства")}
+          description={t("Микрофон и устройство вывода, которое приложение слушает как системный звук.")}
         >
-          <div className="grid gap-3 md:grid-cols-2">
-            <StatusIndicator
-              status={permissions.microphone}
-              label="Микрофон"
-              description="Запись вашего голоса для локального распознавания."
-            />
-            <StatusIndicator
-              status={permissions.systemAudio}
-              label="Системный звук"
-              description="Звук собеседника с выбранного устройства вывода."
-            />
-          </div>
-
-          <div className="mt-5 grid gap-4 md:grid-cols-2">
+          {/* Device selection with inline status */}
+          <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-1.5">
-              <div className="text-xs text-text-muted uppercase tracking-wider">Микрофон</div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs uppercase tracking-wider text-text-muted">{t("Микрофон")}</span>
+                <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${micStatus.chip}`}>
+                  <span className={`h-1.5 w-1.5 rounded-full ${micStatus.dot}`} />
+                  {t(micStatus.text)}
+                </span>
+              </div>
               <Select
                 value={microphoneDeviceId}
                 onChange={setMicrophoneDeviceId}
@@ -1748,10 +1766,17 @@ function AudioSettings({
                 placeholder=""
                 disabled={controlsDisabled}
               />
+              <p className="text-[11px] leading-relaxed text-text-muted">{t("Записывает ваш голос.")}</p>
             </div>
 
             <div className="space-y-1.5">
-              <div className="text-xs text-text-muted uppercase tracking-wider">Системный звук</div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs uppercase tracking-wider text-text-muted">{t("Системный звук")}</span>
+                <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${sysStatus.chip}`}>
+                  <span className={`h-1.5 w-1.5 rounded-full ${sysStatus.dot}`} />
+                  {t(sysStatus.text)}
+                </span>
+              </div>
               <Select
                 value={systemAudioDeviceId}
                 onChange={setSystemAudioDeviceId}
@@ -1759,23 +1784,28 @@ function AudioSettings({
                 placeholder=""
                 disabled={controlsDisabled}
               />
+              <p className="text-[11px] leading-relaxed text-text-muted">{t("Слышит голос собеседника.")}</p>
             </div>
           </div>
 
-          <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs text-text-muted leading-relaxed">
-            Если оставить режим по умолчанию, приложение возьмет текущие устройства Windows.
-            Если выбрать конкретные устройства, во время интервью будут использоваться именно они.
-          </div>
+          <p className="mt-4 text-xs leading-relaxed text-text-muted">
+            {t("По умолчанию берутся текущие устройства Windows. Выберите конкретные — и на интервью будут использоваться именно они.")}
+          </p>
 
-          <div className="mt-4 rounded-lg border border-accent/25 bg-accent/8 p-3">
-            <div className="flex flex-wrap items-center gap-2">
+          {/* Testing */}
+          <div className="mt-5 border-t border-border pt-5">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h4 className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">
+                {t("Проверка")}
+              </h4>
               <Button
-                variant="secondary"
+                variant="ghost"
                 size="sm"
                 disabled={controlsDisabled || autoProbeRunning}
                 onClick={() => {
                   void handleAutoProbeAudio();
                 }}
+                title={t("Проверяет реальные устройства, которые используются во время интервью.")}
                 icon={
                   autoProbeRunning ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1784,53 +1814,46 @@ function AudioSettings({
                   )
                 }
               >
-                {autoProbeRunning ? "Ищем устройства..." : "Автонастройка аудио"}
+                {autoProbeRunning ? t("Проверяем...") : t("Автонастройка")}
               </Button>
-              <span className="text-xs leading-relaxed text-text-muted">
-                Проверяет реальные native-устройства, которые используются во время интервью.
-              </span>
             </div>
+
             {autoProbeMessage && (
-              <div className="mt-2 text-xs leading-relaxed text-text-secondary">
+              <div className="mb-3 rounded-lg border border-border bg-bg-secondary/60 px-3 py-2 text-xs leading-relaxed text-text-secondary">
                 {autoProbeMessage}
               </div>
             )}
-          </div>
 
-          <div className="mt-4 rounded-lg border border-border bg-bg-secondary p-3">
-            <div className="text-xs text-text-muted uppercase tracking-wider">
-              Проверка устройств
-            </div>
-            <div className="mt-3 grid gap-3 md:grid-cols-2">
-              <div className="rounded-lg border border-border bg-bg-primary/50 p-3">
-                <div className="flex items-center gap-2 text-sm text-text-secondary">
+            <div className="grid gap-3 md:grid-cols-2">
+              {/* Mic test */}
+              <div className="rounded-xl border border-border bg-bg-secondary/50 p-4">
+                <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
                   <Mic className="h-4 w-4 text-accent" />
-                  Микрофон
+                  {t("Микрофон")}
                 </div>
-                <div className="mt-2 h-2 overflow-hidden rounded-full bg-bg-tertiary">
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-bg-tertiary">
                   <div
-                    className="h-full bg-accent transition-all duration-150"
+                    className="h-full rounded-full bg-accent transition-all duration-150"
                     style={{ width: `${Math.round(micLevel * 100)}%` }}
                   />
                 </div>
-                <div className="mt-1 text-xs text-text-muted">
-                  Уровень: {Math.round(micLevel * 100)}%
-                </div>
-                <div className="mt-1 text-xs text-text-muted">
-                  Пик: {Math.round(micPeakLevel * 100)}% · Средний: {Math.round(micAverageLevel * 100)}%
-                </div>
-                <div className="mt-1 text-xs text-text-muted">
-                  Тишина: {Math.round(micSilentDurationMs / 100) / 10} c
+                <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-text-muted">
+                  <span className="font-medium text-text-secondary">
+                    {t("Уровень {percent}%", { percent: Math.round(micLevel * 100) })}
+                  </span>
+                  <span className="tabular-nums">
+                    {t("пик {peak}% · сред {avg}% · тишина {silence}c", {
+                      peak: Math.round(micPeakLevel * 100),
+                      avg: Math.round(micAverageLevel * 100),
+                      silence: Math.round(micSilentDurationMs / 100) / 10,
+                    })}
+                  </span>
                 </div>
                 {micSilenceHint && (
-                  <div className="mt-2 text-xs leading-relaxed text-warning">
-                    {micSilenceHint}
-                  </div>
+                  <div className="mt-2 text-[11px] leading-relaxed text-warning">{micSilenceHint}</div>
                 )}
                 {micTestMessage && (
-                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
-                    {micTestMessage}
-                  </div>
+                  <div className="mt-2 text-[11px] leading-relaxed text-text-muted">{micTestMessage}</div>
                 )}
                 <div className="mt-3">
                   <Button
@@ -1840,28 +1863,29 @@ function AudioSettings({
                     onClick={() => {
                       if (micTestActive) {
                         stopMicTest();
-                        setMicTestMessage("Проверка микрофона остановлена.");
+                        setMicTestMessage(t("Проверка микрофона остановлена."));
                         logInfo("audio.micTest", "Проверка микрофона остановлена вручную");
                         return;
                       }
                       void startMicTest();
                     }}
                   >
-                    {micTestActive ? "Остановить проверку" : "Проверить микрофон"}
+                    {micTestActive ? t("Остановить") : t("Проверить микрофон")}
                   </Button>
                 </div>
               </div>
 
-              <div className="rounded-lg border border-border bg-bg-primary/50 p-3">
-                <div className="flex items-center gap-2 text-sm text-text-secondary">
+              {/* Speaker test */}
+              <div className="rounded-xl border border-border bg-bg-secondary/50 p-4">
+                <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
                   <Volume2 className="h-4 w-4 text-accent" />
-                  Динамик
+                  {t("Динамик")}
                 </div>
-                <div className="mt-2 text-xs leading-relaxed text-text-muted">
-                  Нажмите кнопку, и приложение воспроизведет короткий двойной сигнал.
+                <div className="mt-2 text-[11px] leading-relaxed text-text-muted">
+                  {t("Воспроизведёт короткий двойной сигнал на выбранном устройстве.")}
                 </div>
                 {speakerTestMessage && (
-                  <div className="mt-2 text-xs leading-relaxed text-text-muted">
+                  <div className="mt-2 text-[11px] leading-relaxed text-text-muted">
                     {speakerTestMessage}
                   </div>
                 )}
@@ -1874,7 +1898,7 @@ function AudioSettings({
                       void runSpeakerTest();
                     }}
                   >
-                    {speakerTestRunning ? "Тестируем..." : "Проверить динамик"}
+                    {speakerTestRunning ? t("Тестируем...") : t("Проверить динамик")}
                   </Button>
                 </div>
               </div>
@@ -1882,7 +1906,7 @@ function AudioSettings({
           </div>
 
           {audioDeviceLoadError && (
-            <p className="mt-3 text-xs text-warning leading-relaxed">{audioDeviceLoadError}</p>
+            <p className="mt-3 text-xs leading-relaxed text-warning">{audioDeviceLoadError}</p>
           )}
         </Card>
       </div>
@@ -1902,10 +1926,12 @@ function LanguageSettings({
   const {
     primaryLanguage,
     secondaryLanguage,
+    appLanguage,
     primarySttVariant,
     secondarySttVariant,
     setPrimaryLanguage,
     setSecondaryLanguage,
+    setAppLanguage,
     setPrimarySttVariant,
     setSecondarySttVariant,
     hotkeys,
@@ -1921,6 +1947,7 @@ function LanguageSettings({
     readiness,
     setReadiness,
   } = useAppStore();
+  const t = useT();
 
   const [models, setModels] = useState<VoskModelOption[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1958,7 +1985,7 @@ function LanguageSettings({
       setError(
         modelsResult.reason instanceof Error
           ? modelsResult.reason.message
-          : "Не удалось загрузить настройки голосового движка.",
+          : t("Не удалось загрузить настройки голосового движка."),
       );
     }
 
@@ -1994,7 +2021,7 @@ function LanguageSettings({
     if (!isTauri()) {
       const detail =
         "Подготовка распознавания доступна только в приложении. Откройте установленную версию, а не вкладку браузера.";
-      setError(detail);
+      setError(t(detail));
       logWarn("speech.install", "Speech module install requested outside desktop app", { detail });
       return false;
     }
@@ -2013,7 +2040,7 @@ function LanguageSettings({
       contentLength: null,
       speedBytesPerSecond: null,
       etaSeconds: null,
-      detail: "Устанавливаем компоненты распознавания...",
+      detail: t("Устанавливаем компоненты распознавания..."),
       language: null,
       variant: null,
     });
@@ -2037,18 +2064,18 @@ function LanguageSettings({
           etaSeconds: metrics.etaSeconds,
           detail:
             progress.phase === "downloading"
-              ? "Скачиваем компоненты распознавания..."
-              : "Распаковываем компоненты распознавания...",
+              ? t("Скачиваем компоненты распознавания...")
+              : t("Распаковываем компоненты распознавания..."),
           language: null,
           variant: null,
         });
       });
-      setSuccess("Компоненты распознавания установлены.");
+      setSuccess(t("Компоненты распознавания установлены."));
       await refresh();
       return true;
     } catch (err: unknown) {
       if (isInstallОтменаledError(err)) {
-        setSuccess("Подготовка распознавания отменена.");
+        setSuccess(t("Подготовка распознавания отменена."));
         setError(null);
         return false;
       }
@@ -2060,7 +2087,7 @@ function LanguageSettings({
         networkHint ||
           (err instanceof Error
             ? err.message
-            : "Не удалось установить компоненты распознавания."),
+            : t("Не удалось установить компоненты распознавания.")),
       );
       return false;
     } finally {
@@ -2080,7 +2107,7 @@ function LanguageSettings({
       if (!isTauri()) {
         const detail =
           "Установка профиля распознавания доступна только в приложении. Откройте установленную версию, а не вкладку браузера.";
-        setError(detail);
+        setError(t(detail));
         logWarn("speech.install", "Speech profile install requested outside desktop app", {
           language,
           variant,
@@ -2105,14 +2132,14 @@ function LanguageSettings({
           model = getModelByVariant(latestModels, language, variant);
         } catch (err: unknown) {
           setError(
-            err instanceof Error ? err.message : "Не удалось обновить список профилей распознавания.",
+            err instanceof Error ? err.message : t("Не удалось обновить список профилей распознавания."),
           );
           return false;
         }
       }
       if (!model) {
         setError(
-          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
+          t("Точный профиль недоступен для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return false;
       }
@@ -2137,7 +2164,7 @@ function LanguageSettings({
         contentLength: null,
         speedBytesPerSecond: null,
         etaSeconds: null,
-        detail: `Устанавливаем ${getVariantDisplayName(variant)} профиль...`,
+        detail: t("Устанавливаем точный профиль..."),
         language,
         variant,
       });
@@ -2177,8 +2204,8 @@ function LanguageSettings({
               etaSeconds: metrics.etaSeconds,
               detail:
                 progress.phase === "downloading"
-                  ? `Скачиваем ${getVariantDisplayName(variant)} профиль...`
-                  : `Распаковываем ${getVariantDisplayName(variant)} профиль...`,
+                  ? t("Скачиваем точный профиль...")
+                  : t("Распаковываем точный профиль..."),
               language,
               variant,
             });
@@ -2187,19 +2214,19 @@ function LanguageSettings({
         );
 
         setSuccess(
-          `Точный профиль установлен для языка ${getLanguageLabel(language)}.`,
+          t("Точный профиль установлен для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return true;
       } catch (err: unknown) {
         if (isInstallОтменаledError(err)) {
-          setSuccess("Установка точного профиля отменена.");
+          setSuccess(t("Установка точного профиля отменена."));
           setError(null);
           return false;
         }
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось установить точный профиль для языка ${getLanguageLabel(language)}.`,
+            : t("Не удалось установить точный профиль для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return false;
       } finally {
@@ -2224,7 +2251,7 @@ function LanguageSettings({
         await import("@/lib/tauri");
       if (!isTauri()) {
         setError(
-          "Установка из ZIP доступна только в приложении. Откройте установленную версию, а не вкладку браузера.",
+          t("Установка из ZIP доступна только в приложении. Откройте установленную версию, а не вкладку браузера."),
         );
         return false;
       }
@@ -2247,14 +2274,14 @@ function LanguageSettings({
           setError(
             err instanceof Error
               ? err.message
-              : "Не удалось обновить список профилей распознавания.",
+              : t("Не удалось обновить список профилей распознавания."),
           );
           return false;
         }
       }
       if (!model) {
         setError(
-          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
+          t("Точный профиль недоступен для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return false;
       }
@@ -2276,7 +2303,7 @@ function LanguageSettings({
         contentLength: model.size_mb > 0 ? model.size_mb * 1024 * 1024 : null,
         speedBytesPerSecond: null,
         etaSeconds: null,
-        detail: `Устанавливаем ${getVariantDisplayName(variant)} профиль из ZIP...`,
+        detail: t("Устанавливаем точный профиль из ZIP..."),
         language,
         variant,
       });
@@ -2302,7 +2329,7 @@ function LanguageSettings({
               contentLength: estimatedContentLength,
               speedBytesPerSecond: metrics.speedBytesPerSecond,
               etaSeconds: metrics.etaSeconds,
-              detail: `Распаковываем ${getVariantDisplayName(variant)} профиль из выбранного ZIP...`,
+              detail: t("Распаковываем точный профиль из выбранного ZIP..."),
               language,
               variant,
             });
@@ -2311,19 +2338,19 @@ function LanguageSettings({
         );
 
         setSuccess(
-          `Точный профиль установлен из ZIP для языка ${getLanguageLabel(language)}.`,
+          t("Точный профиль установлен из ZIP для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return true;
       } catch (err: unknown) {
         if (isInstallОтменаledError(err)) {
-          setSuccess("Установка точного профиля отменена.");
+          setSuccess(t("Установка точного профиля отменена."));
           setError(null);
           return false;
         }
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось установить точный профиль из ZIP.`,
+            : t("Не удалось установить точный профиль из ZIP."),
         );
         return false;
       } finally {
@@ -2354,12 +2381,12 @@ function LanguageSettings({
       } else {
         const opened = window.open(url, "_blank", "noopener,noreferrer");
         if (!opened) {
-          throw new Error(`Браузер заблокировал открытие ссылки: ${url}`);
+          throw new Error(t("Браузер заблокировал открытие ссылки: {url}", { url }));
         }
       }
-      setSuccess("Открыли ссылку на ZIP в браузере.");
+      setSuccess(t("Открыли ссылку на ZIP в браузере."));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : `Не удалось открыть ссылку: ${url}`);
+      setError(err instanceof Error ? err.message : t("Не удалось открыть ссылку: {url}", { url }));
     }
   }, []);
 
@@ -2370,12 +2397,12 @@ function LanguageSettings({
     try {
       await navigator.clipboard.writeText(url);
       setCopiedModelDownloadUrl(url);
-      setSuccess("Ссылка на ZIP скопирована. Ее можно открыть в браузере или менеджере загрузок.");
+      setSuccess(t("Ссылка на ZIP скопирована. Ее можно открыть в браузере или менеджере загрузок."));
     } catch (err: unknown) {
       setError(
         err instanceof Error
           ? err.message
-          : "Не удалось скопировать ссылку на ZIP.",
+          : t("Не удалось скопировать ссылку на ZIP."),
       );
     }
   }, []);
@@ -2404,12 +2431,12 @@ function LanguageSettings({
         } else if (language === secondaryLanguage) {
           setSecondarySttVariant("large");
         }
-        setSuccess(`Точный профиль удален для языка ${getLanguageLabel(language)}.`);
+        setSuccess(t("Точный профиль удален для языка {lang}.", { lang: getLanguageLabel(language) }));
       } catch (err: unknown) {
         setError(
           err instanceof Error
             ? err.message
-            : `Не удалось удалить точный профиль для языка ${getLanguageLabel(language)}.`,
+            : t("Не удалось удалить точный профиль для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
       } finally {
         setActiveModelOperation(null);
@@ -2467,7 +2494,10 @@ function LanguageSettings({
       if (shouldQueue) {
         enqueueSttInstallTask({ language, variant });
         setSuccess(
-          `${variant === "large" ? "Точный" : "Быстрый"} профиль для языка ${getLanguageLabel(language)} добавлен в очередь.`,
+          t("{quality} профиль для языка {lang} добавлен в очередь.", {
+            quality: variant === "large" ? t("Точный") : t("Быстрый"),
+            lang: getLanguageLabel(language),
+          }),
         );
         return true;
       }
@@ -2519,7 +2549,7 @@ function LanguageSettings({
   const handleОтменаInstall = useCallback(async () => {
     clearSttInstallQueue();
     if (!sttInstall.active) {
-      setSuccess("Очередь установки очищена.");
+      setSuccess(t("Очередь установки очищена."));
       return;
     }
 
@@ -2527,7 +2557,7 @@ function LanguageSettings({
     setError(null);
     setSuccess(null);
     setSttInstall({
-      detail: "Отменяем установку...",
+      detail: t("Отменяем установку..."),
     });
 
     try {
@@ -2535,10 +2565,10 @@ function LanguageSettings({
       if (isTauri()) {
         await cancelVoskInstall();
       }
-      setSuccess("Запрос на отмену отправлен.");
+      setSuccess(t("Запрос на отмену отправлен."));
     } catch (err: unknown) {
       setError(
-        err instanceof Error ? err.message : "Не удалось отменить установку.",
+        err instanceof Error ? err.message : t("Не удалось отменить установку."),
       );
     } finally {
       setОтменаingInstall(false);
@@ -2554,7 +2584,7 @@ function LanguageSettings({
       const model = getModelByVariant(models, language, variant);
       if (!model) {
         setError(
-          `Точный профиль недоступен для языка ${getLanguageLabel(language)}.`,
+          t("Точный профиль недоступен для языка {lang}.", { lang: getLanguageLabel(language) }),
         );
         return;
       }
@@ -2569,7 +2599,10 @@ function LanguageSettings({
       markManualSttProfileOverride();
       setVariant(variant);
       setSuccess(
-        `Профиль для языка ${getLanguageLabel(language)}: ${variant === "large" ? "точный" : "быстрый"}.`,
+        t("Профиль для языка {lang}: {quality}.", {
+          lang: getLanguageLabel(language),
+          quality: variant === "large" ? t("точный") : t("быстрый"),
+        }),
       );
     },
     [models, requestModelInstall],
@@ -2592,8 +2625,8 @@ function LanguageSettings({
       speedBytesPerSecond: null,
       etaSeconds: null,
       detail: readiness.voskRuntimeLoaded
-        ? "Проверяем русский пакет распознавания..."
-        : "Запускаем установку компонентов распознавания...",
+        ? t("Проверяем русский пакет распознавания...")
+        : t("Запускаем установку компонентов распознавания..."),
       language: readiness.voskRuntimeLoaded ? primaryLanguage : null,
       variant: readiness.voskRuntimeLoaded ? "large" : null,
     });
@@ -2621,7 +2654,7 @@ function LanguageSettings({
       }
 
       await refresh();
-      setSuccess("Компоненты распознавания и точный русский профиль установлены.");
+      setSuccess(t("Компоненты распознавания и точный русский профиль установлены."));
     } finally {
       setBootstrapInstalling(false);
       clearSttInstall();
@@ -2651,7 +2684,7 @@ function LanguageSettings({
         setSecondaryLanguage("none");
       }
       setPrimarySttVariant("large");
-      setSuccess(`Точный профиль для языка ${getLanguageLabel(value)} будет установлен автоматически.`);
+      setSuccess(t("Точный профиль для языка {lang} будет установлен автоматически.", { lang: getLanguageLabel(value) }));
     },
     [
       primaryLanguage,
@@ -2678,7 +2711,7 @@ function LanguageSettings({
 
       setSecondaryLanguage(value);
       setSecondarySttVariant("large");
-      setSuccess(`Точный профиль для языка ${getLanguageLabel(value)} будет установлен автоматически.`);
+      setSuccess(t("Точный профиль для языка {lang} будет установлен автоматически.", { lang: getLanguageLabel(value) }));
     },
     [secondaryLanguage, setSecondaryLanguage, setSecondarySttVariant],
   );
@@ -2750,14 +2783,14 @@ function LanguageSettings({
           : "muted";
   const selectedPrimaryModelStatusLabel =
     selectedPrimaryModelInstalling
-      ? "Устанавливается"
+      ? t("Устанавливается")
       : selectedPrimaryModelQueued
-        ? "В очереди"
+        ? t("В очереди")
         : selectedPrimaryModelInstalled
-          ? "Установлена"
+          ? t("Установлена")
           : selectedPrimaryModel === null
-            ? "Недоступна"
-          : "Нужно установить";
+            ? t("Недоступна")
+          : t("Нужно установить");
   const activeInstallTransferLabel = formatTransferDiagnostics(
     sttInstall.bytesDownloaded,
     sttInstall.contentLength,
@@ -2766,29 +2799,29 @@ function LanguageSettings({
   );
   const activeInstallTitle =
     sttInstall.phase === "runtime"
-      ? "Устанавливаем распознавание"
-      : "Скачиваем точный русский профиль";
+      ? t("Устанавливаем распознавание")
+      : t("Скачиваем точный русский профиль");
   const activeInstallHint =
     sttInstall.phase === "model" && sttInstall.variant === "large"
-      ? "Источник: e-rd.ru. Точный профиль весит около 1.8 ГБ, поэтому на медленном интернете установка может занять несколько минут."
-      : "Источник: e-rd.ru. Если процент пару секунд стоит на 0%, это нормально: соединение и размер архива еще подготавливаются.";
+      ? t("Источник: e-rd.ru. Точный профиль весит около 1.8 ГБ, поэтому на медленном интернете установка может занять несколько минут.")
+      : t("Источник: e-rd.ru. Если процент пару секунд стоит на 0%, это нормально: соединение и размер архива еще подготавливаются.");
   const voskInstallBusy = bootstrapInstalling || runtimeInstalling || sttInstall.active;
   const voskInstallButtonLabel = voskInstallBusy
-    ? "Устанавливаем..."
+    ? t("Устанавливаем...")
     : runtimeNeedsInstall
-      ? "Установить распознавание"
+      ? t("Установить распознавание")
       : selectedPrimaryModelMissing
-        ? `Установить ${selectedPrimaryModelLabel}`
-        : "Проверить";
+        ? t("Установить {label}", { label: selectedPrimaryModelLabel })
+        : t("Проверить");
   const voskInstallHint = runtimeNeedsInstall
-    ? "Не хватает компонентов распознавания. Точный профиль уже может быть установлен отдельно."
+    ? t("Не хватает компонентов распознавания. Точный профиль уже может быть установлен отдельно.")
     : selectedPrimaryModelMissing
-      ? `Не хватает выбранного профиля ${selectedPrimaryModelLabel}. Без него распознавание не запустится.`
-      : "Компоненты на диске есть, но готовность еще не подтверждена. Нажмите, чтобы перепроверить состояние.";
+      ? t("Не хватает выбранного профиля {label}. Без него распознавание не запустится.", { label: selectedPrimaryModelLabel })
+      : t("Компоненты на диске есть, но готовность еще не подтверждена. Нажмите, чтобы перепроверить состояние.");
   const voskStatusDetail =
     readiness.vosk === "granted"
-      ? "Распознавание готово: микрофон и системный звук можно использовать."
-      : "Нужно установить компоненты распознавания и выбранный русский профиль.";
+      ? t("Распознавание готово: микрофон и системный звук можно использовать.")
+      : t("Нужно установить компоненты распознавания и выбранный русский профиль.");
   const currentQualityProfile = useMemo(
     () => resolveSttQualityProfile(primarySttVariant, secondarySttVariant),
     [primarySttVariant, secondarySttVariant],
@@ -2798,7 +2831,7 @@ function LanguageSettings({
     formatHotkey(
       hotkeys.find((item) => item.action === "switch_stt_language")?.keys ?? [],
     ) ||
-    "Не задано";
+    t("Не задано");
 
   const primaryLanguageOptions = APP_LANGUAGE_OPTIONS.map((option) => ({
     value: option.code,
@@ -2806,7 +2839,7 @@ function LanguageSettings({
   }));
 
   const secondaryLanguageOptions: { value: SecondaryLanguage; label: string }[] = [
-    { value: "none", label: "Без дополнительного языка" },
+    { value: "none", label: t("Без дополнительного языка") },
     ...APP_LANGUAGE_OPTIONS.filter((option) => option.code !== primaryLanguage).map(
       (option) => ({
         value: option.code,
@@ -2837,11 +2870,28 @@ function LanguageSettings({
       {isLanguageSection && (
         <>
           <Card
-            title="Язык собеседования"
-            description="Основной язык распознавания речи."
+            title={t("Язык приложения")}
+            description={t("Язык интерфейса приложения. Язык собеседования настраивается отдельно ниже.")}
           >
             <div className="space-y-1.5">
-              <div className="text-xs text-text-muted uppercase tracking-wider">Основной язык</div>
+              <div className="text-xs text-text-muted uppercase tracking-wider">{t("Язык интерфейса")}</div>
+              <Select
+                value={appLanguage}
+                onChange={(value) => setAppLanguage(value === "en" ? "en" : "ru")}
+                options={[
+                  { value: "ru", label: t("Русский") },
+                  { value: "en", label: "English" },
+                ]}
+              />
+            </div>
+          </Card>
+
+          <Card
+            title={t("Язык собеседования")}
+            description={t("Основной язык распознавания речи.")}
+          >
+            <div className="space-y-1.5">
+              <div className="text-xs text-text-muted uppercase tracking-wider">{t("Основной язык")}</div>
               <Select
                 value={primaryLanguage}
                 onChange={(value) => {
@@ -2853,17 +2903,16 @@ function LanguageSettings({
             </div>
 
             <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
-              Собеседование начнется с языка <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>.
-              Дополнительные языковые режимы и ручное переключение доступны ниже.
+              {t("Собеседование начнется с языка")} <span className="text-text-primary">{getLanguageLabel(primaryLanguage)}</span>{t(". Дополнительные языковые режимы и ручное переключение доступны ниже.")}
             </div>
           </Card>
 
           <Card
-            title="Дополнительные языки"
-            description="Второй язык и ручное переключение во время собеседования."
+            title={t("Дополнительные языки")}
+            description={t("Второй язык и ручное переключение во время собеседования.")}
           >
             <div className="space-y-1.5">
-              <div className="text-xs text-text-muted uppercase tracking-wider">Второй язык</div>
+              <div className="text-xs text-text-muted uppercase tracking-wider">{t("Второй язык")}</div>
               <Select
                 value={secondaryLanguage}
                 onChange={(value) => {
@@ -2878,7 +2927,7 @@ function LanguageSettings({
             </div>
 
             <div className="mt-4 p-3 rounded-lg border border-border bg-bg-secondary text-xs text-text-muted leading-relaxed">
-              Горячая клавиша переключения языка:{" "}
+              {t("Горячая клавиша переключения языка:")}{" "}
               <kbd className="mx-1 px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-[10px] font-mono text-text-primary">
                 {switchHotkeyLabel}
               </kbd>
@@ -2894,17 +2943,17 @@ function LanguageSettings({
             className={getFocusSectionClass(focusTarget === "language-runtime")}
           >
             <Card
-              title="Распознавание речи"
-              description="Локальное распознавание микрофона и системного звука на русском."
+              title={t("Распознавание речи")}
+              description={t("Локальное распознавание микрофона и системного звука на русском.")}
             >
               <StatusIndicator
                 status={readiness.vosk}
-                label="Распознавание"
+                label={t("Распознавание")}
                 description={voskStatusDetail}
               />
 
               {runtimeNetworkHint && (
-                <p className="mt-3 text-xs leading-relaxed text-warning">{runtimeNetworkHint}</p>
+                <p className="mt-3 text-xs leading-relaxed text-warning">{t(runtimeNetworkHint)}</p>
               )}
 
               <div className="mt-4 flex items-center gap-2">
@@ -2918,14 +2967,16 @@ function LanguageSettings({
                     icon={runtimeInstalling ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
                   >
                     {runtimeInstalling
-                      ? `Устанавливаем${runtimeInstallProgress !== null ? ` ${runtimeInstallProgress}%` : "..."}` 
+                      ? runtimeInstallProgress !== null
+                        ? t("Устанавливаем {percent}%", { percent: runtimeInstallProgress })
+                        : t("Устанавливаем...")
                       : runtimeNeedsInstall
-                        ? "Установить распознавание"
-                        : "Обновить до стабильной версии"}
+                        ? t("Установить распознавание")
+                        : t("Обновить до стабильной версии")}
                   </Button>
                 ) : (
                   <Badge variant={showLatestRuntimeVersion ? "success" : "muted"}>
-                    Компоненты установлены
+                    {t("Компоненты установлены")}
                   </Badge>
                 )}
                 {selectedPrimaryModelMissing && (
@@ -2939,7 +2990,7 @@ function LanguageSettings({
                     }}
                     disabled={disabled || runtimeInstalling || sttInstall.active}
                   >
-                    Установить {selectedPrimaryModelLabel}
+                    {t("Установить {label}", { label: selectedPrimaryModelLabel })}
                     {selectedPrimaryModelSizeMb !== null ? ` (${selectedPrimaryModelSizeMb} MB)` : ""}
                   </Button>
                 )}
@@ -2947,14 +2998,14 @@ function LanguageSettings({
 
               {selectedPrimaryModelMissing && (
                 <div className="mt-3 rounded-lg border border-warning/30 bg-warning-muted p-3 text-xs leading-relaxed text-warning">
-                  Выбранный профиль {selectedPrimaryModelLabel} еще не установлен. Без него распознавание не запустится.
+                  {t("Выбранный профиль {label} еще не установлен. Без него распознавание не запустится.", { label: selectedPrimaryModelLabel })}
                 </div>
               )}
 
               {runtimeInstalling && (
                 <div className="mt-3 space-y-2">
                   <ProgressBar
-                    label="Устанавливаем компоненты распознавания..."
+                    label={t("Устанавливаем компоненты распознавания...")}
                     percent={runtimeInstallProgress}
                   />
                   <div className="flex justify-end">
@@ -2966,7 +3017,7 @@ function LanguageSettings({
                       }}
                       disabled={cancelingInstall}
                     >
-                      {cancelingInstall ? "Отменяем..." : "Отмена"}
+                      {cancelingInstall ? t("Отменяем...") : t("Отмена")}
                     </Button>
                   </div>
                 </div>
@@ -2979,8 +3030,8 @@ function LanguageSettings({
             className={getFocusSectionClass(focusTarget === "language-models")}
           >
             <Card
-              title="Профиль распознавания"
-              description="Русское распознавание работает через точный профиль Large."
+              title={t("Профиль распознавания")}
+              description={t("Русское распознавание работает через точный профиль Large.")}
               className="mb-4"
             >
               <div className="grid gap-2 sm:grid-cols-2">
@@ -3003,11 +3054,11 @@ function LanguageSettings({
                       <div className="flex items-center justify-between gap-2">
                         <div className="text-sm font-semibold text-text-primary">{profile.label}</div>
                         <Badge variant={selected ? "success" : "muted"}>
-                          {selected ? "Активен" : "Выбрать"}
+                          {selected ? t("Активен") : t("Выбрать")}
                         </Badge>
                       </div>
                       <p className="mt-1.5 text-xs leading-relaxed text-text-secondary">
-                        Точнее распознает русский голос, но пакет тяжелее и запускается дольше.
+                        {t("Точнее распознает русский голос, но пакет тяжелее и запускается дольше.")}
                       </p>
                     </button>
                   );
@@ -3016,18 +3067,18 @@ function LanguageSettings({
             </Card>
 
             <Card
-              title="Русский пакет"
-              description="Для релиза оставляем один точный русский профиль Large."
+              title={t("Русский пакет")}
+              description={t("Для релиза оставляем один точный русский профиль Large.")}
             >
               {sttInstall.active && (
-                <div className="mb-4 rounded-xl border border-accent/30 bg-accent/8 p-4 shadow-[0_0_30px_rgba(87,208,255,0.08)]">
+                <div className="mb-4 rounded-xl border border-accent/30 bg-accent/8 p-4 shadow-[0_0_30px_rgba(0,108,250,0.1)]">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="text-sm font-semibold text-text-primary">
                         {activeInstallTitle}
                       </div>
                       <p className="mt-1 text-xs leading-relaxed text-text-secondary">
-                        {sttInstall.detail || "Подготавливаем распознавание..."}
+                        {sttInstall.detail || t("Подготавливаем распознавание...")}
                       </p>
                       <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
                         {activeInstallHint}
@@ -3042,7 +3093,7 @@ function LanguageSettings({
 
                   <div className="mt-3">
                     <ProgressBar
-                      label={activeInstallTransferLabel ?? "Ожидаем первые данные загрузки..."}
+                      label={activeInstallTransferLabel ?? t("Ожидаем первые данные загрузки...")}
                       percent={sttInstall.percent}
                     />
                   </div>
@@ -3050,11 +3101,11 @@ function LanguageSettings({
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-muted">
                     <span>
                       {activeInstallTransferLabel
-                        ? "Загрузка идет. После скачивания приложение распакует пакет автоматически."
-                        : "Кнопку можно не нажимать повторно: установка уже запущена."}
+                        ? t("Загрузка идет. После скачивания приложение распакует пакет автоматически.")
+                        : t("Кнопку можно не нажимать повторно: установка уже запущена.")}
                     </span>
                     {sttInstallQueue.length > 0 && (
-                      <span className="text-warning">В очереди: {sttInstallQueue.length}</span>
+                      <span className="text-warning">{t("В очереди: {count}", { count: sttInstallQueue.length })}</span>
                     )}
                   </div>
 
@@ -3067,7 +3118,7 @@ function LanguageSettings({
                       }}
                       disabled={cancelingInstall}
                     >
-                      {cancelingInstall ? "Отменяем..." : "Отменить установку"}
+                      {cancelingInstall ? t("Отменяем...") : t("Отменить установку")}
                     </Button>
                   </div>
                 </div>
@@ -3076,7 +3127,7 @@ function LanguageSettings({
               {!voskReady && !sttInstall.active && (
                 <div className="mb-4 p-3 rounded-lg border border-warning/30 bg-warning-muted flex items-center justify-between gap-3">
                   <div className="text-xs text-warning leading-relaxed">
-                    <div className="font-semibold">Распознавание еще не полностью готово.</div>
+                    <div className="font-semibold">{t("Распознавание еще не полностью готово.")}</div>
                     <div className="mt-1">{voskInstallHint}</div>
                   </div>
                   <Button
@@ -3109,7 +3160,7 @@ function LanguageSettings({
                       )}
                     </div>
                     <p className="mt-1 text-xs leading-relaxed text-text-muted">
-                      Более точное распознавание, пакет тяжелее.
+                      {t("Более точное распознавание, пакет тяжелее.")}
                     </p>
                   </div>
 
@@ -3129,8 +3180,8 @@ function LanguageSettings({
                       }
                     >
                       {selectedPrimaryModelQueued
-                        ? "В очереди"
-                        : `Установить ${selectedPrimaryModelLabel}${
+                        ? t("В очереди")
+                        : `${t("Установить {label}", { label: selectedPrimaryModelLabel })}${
                             selectedPrimaryModelSizeMb !== null
                               ? ` (${selectedPrimaryModelSizeMb} MB)`
                               : ""
@@ -3149,7 +3200,7 @@ function LanguageSettings({
                           void openModelDownloadUrl(selectedPrimaryModel.download_url);
                         }}
                       >
-                        Скачать вручную
+                        {t("Скачать вручную")}
                       </Button>
                       <Button
                         variant="ghost"
@@ -3160,8 +3211,8 @@ function LanguageSettings({
                         }}
                       >
                         {copiedModelDownloadUrl === selectedPrimaryModel.download_url
-                          ? "Ссылка скопирована"
-                          : "Скопировать ссылку"}
+                          ? t("Ссылка скопирована")
+                          : t("Скопировать ссылку")}
                       </Button>
                       <Button
                         variant="secondary"
@@ -3171,29 +3222,28 @@ function LanguageSettings({
                         }}
                         disabled={disabled || runtimeInstalling || sttInstall.active}
                       >
-                        Установить из файла
+                        {t("Установить из файла")}
                       </Button>
                     </div>
                     <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
-                      Если встроенная загрузка идет медленно, скачайте архив браузером или менеджером
-                      загрузок, затем выберите этот файл здесь. Распаковывать вручную не нужно.
+                      {t("Если встроенная загрузка идет медленно, скачайте архив браузером или менеджером загрузок, затем выберите этот файл здесь. Распаковывать вручную не нужно.")}
                     </p>
                     <div className="mt-2 break-all rounded-md border border-border/60 bg-black/20 px-2 py-1.5 text-[10px] leading-relaxed text-text-muted">
-                      Файл загрузки: {selectedPrimaryModel.download_url}
+                      {t("Файл загрузки:")} {selectedPrimaryModel.download_url}
                     </div>
                   </div>
                 )}
 
                 {selectedPrimaryModel === null && (
                   <p className="mt-3 text-xs leading-relaxed text-warning">
-                    Профиль {selectedPrimaryModelLabel} сейчас недоступен для установки.
+                    {t("Профиль {label} сейчас недоступен для установки.", { label: selectedPrimaryModelLabel })}
                   </p>
                 )}
 
                 {selectedPrimaryModelInstalling && (
                   <div className="mt-3 space-y-2">
                     <ProgressBar
-                      label={sttInstall.detail || `Устанавливаем ${selectedPrimaryModelLabel}...`}
+                      label={sttInstall.detail || t("Устанавливаем {label}...", { label: selectedPrimaryModelLabel })}
                       percent={sttInstall.percent}
                     />
                     <div className="flex justify-end">
@@ -3205,7 +3255,7 @@ function LanguageSettings({
                         }}
                         disabled={cancelingInstall}
                       >
-                        {cancelingInstall ? "Отменяем..." : "Отмена"}
+                        {cancelingInstall ? t("Отменяем...") : t("Отмена")}
                       </Button>
                     </div>
                   </div>
@@ -3224,6 +3274,7 @@ function LanguageSettings({
 
 function ImageSettings({ disabled }: { disabled: boolean }) {
   const { apiKey, imageHandlingMode, setImageHandlingMode } = useSettingsStore();
+  const t = useT();
 
   const aiLocked = disabled || apiKey.trim().length === 0;
 
@@ -3233,14 +3284,14 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
         <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
           <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
           <p className="text-xs text-warning leading-relaxed">
-            Настройки скриншотов доступны после ввода лицензионного ключа.
+            {t("Настройки скриншотов доступны после ввода лицензионного ключа.")}
           </p>
         </div>
       )}
 
       <Card
-        title="Скриншоты"
-        description="Как обрабатывать скриншоты перед отправкой."
+        title={t("Скриншоты")}
+        description={t("Как обрабатывать скриншоты перед отправкой.")}
       >
         <div
           className={`space-y-3 transition-opacity ${aiLocked ? "opacity-50 pointer-events-none" : "opacity-100"}`}
@@ -3255,8 +3306,8 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
               className="accent-accent"
             />
             <div>
-              <div className="text-sm font-medium">OCR - только текст</div>
-              <div className="text-xs text-text-muted">Локальное извлечение текста перед отправкой.</div>
+              <div className="text-sm font-medium">{t("OCR - только текст")}</div>
+              <div className="text-xs text-text-muted">{t("Локальное извлечение текста перед отправкой.")}</div>
             </div>
           </label>
           <label className={`flex items-center gap-3 p-3 rounded-lg border border-border transition-colors ${aiLocked ? "cursor-not-allowed" : "hover:border-border-active cursor-pointer"}`}>
@@ -3269,8 +3320,8 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
               className="accent-accent"
             />
             <div>
-              <div className="text-sm font-medium">Отправлять изображение</div>
-              <div className="text-xs text-text-muted">Лучше для схем и кода, когда текста недостаточно.</div>
+              <div className="text-sm font-medium">{t("Отправлять изображение")}</div>
+              <div className="text-xs text-text-muted">{t("Лучше для схем и кода, когда текста недостаточно.")}</div>
             </div>
           </label>
         </div>
@@ -3281,29 +3332,30 @@ function ImageSettings({ disabled }: { disabled: boolean }) {
 
 function PrivacySettings({ disabled }: { disabled: boolean }) {
   const { protectOverlay, setProtectOverlay } = useSettingsStore();
+  const t = useT();
 
   return (
     <div className="space-y-5">
       <Card
-        title="Видимость при шаринге"
-        description="Скрывать окно из демонстрации экрана и записи."
+        title={t("Видимость при шаринге")}
+        description={t("Скрывать окно из демонстрации экрана и записи.")}
       >
         <Toggle
           checked={protectOverlay}
           onChange={setProtectOverlay}
           disabled={disabled}
-          label="Скрывать окно при захвате экрана"
-          description="Использует системную защиту окна. Перед интервью лучше проверить режим в тестовом звонке."
+          label={t("Скрывать окно при захвате экрана")}
+          description={t("Использует системную защиту окна. Перед интервью лучше проверить режим в тестовом звонке.")}
         />
 
         <div className="mt-4 space-y-2">
           <div className="text-xs font-medium text-text-muted uppercase tracking-wider">
-            Статус платформы
+            {t("Статус платформы")}
           </div>
           <StatusIndicator
             status="supported"
-            label="macOS Видимость при шаринге"
-            description="Скрытие окна активно."
+            label={t("macOS Видимость при шаринге")}
+            description={t("Скрытие окна активно.")}
           />
         </div>
       </Card>
@@ -3458,6 +3510,7 @@ function HotkeySettings({
   focusTarget: SettingsFocusTarget | null;
 }) {
   const { hotkeys, setHotkey, resetHotkeys } = useSettingsStore();
+  const t = useT();
   const [recording, setRecording] = useState<HotkeyAction | null>(null);
   const [recordingPreview, setRecordingPreview] = useState<string[]>([]);
   const recordingPreviewRef = useRef<string[]>([]);
@@ -3533,13 +3586,13 @@ function HotkeySettings({
         className={getFocusSectionClass(focusTarget === "hotkeys-bindings")}
       >
         <Card
-          title="Горячие клавиши"
-          description="Эти сочетания работают во время интервью. Нажмите на кнопку справа, чтобы назначить свое сочетание."
+          title={t("Горячие клавиши")}
+          description={t("Эти сочетания работают во время интервью. Нажмите на кнопку справа, чтобы назначить свое сочетание.")}
         >
           <div className="mb-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs leading-relaxed text-text-muted">
-            Для простого старта рекомендуем одиночные клавиши{" "}
-            <span className="font-medium text-text-secondary">F8, F9, F10 и F11</span>.{" "}
-            Они стабильнее работают в Windows, чем системные комбинации вроде{" "}
+            {t("Для простого старта рекомендуем одиночные клавиши")}{" "}
+            <span className="font-medium text-text-secondary">{t("F8, F9, F10 и F11")}</span>.{" "}
+            {t("Они стабильнее работают в Windows, чем системные комбинации вроде")}{" "}
             <span className="font-medium text-text-secondary">Alt + Space</span>.
           </div>
           <div className="space-y-2">
@@ -3548,12 +3601,12 @@ function HotkeySettings({
                 key={hk.action}
                 className="flex items-center justify-between p-3 rounded-lg border border-border"
               >
-                <span className="text-sm text-text-secondary">{hk.label}</span>
+                <span className="text-sm text-text-secondary">{t(hk.label)}</span>
                 {recording === hk.action ? (
                   <input
                     autoFocus
                     readOnly
-                    placeholder={`Нажмите до ${HOTKEY_MAX_KEYS} клавиш...`}
+                    placeholder={t("Нажмите до {n} клавиш...", { n: HOTKEY_MAX_KEYS })}
                     value={formatHotkey(recordingPreview)}
                     className="px-3 py-1.5 bg-accent/10 border border-accent rounded-md text-xs font-mono text-accent w-52 text-center focus:outline-none"
                     onKeyDown={(e) => handleKeyDown(hk.action, e)}
@@ -3582,7 +3635,7 @@ function HotkeySettings({
             ))}
           </div>
           <p className="mt-3 text-xs text-text-muted">
-            Можно использовать до {HOTKEY_MAX_KEYS} клавиш в одном сочетании.
+            {t("Можно использовать до {n} клавиш в одном сочетании.", { n: HOTKEY_MAX_KEYS })}
           </p>
           <div className="mt-4">
             <Button
@@ -3592,7 +3645,7 @@ function HotkeySettings({
               disabled={disabled}
               className="mr-2"
             >
-              Простой набор (F8-F11)
+              {t("Простой набор (F8-F11)")}
             </Button>
             <Button
               variant="ghost"
@@ -3604,7 +3657,7 @@ function HotkeySettings({
               disabled={disabled}
               icon={<RotateCcw className="w-3.5 h-3.5" />}
             >
-              Сбросить по умолчанию
+              {t("Сбросить по умолчанию")}
             </Button>
           </div>
         </Card>
@@ -3612,4 +3665,3 @@ function HotkeySettings({
     </div>
   );
 }
-

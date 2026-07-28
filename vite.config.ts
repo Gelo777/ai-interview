@@ -22,7 +22,9 @@ export default defineConfig({
   },
   clearScreen: false,
   server: {
-    port: 5173,
+    // When PORT is provided (e.g. by the preview harness) bind it; otherwise
+    // fall back to Vite's default dev port for the Tauri workflow.
+    port: process.env.PORT ? Number(process.env.PORT) : undefined,
     strictPort: true,
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 5174 } : undefined,

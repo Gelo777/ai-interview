@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type {
+  ApiKeyCheckState,
+  AppLanguage,
   AppSettings,
+  ContextFile,
+  DictationSource,
+  DictationTrigger,
   HotkeyBinding,
   HotkeyAction,
   ImageHandlingMode,
@@ -24,7 +29,42 @@ import {
 import { appPersistStorage } from "@/lib/persistStorage";
 
 const SETTINGS_STORAGE_KEY = "ai-interview-settings";
+// Dev/browser fallback slot for the license key. The packaged app keeps the key
+// in the OS keychain (Tauri) and never writes it here; outside Tauri there is no
+// keychain, so we persist it separately to survive a page reload.
+const DEV_API_KEY_STORAGE_KEY = "ai-interview-dev-api-key";
 let apiKeyPersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function isRunningInTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export function readDevPersistedApiKey(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  try {
+    return window.localStorage.getItem(DEV_API_KEY_STORAGE_KEY)?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDevPersistedApiKey(apiKey: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const trimmed = apiKey.trim();
+    if (trimmed) {
+      window.localStorage.setItem(DEV_API_KEY_STORAGE_KEY, trimmed);
+    } else {
+      window.localStorage.removeItem(DEV_API_KEY_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage may be unavailable (private mode); the in-memory key still works.
+  }
+}
 
 function areHotkeyBindingsEqual(a: string[] | undefined, b: string[]): boolean {
   if (!Array.isArray(a)) {
@@ -106,13 +146,32 @@ function scheduleApiKeyPersistence(apiKey: string): void {
 }
 
 async function persistApiKeyToSecureStore(apiKey: string): Promise<void> {
+  if (!isRunningInTauri()) {
+    // No OS keychain outside the packaged app — keep the key in localStorage so
+    // it survives a browser/dev reload instead of vanishing from the cabinet.
+    writeDevPersistedApiKey(apiKey);
+    return;
+  }
   try {
-    const { isTauri, setSecureApiKey } = await import("@/lib/tauri");
-    if (!isTauri()) {
-      return;
-    }
+    const { setSecureApiKey, getSecureApiKey } = await import("@/lib/tauri");
     await setSecureApiKey(apiKey);
+
+    // Read back: a keychain that accepts writes but never persists them (e.g. the
+    // keyring mock store, compiled when no platform backend feature is enabled)
+    // fails completely silently and the key vanishes on the next launch. Verify
+    // rather than trust, and make the failure loud.
+    const stored = ((await getSecureApiKey()) ?? "").trim();
+    const expected = apiKey.trim();
+    if (stored !== expected) {
+      const { logWarn } = await import("@/lib/diagnostics");
+      logWarn("settings.apiKey", "Secure storage did not retain the API key", {
+        expectedLength: expected.length,
+        storedLength: stored.length,
+      });
+    }
   } catch (error) {
+    const { logWarn } = await import("@/lib/diagnostics");
+    logWarn("settings.apiKey", "Failed to persist API key to secure storage", error);
     console.warn("Failed to persist API key to secure storage:", error);
   }
 }
@@ -179,12 +238,17 @@ interface SettingsState extends AppSettings {
   setCustomBaseUrl: (baseUrl: string) => void;
   setPrimaryLanguage: (l: PrimaryLanguage) => void;
   setSecondaryLanguage: (l: SecondaryLanguage) => void;
+  setAppLanguage: (l: AppLanguage) => void;
   setPrimarySttVariant: (v: SttModelVariant) => void;
   setSecondarySttVariant: (v: SttModelVariant) => void;
   setMicrophoneDeviceId: (deviceId: string) => void;
   setSystemAudioDeviceId: (deviceId: string) => void;
   setApiKey: (key: string) => void;
+  setApiKeyCheck: (value: ApiKeyCheckState | null) => void;
   setInterviewContext: (value: string) => void;
+  addContextFiles: (files: ContextFile[]) => void;
+  removeContextFile: (id: string) => void;
+  clearContextFiles: () => void;
   hydrateApiKey: (key: string) => void;
   setSelectedModel: (m: ModelInfo | null) => void;
   setSendSummary: (v: boolean) => void;
@@ -194,11 +258,29 @@ interface SettingsState extends AppSettings {
   setProtectOverlay: (v: boolean) => void;
   setChatMemoryLimitMb: (v: number) => void;
   setHistoryRetentionDays: (v: number | null) => void;
+  setDictationTrigger: (v: DictationTrigger) => void;
+  setDictationSource: (v: DictationSource) => void;
+  setAudioHintWindowSeconds: (v: number) => void;
   setHotkey: (action: HotkeyAction, keys: string[]) => void;
   resetHotkeys: () => void;
 }
 
 const defaultPrimaryLanguage: PrimaryLanguage = "ru-RU";
+
+// Окно кнопки «последние N сек» аудио-подсказки: пользователь выбирает, сколько
+// хвоста серверного аудио-буфера уходит в модель одним кликом.
+export const AUDIO_HINT_WINDOW_MIN_SECONDS = 3;
+export const AUDIO_HINT_WINDOW_MAX_SECONDS = 15;
+export const AUDIO_HINT_WINDOW_DEFAULT_SECONDS = 8;
+
+export function clampAudioHintWindowSeconds(value: number): number {
+  if (!Number.isFinite(value)) {
+    return AUDIO_HINT_WINDOW_DEFAULT_SECONDS;
+  }
+  return Math.round(
+    Math.max(AUDIO_HINT_WINDOW_MIN_SECONDS, Math.min(AUDIO_HINT_WINDOW_MAX_SECONDS, value)),
+  );
+}
 
 export const useSettingsStore = create<SettingsState>()(
   persist(
@@ -208,12 +290,15 @@ export const useSettingsStore = create<SettingsState>()(
       customBaseUrl: PROXY_BASE_URL,
       primaryLanguage: defaultPrimaryLanguage,
       secondaryLanguage: "none",
+      appLanguage: "ru",
       primarySttVariant: "large",
       secondarySttVariant: "large",
       microphoneDeviceId: "",
       systemAudioDeviceId: "",
       apiKey: "",
+      apiKeyCheck: null,
       interviewContext: "",
+      contextFiles: [],
       selectedModel: null,
       sendSummary: true,
       finalReport: true,
@@ -222,6 +307,9 @@ export const useSettingsStore = create<SettingsState>()(
       protectOverlay: true,
       chatMemoryLimitMb: 16,
       historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
+      dictationTrigger: "toggle",
+      dictationSource: "both",
+      audioHintWindowSeconds: AUDIO_HINT_WINDOW_DEFAULT_SECONDS,
       hotkeys: cloneDefaultHotkeys(),
 
       setProvider: (provider) =>
@@ -246,6 +334,7 @@ export const useSettingsStore = create<SettingsState>()(
       setPrimaryLanguage: (primaryLanguage) =>
         set({ primaryLanguage: normalizePrimaryLanguage(primaryLanguage) }),
       setSecondaryLanguage: (secondaryLanguage) => set({ secondaryLanguage }),
+      setAppLanguage: (appLanguage) => set({ appLanguage }),
       setPrimarySttVariant: (primarySttVariant) => set({ primarySttVariant }),
       setSecondarySttVariant: (secondarySttVariant) => set({ secondarySttVariant }),
       setMicrophoneDeviceId: (microphoneDeviceId) => set({ microphoneDeviceId }),
@@ -254,7 +343,19 @@ export const useSettingsStore = create<SettingsState>()(
         set({ apiKey });
         scheduleApiKeyPersistence(apiKey);
       },
+      setApiKeyCheck: (apiKeyCheck) => set({ apiKeyCheck }),
       setInterviewContext: (interviewContext) => set({ interviewContext }),
+      addContextFiles: (files) =>
+        set((state) => {
+          const existingNames = new Set(state.contextFiles.map((file) => file.name));
+          const additions = files.filter((file) => !existingNames.has(file.name));
+          return { contextFiles: [...state.contextFiles, ...additions] };
+        }),
+      removeContextFile: (id) =>
+        set((state) => ({
+          contextFiles: state.contextFiles.filter((file) => file.id !== id),
+        })),
+      clearContextFiles: () => set({ contextFiles: [] }),
       hydrateApiKey: (apiKey) => set({ apiKey }),
       setSelectedModel: (selectedModel) => {
         const normalizedModel = normalizeModelCacheSupport(selectedModel);
@@ -282,6 +383,10 @@ export const useSettingsStore = create<SettingsState>()(
               ? null
               : normalizeHistoryRetentionDays(historyRetentionDays),
         }),
+      setDictationTrigger: (dictationTrigger) => set({ dictationTrigger }),
+      setDictationSource: (dictationSource) => set({ dictationSource }),
+      setAudioHintWindowSeconds: (audioHintWindowSeconds) =>
+        set({ audioHintWindowSeconds: clampAudioHintWindowSeconds(audioHintWindowSeconds) }),
       setHotkey: (action, keys) => {
         const normalizedKeys = normalizeHotkeyKeys(keys)
         set((s) => ({
@@ -301,12 +406,15 @@ export const useSettingsStore = create<SettingsState>()(
         customBaseUrl: state.customBaseUrl,
         primaryLanguage: state.primaryLanguage,
         secondaryLanguage: state.secondaryLanguage,
+        appLanguage: state.appLanguage,
         primarySttVariant: state.primarySttVariant,
         secondarySttVariant: state.secondarySttVariant,
         microphoneDeviceId: state.microphoneDeviceId,
         systemAudioDeviceId: state.systemAudioDeviceId,
-        apiKey: state.apiKey,
+        // apiKey lives canonically in the keychain (hydrated in App.tsx); it is
+        // never persisted in the settings blob. apiKeyCheck is deprecated.
         interviewContext: state.interviewContext,
+        contextFiles: state.contextFiles,
         selectedModel: state.selectedModel,
         sendSummary: state.sendSummary,
         finalReport: state.finalReport,
@@ -315,6 +423,9 @@ export const useSettingsStore = create<SettingsState>()(
         protectOverlay: state.protectOverlay,
         chatMemoryLimitMb: state.chatMemoryLimitMb,
         historyRetentionDays: state.historyRetentionDays,
+        dictationTrigger: state.dictationTrigger,
+        dictationSource: state.dictationSource,
+        audioHintWindowSeconds: state.audioHintWindowSeconds,
         hotkeys: state.hotkeys,
       }),
       onRehydrateStorage: () => (state) => {
@@ -322,11 +433,22 @@ export const useSettingsStore = create<SettingsState>()(
           return;
         }
 
+        if (!isRunningInTauri()) {
+          // Restore the dev/browser-persisted key (keychain is Tauri-only). In the
+          // packaged app the key is hydrated from the keychain in App.tsx instead.
+          const devApiKey = readDevPersistedApiKey();
+          if (devApiKey) {
+            state.apiKey = devApiKey;
+          }
+        }
+
         state.baseUrlPreset = "custom";
         state.provider = "custom";
         state.customBaseUrl = PROXY_BASE_URL;
         state.primaryLanguage = defaultPrimaryLanguage;
         state.secondaryLanguage = "none";
+        const rawAppLanguage = (state as unknown as { appLanguage?: unknown }).appLanguage;
+        state.appLanguage = rawAppLanguage === "en" ? "en" : "ru";
 
         state.primarySttVariant = "large";
         state.secondarySttVariant = "large";
@@ -338,16 +460,44 @@ export const useSettingsStore = create<SettingsState>()(
           .systemAudioDeviceId;
         state.systemAudioDeviceId =
           typeof rawSystemAudioDeviceId === "string" ? rawSystemAudioDeviceId : "";
+        const rawApiKeyCheck = (state as unknown as { apiKeyCheck?: unknown }).apiKeyCheck;
+        state.apiKeyCheck =
+          rawApiKeyCheck &&
+          typeof rawApiKeyCheck === "object" &&
+          typeof (rawApiKeyCheck as ApiKeyCheckState).key === "string" &&
+          typeof (rawApiKeyCheck as ApiKeyCheckState).valid === "boolean"
+            ? (rawApiKeyCheck as ApiKeyCheckState)
+            : null;
         const rawInterviewContext = (state as unknown as { interviewContext?: unknown })
           .interviewContext;
         state.interviewContext =
           typeof rawInterviewContext === "string" ? rawInterviewContext : "";
+        const rawContextFiles = (state as unknown as { contextFiles?: unknown }).contextFiles;
+        state.contextFiles = Array.isArray(rawContextFiles)
+          ? rawContextFiles.filter(
+              (item): item is ContextFile =>
+                !!item &&
+                typeof item === "object" &&
+                typeof (item as ContextFile).id === "string" &&
+                typeof (item as ContextFile).name === "string" &&
+                typeof (item as ContextFile).content === "string",
+            )
+          : [];
         const rawHistoryRetentionDays = (state as unknown as { historyRetentionDays?: unknown })
           .historyRetentionDays;
         state.historyRetentionDays =
           rawHistoryRetentionDays === null
             ? null
             : normalizeHistoryRetentionDays(rawHistoryRetentionDays);
+        const rawDictationTrigger = (state as unknown as { dictationTrigger?: unknown })
+          .dictationTrigger;
+        state.dictationTrigger = rawDictationTrigger === "push" ? "push" : "toggle";
+        const rawDictationSource = (state as unknown as { dictationSource?: unknown })
+          .dictationSource;
+        state.dictationSource =
+          rawDictationSource === "mic" || rawDictationSource === "system"
+            ? rawDictationSource
+            : "both";
         const rawSelectedModel = (state as unknown as { selectedModel?: unknown }).selectedModel;
         state.selectedModel =
           rawSelectedModel && typeof rawSelectedModel === "object"

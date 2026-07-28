@@ -100,7 +100,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
             Окно столкнулось с ошибкой интерфейса. Перезагрузите приложение или отправьте сообщение в поддержку.
           </div>
           {this.state.sendStatus && (
-            <div className="mt-4 rounded-2xl border border-border bg-white/[0.03] p-3 text-sm text-text-secondary">
+            <div className="mt-4 rounded-2xl border border-border bg-bg-tertiary/50 p-3 text-sm text-text-secondary">
               {this.state.sendStatus}
               {this.state.reportId ? ` ID: ${this.state.reportId}` : ""}
             </div>

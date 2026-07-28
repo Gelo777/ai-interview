@@ -1,21 +1,26 @@
 ﻿import { useState, useEffect, useRef, useCallback } from "react";
+import type { ClipboardEvent as ReactClipboardEvent, ReactNode } from "react";
 import {
   Send,
   Scissors,
   Square,
   Mic,
   Volume2,
-  Languages,
   Clock,
   ChevronDown,
   Bot,
   Loader2,
   Copy,
-  Maximize2,
-  Minimize2,
   RotateCcw,
+  History,
+  Paperclip,
+  AudioLines,
+  AlignLeft,
+  X,
 } from "lucide-react";
+import { planLimitsFor, remainingOf } from "@/lib/plans";
 import { Button } from "@/components/ui/Button";
+import { useT } from "@/lib/i18n";
 import { useSessionStore } from "@/stores/session";
 import { useSettingsStore } from "@/stores/settings";
 import { useAppStore } from "@/stores/app";
@@ -24,6 +29,7 @@ import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import {
   buildLiveSttWebSocketUrl,
   formatProxyHintResponse,
+  ProxyApiError,
   PROXY_BASE_URL,
   requestLiveSttTranscribeLatest,
   requestProxyHint,
@@ -31,7 +37,12 @@ import {
   type AiFeedbackRating,
   type LiveSttTranscribeLatestResponse,
 } from "@/lib/proxy";
-import { getLanguageLabel } from "@/lib/languages";
+import { useLicenseStore } from "@/stores/license";
+import { getLanguageLabel, getLanguageShortLabel } from "@/lib/languages";
+import { isKnownSubtitleCreditNoise } from "@/lib/sttNoise";
+import { describeDroppedSelection, repairAudioSelection } from "@/lib/audioSelection";
+import { appendUtterance, dictationAcceptsTrack } from "@/lib/speechInput";
+import { countHiddenPhrases, selectVisibleMessages } from "@/lib/transcriptWindow";
 import { logError, logInfo, logWarn } from "@/lib/diagnostics";
 import {
   getSttWarmupSnapshot,
@@ -42,9 +53,11 @@ import {
   normalizeHotkeyKeys,
   normalizeHotkeyToken,
 } from "@/lib/hotkeys";
-import { cropBase64PngByRect, type CropRect } from "@/lib/imageCrop";
+import { blobToBase64Png, cropBase64PngByRect, type CropRect } from "@/lib/imageCrop";
+import { buildAssistantContext } from "@/lib/interviewContext";
 import type {
   ChatMessage,
+  DictationSource,
   LlmResponse,
   PrimaryLanguage,
   SessionRecord,
@@ -55,7 +68,7 @@ import type {
   ServerSttChunkTrack,
   SttDiagnosticEvent,
   SttResultEvent,
-  VoskModelOption,
+  WhisperModelOption,
 } from "@/lib/tauri";
 
 type PersistStoreLike = {
@@ -65,7 +78,7 @@ type PersistStoreLike = {
   };
 };
 
-const VOSK_MODEL_LOOKUP_TIMEOUT_MS = 6000;
+const STT_MODEL_LOOKUP_TIMEOUT_MS = 6000;
 const STT_STARTUP_TIMEOUT_MS = 240000;
 const STT_START_REQUEST_TIMEOUT_MS = 240000;
 const STT_STOP_TIMEOUT_MS = 12000;
@@ -83,17 +96,28 @@ const SCREENSHOT_STREAM_READY_TIMEOUT_MS = 4000;
 const SETTINGS_HYDRATION_WATCHDOG_MS = 2500;
 const STT_AUTOSTART_ENABLED = true;
 const STT_STRICT_AUDIO_MODE = true;
+/**
+ * Recognition runs locally on Whisper: audio never leaves the machine, mixed-language
+ * speech works without swapping models, and the request to the backend carries text
+ * instead of a WAV — which is what used to trip the 1 MB limit on the upstream proxy.
+ *
+ * Kept as a constant rather than deleted so the server path stays reachable if the
+ * local engine has to be bypassed.
+ */
 const STT_ENGINE_SERVER_ONLY = true;
 const SERVER_STT_OPTIMISTIC_START = true;
 const SERVER_STT_STREAM_CHUNK_SECONDS = 1;
 const SERVER_STT_LOOP_GAP_MS = 100;
+// While dictating we drain the capture runtime far more often so words reach the
+// input field close to real time instead of once per second.
+const DICTATION_CHUNK_MS = 250;
+const DICTATION_FINAL_WAIT_MS = 1800;
+const DICTATION_MAX_DURATION_MS = 2 * 60 * 1000;
 const SERVER_STT_RETRY_BASE_MS = 1200;
 const SERVER_STT_WS_READY_TIMEOUT_MS = 15000;
 const SERVER_STT_TRANSCRIBE_WINDOW_SECONDS = 12;
 const SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS = 0;
 const SERVER_STT_CONTEXT_HINT_MAX_CHARS = 420;
-const SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS = 150;
-const SERVER_STT_SAVE_DEBUG_AUDIO = false;
 const SERVER_STT_AUTO_TRANSCRIBE_ENABLED = false;
 const SERVER_STT_AUTO_TRANSCRIBE_INTERVAL_MS = 3200;
 const SERVER_STT_AUTO_TRANSCRIBE_WINDOW_SECONDS = 6;
@@ -123,6 +147,16 @@ type InterviewIntent = {
   reason: string;
 };
 
+/** Dictation events pushed by the backend over the live audio websocket. */
+type DictationServerEvent = {
+  type: string;
+  dictationId?: string;
+  text?: string;
+  completed?: boolean;
+  code?: string;
+  message?: string;
+};
+
 type LastHintMeta = {
   hintId: string | null;
   taskType: string | null;
@@ -145,6 +179,13 @@ type ResolvedSttStartSelection = {
   systemAudioLabel: string;
   usedWindowsDefaultMic: boolean;
   usedWindowsDefaultSystem: boolean;
+  /** Set when a saved device had vanished and was reset to the Windows default. */
+  repairNotice: string | null;
+};
+
+type CropDialogResult = {
+  image: string;
+  prompt: string;
 };
 
 type SttWarmupUiState = {
@@ -153,52 +194,14 @@ type SttWarmupUiState = {
   hint: string;
 };
 
-const INTERVIEW_INTENT_OPTIONS: Array<{
-  mode: InterviewIntentMode;
-  label: string;
-  shortLabel: string;
-  hint: string;
-}> = [
-  {
-    mode: "AUTO",
-    label: "Авто",
-    shortLabel: "Авто",
-    hint: "Режим выберется автоматически по тексту и скриншоту.",
-  },
-  {
-    mode: "LIVE_CODING",
-    label: "Дописать код",
-    shortLabel: "Код",
-    hint: "Писать решение или недостающий фрагмент, а не ревьюить.",
-  },
-  {
-    mode: "DEBUG",
-    label: "Дебаг",
-    shortLabel: "Дебаг",
-    hint: "Найти причину ошибки, stack trace или падающего теста.",
-  },
-  {
-    mode: "CODE_REVIEW",
-    label: "Ревью",
-    shortLabel: "Ревью",
-    hint: "Найти баги, риски и минимальный патч.",
-  },
-  {
-    mode: "THEORY",
-    label: "Теория",
-    shortLabel: "Теория",
-    hint: "Дать короткое объяснение для устного ответа.",
-  },
-];
+const INTENT_MODE_LABELS: Record<InterviewIntentMode, string> = {
+  AUTO: "Авто",
+  LIVE_CODING: "Дописать код",
+  DEBUG: "Дебаг",
+  CODE_REVIEW: "Ревью",
+  THEORY: "Теория",
+};
 
-function isKnownSubtitleCreditNoise(text: string): boolean {
-  const lower = text.toLowerCase();
-  return (
-    lower.includes("редактор субтитр") ||
-    (lower.includes("субтитр") && lower.includes("корректор")) ||
-    (lower.includes("subtitles") && lower.includes("editor"))
-  );
-}
 
 const TECHNICAL_SINGLE_TERMS = new Set([
   "acid",
@@ -583,6 +586,7 @@ function toFriendlyScreenshotError(error: unknown): string {
 }
 
 export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
+  const t = useT();
   const session = useSessionStore();
   const settings = useSettingsStore();
   const { setView, setInterviewActive, setSettingsTab, setSettingsFocus } = useAppStore();
@@ -601,6 +605,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     interviewerChars,
     userChars,
     isLlmLoading,
+    snipsUsed,
+    uploadsUsed,
+    audioHintsUsed,
     startSession,
     setSafeMode,
     setLiveMode,
@@ -613,7 +620,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     finishLlmResponse,
     flushContextBuffer,
     trimMessages,
+    noteSnipUsed,
+    noteUploadUsed,
+    noteAudioHintUsed,
   } = session;
+
+  // Лимиты тарифа: клиентская матрица (plans.ts) поверх статуса лицензии.
+  // Гейты здесь — UX-слой; серверный enforcement добавится своей фазой.
+  const licenseAuthStatus = useLicenseStore((s) => s.authStatus);
+  const licensePlanRaw = useLicenseStore((s) => s.snapshot?.plan ?? null);
+  const planLimits = planLimitsFor(licenseAuthStatus, licensePlanRaw);
+  const snipsRemaining = remainingOf(planLimits.scissorsPerInterview, snipsUsed);
+  const uploadsRemaining = remainingOf(planLimits.uploadsPerInterview, uploadsUsed);
+  const audioHintsRemaining = remainingOf(planLimits.audioHintsPerInterview, audioHintsUsed);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -621,7 +640,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [aiPanelAtBottom, setAiPanelAtBottom] = useState(true);
   const [lastLlmError, setLastLlmError] = useState<string | null>(null);
-  const [responseExpanded, setResponseExpanded] = useState(false);
+  // Ref flag so we announce "license expired" once per expiry episode instead of
+  // spamming a marker on every F8/F9 while the license is expired.
+  const licenseExpiredAnnouncedRef = useRef(false);
   const [showFullTranscript, setShowFullTranscript] = useState(false);
   const [copiedResponse, setCopiedResponse] = useState(false);
   const [isEndingInterview, setIsEndingInterview] = useState(false);
@@ -635,6 +656,12 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const [sttStatusText, setSttStatusText] = useState(
     "Подготавливаем распознавание речи...",
   );
+  // Live per-source audio activity, driven from the capture loop, used to animate
+  // the MIC/SYS status chips.
+  const [audioActivity, setAudioActivity] = useState<{ mic: boolean; system: boolean }>({
+    mic: false,
+    system: false,
+  });
   const [sttWarmupModelId, setSttWarmupModelId] = useState<string | null>(null);
   const [sttWarmupUi, setSttWarmupUi] = useState<SttWarmupUiState | null>(null);
   const [isSttStarting, setIsSttStarting] = useState(false);
@@ -643,14 +670,16 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const [isSttRecovering, setIsSttRecovering] = useState(false);
   const [serverSttRestartNonce, setServerSttRestartNonce] = useState(0);
   const [manualQuestion, setManualQuestion] = useState("");
-  const [isServerLiveReady, setIsServerLiveReady] = useState(false);
+  const [isDictating, setIsDictating] = useState(false);
+  const [dictationHint, setDictationHint] = useState<string | null>(null);
+  const [isRecognitionReady, setIsRecognitionReady] = useState(false);
   const [cropDialogImageBase64, setCropDialogImageBase64] = useState<string | null>(
     null,
   );
+  const [pastedImageBase64, setPastedImageBase64] = useState<string | null>(null);
+  const [cropPrompt, setCropPrompt] = useState("");
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
   const [cropDragging, setCropDragging] = useState(false);
-  const [intentModeOverride, setIntentModeOverride] =
-    useState<InterviewIntentMode>("AUTO");
   const [lastRequestIntent, setLastRequestIntent] = useState<InterviewIntent | null>(null);
   const [lastHintMeta, setLastHintMeta] = useState<LastHintMeta | null>(null);
   const [отзываUi, setFeedbackUi] = useState<FeedbackUiState>({
@@ -664,7 +693,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const cropContainerRef = useRef<HTMLDivElement | null>(null);
   const cropImageRef = useRef<HTMLImageElement | null>(null);
   const cropStartRef = useRef<{ x: number; y: number } | null>(null);
-  const cropResolverRef = useRef<((result: string | null) => void) | null>(null);
+  const cropResolverRef = useRef<((result: CropDialogResult | null) => void) | null>(null);
+  const cropPromptRef = useRef("");
   const abortRef = useRef<AbortController | null>(null);
   const endingRef = useRef(false);
   const isEmbeddedMode = mode === "embedded";
@@ -697,6 +727,70 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     socket: null,
     streamId: null,
   });
+  // Push-to-talk audio hint: press once to start recording the interviewer, press
+  // again to send the buffered audio straight to Gemini (no local STT). The audio
+  // stream is already running (STT_ENGINE_SERVER_ONLY), so we only track how long we
+  // recorded and the server drains exactly that tail. The socket's message handler
+  // lives inside the live-socket effect, so it reaches the latest renderer via a ref.
+  const [audioHintRecording, setAudioHintRecording] = useState(false);
+  const audioHintStartRef = useRef(0);
+  // True between sending hint.audio and getting a hint/error back, so the socket
+  // can tell an audio-hint error apart from a background stream error.
+  const audioHintPendingRef = useRef(false);
+  const audioHintMsgRef = useRef<
+    (payload: { type?: string; output?: string; nextSteps?: string[]; message?: string; code?: string }) => void
+  >(() => {});
+  // "Last N seconds" quick hint: a second button that grabs the trailing window of
+  // the already-running audio stream and sends it to Gemini in one click — no manual
+  // start/stop like push-to-talk. The window length is the user's own setting
+  // (settings.audioHintWindowSeconds, 3–15s), sent as an explicit `seconds`.
+  const [audioHintTailSending, setAudioHintTailSending] = useState(false);
+  // Dictation: the text the input already had when recording started, so every
+  // transcript update can simply be appended to it.
+  //
+  // `settledText` exists because the local engine reports one utterance at a time
+  // rather than the full dictation: finalised utterances accumulate here, and the
+  // in-flight partial is rendered on top of them without being committed.
+  const dictationRef = useRef<{
+    id: string | null;
+    baseText: string;
+    lastText: string;
+    settledText: string;
+    /** When the last utterance was committed, so the next one knows if a sentence ended. */
+    lastUtteranceAt: number;
+    finalResolvers: Array<() => void>;
+  }>({
+    id: null,
+    baseText: "",
+    lastText: "",
+    settledText: "",
+    lastUtteranceAt: 0,
+    finalResolvers: [],
+  });
+  // Two flags on purpose. `dictationActiveRef` means "microphone text is being routed
+  // to the input" and stays on through the tail window after the button is released;
+  // `dictationRecordingRef` means "the user is holding the button" and drops at once.
+  // Guarding start/stop on the first one made every stop block the next dictation for
+  // the whole tail delay.
+  const dictationActiveRef = useRef(false);
+  const dictationRecordingRef = useRef(false);
+  // Dictated text is cleared from the input once it has been sent; text the user
+  // typed themselves is left alone.
+  const dictationProducedTextRef = useRef(false);
+  // sendToLlm awaits the dictation tail, so it cannot read the question from a
+  // closure captured before that await.
+  const manualQuestionRef = useRef("");
+  // Mirrors the "Что слушать" setting for handleSttResult, which is memoised with
+  // stable deps and would otherwise capture whatever the value was on mount.
+  const dictationSourceRef = useRef<DictationSource>(settings.dictationSource);
+
+  useEffect(() => {
+    manualQuestionRef.current = manualQuestion;
+  }, [manualQuestion]);
+
+  useEffect(() => {
+    dictationSourceRef.current = settings.dictationSource;
+  }, [settings.dictationSource]);
 
   useEffect(() => {
     activeSttLanguageRef.current = activeSttLanguage;
@@ -822,14 +916,15 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         ? ""
         : (request?.systemAudioDeviceId ?? currentSettings.systemAudioDeviceId);
 
-      const trimmedMic = requestedMic?.trim() ?? "";
-      const trimmedSystem = requestedSystem?.trim() ?? "";
+      let trimmedMic = requestedMic?.trim() ?? "";
+      let trimmedSystem = requestedSystem?.trim() ?? "";
       let microphoneDeviceId = trimmedMic || undefined;
       let systemAudioDeviceId = trimmedSystem || undefined;
       let microphoneLabel = microphoneDeviceId || "Windows default microphone";
       let systemAudioLabel = systemAudioDeviceId || "Windows default output";
       let usedWindowsDefaultMic = !microphoneDeviceId;
       let usedWindowsDefaultSystem = !systemAudioDeviceId;
+      let repairNotice: string | null = null;
 
       try {
         const { isTauri, listAudioDevices } = await import("@/lib/tauri");
@@ -841,10 +936,45 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             systemAudioLabel,
             usedWindowsDefaultMic,
             usedWindowsDefaultSystem,
+            repairNotice,
           };
         }
 
         const devices = await listAudioDevices();
+
+        // A saved endpoint that no longer exists is not a reason to refuse to start.
+        // Strict mode is there to stop us from silently recording the wrong device —
+        // but an id that resolves to nothing cannot be the wrong device, it is simply
+        // gone. Drop it back to the Windows default here, persist that, and let the
+        // resolution below run as if the user had never picked it.
+        const repair = repairAudioSelection(
+          { microphoneDeviceId: trimmedMic, systemAudioDeviceId: trimmedSystem },
+          devices,
+        );
+        if (repair.droppedMicrophoneId || repair.droppedSystemAudioId) {
+          logWarn("speech.session", "Dropped audio selection that no longer resolves", {
+            droppedMicrophoneId: repair.droppedMicrophoneId,
+            droppedSystemAudioId: repair.droppedSystemAudioId,
+            outputDevices: devices.filter((device) => !device.is_input).length,
+            inputDevices: devices.filter((device) => device.is_input).length,
+          });
+          // Persisted so the dashboard, the settings page and the next start all agree
+          // instead of each rediscovering the dead id on its own.
+          if (repair.droppedMicrophoneId) {
+            useSettingsStore.getState().setMicrophoneDeviceId("");
+          }
+          if (repair.droppedSystemAudioId) {
+            useSettingsStore.getState().setSystemAudioDeviceId("");
+          }
+          trimmedMic = repair.microphoneDeviceId;
+          trimmedSystem = repair.systemAudioDeviceId;
+          microphoneDeviceId = trimmedMic || undefined;
+          systemAudioDeviceId = trimmedSystem || undefined;
+          usedWindowsDefaultMic = !microphoneDeviceId;
+          usedWindowsDefaultSystem = !systemAudioDeviceId;
+          repairNotice = describeDroppedSelection(repair);
+        }
+
         const resolveSelectedDevice = (
           isInput: boolean,
           selector?: string,
@@ -925,6 +1055,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         systemAudioLabel,
         usedWindowsDefaultMic,
         usedWindowsDefaultSystem,
+        repairNotice,
       };
     },
     [],
@@ -938,7 +1069,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       language?: PrimaryLanguage;
     }) => {
       const resolvedSelection = await resolveConcreteAudioSelection(request);
-      const { startVoskSttSession } = await import("@/lib/tauri");
+      const { startSttSession } = await import("@/lib/tauri");
       logInfo("speech.session", "Starting speech session", {
         microphoneDeviceId: resolvedSelection.microphoneDeviceId || "(default)",
         microphoneLabel: resolvedSelection.microphoneLabel,
@@ -948,17 +1079,26 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         usedWindowsDefaultSystem: resolvedSelection.usedWindowsDefaultSystem,
         strictAudioMode: STT_STRICT_AUDIO_MODE,
       });
+      if (resolvedSelection.repairNotice) {
+        addMessage({
+          id: crypto.randomUUID(),
+          timestamp: Date.now(),
+          source: "ai_marker",
+          text: resolvedSelection.repairNotice,
+          isFinal: true,
+        });
+      }
       sttStartupInProgressRef.current = true;
       const startupStartedAt = Date.now();
       setSttStartupStartedAt(startupStartedAt);
       setSttStartupElapsedMs(0);
       setIsSttStarting(true);
       setSttStatusText(
-        "Загружаем точный профиль распознавания. Первый запуск Large может занять 1-3 минуты...",
+        "Загружаем модель распознавания. Первый запуск может занять до минуты...",
       );
       try {
         await withTimeout(
-          startVoskSttSession({
+          startSttSession({
             microphoneDeviceId: resolvedSelection.microphoneDeviceId,
             systemAudioDeviceId: resolvedSelection.systemAudioDeviceId,
             language: request?.language,
@@ -973,12 +1113,15 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         setSttStartupElapsedMs(0);
       }
       sttAcceptingResultsRef.current = true;
+      // Drives the dictation button and the send button: both were gated on a flag
+      // that only the (now unused) server path ever set, which left them dead.
+      setIsRecognitionReady(true);
       logInfo("speech.session", "Speech session started", {
         microphoneLabel: resolvedSelection.microphoneLabel,
         systemAudioLabel: resolvedSelection.systemAudioLabel,
       });
     },
-    [resolveConcreteAudioSelection],
+    [addMessage, resolveConcreteAudioSelection],
   );
 
   const stopSttSessionGracefully = useCallback(
@@ -1009,6 +1152,20 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return;
         }
         sttAcceptingResultsRef.current = false;
+        setIsRecognitionReady(false);
+        // Recognition is going away, so any dictation riding on it is over too.
+        // Without this the button stays stuck in its red recording state, and the
+        // only way out was the two-minute safety valve.
+        //
+        // Inlined rather than calling finishDictationLocally: that helper is declared
+        // further down the file, so naming it as a dependency here would hit the
+        // temporal dead zone and throw during render.
+        if (dictationActiveRef.current) {
+          dictationRecordingRef.current = false;
+          dictationActiveRef.current = false;
+          setIsDictating(false);
+          setDictationHint("Распознавание остановлено — диктовка прервана.");
+        }
         await stopSttSession().catch(() => {
           // Best effort cleanup for the older live path.
         });
@@ -1330,9 +1487,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     async (language: PrimaryLanguage, restartSession: boolean): Promise<boolean> => {
       const {
         isTauri,
-        isVoskSttSessionRunning,
-        listVoskModels,
-        setActiveVoskModel,
+        isSttSessionRunning,
+        listWhisperModels,
+        setActiveWhisperModel,
       } = await import("@/lib/tauri");
       if (!isTauri()) {
         logInfo("speech.language", "Skipping speech profile switch in non-desktop mode", {
@@ -1342,80 +1499,43 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         return true;
       }
 
-      const currentSettings = useSettingsStore.getState();
-      const preferredVariant =
-        language === currentSettings.primaryLanguage
-          ? currentSettings.primarySttVariant
-          : currentSettings.secondaryLanguage !== "none" &&
-              language === currentSettings.secondaryLanguage
-            ? currentSettings.secondarySttVariant
-            : currentSettings.primarySttVariant;
-
       logInfo("speech.language", "Resolving active speech profile", {
         language,
-        preferredVariant,
         restartSession,
       });
 
+      // Whisper models are multilingual — one installed model serves every language,
+      // so there is nothing to match by language. That is also what makes mixed-language
+      // speech work without swapping models mid-interview.
       const models = await withTimeout(
-        listVoskModels(),
-        VOSK_MODEL_LOOKUP_TIMEOUT_MS,
-        "Не удалось быстро получить список профилей. Проверьте настройки распознавания.",
+        listWhisperModels(),
+        STT_MODEL_LOOKUP_TIMEOUT_MS,
+        "Не удалось быстро получить список моделей. Проверьте настройки распознавания.",
       );
       const selectedModel =
-        models.find(
-          (model: VoskModelOption) =>
-            model.installed &&
-            model.language === language &&
-            model.variant === preferredVariant,
-        ) ??
-        models.find(
-          (model: VoskModelOption) =>
-            model.installed &&
-            model.language === language,
-        ) ??
-        models.find((model: VoskModelOption) => model.installed) ??
+        models.find((model: WhisperModelOption) => model.installed && model.active) ??
+        models.find((model: WhisperModelOption) => model.installed) ??
         null;
 
-      if (!selectedModel || !selectedModel.installed) {
-        logWarn("speech.language", "No installed speech profile was found", {
-          language,
-          preferredVariant,
-          selectedModelId: selectedModel?.id ?? null,
-        });
+      if (!selectedModel) {
+        logWarn("speech.language", "No installed speech model was found", { language });
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: "Не найден точный профиль распознавания. Откройте настройки и установите Large.",
+          text: "Модель распознавания не установлена. Откройте настройки и скачайте её.",
           isFinal: true,
         });
         return false;
       }
 
-      if (selectedModel.variant !== preferredVariant) {
-        logWarn("speech.language", "Preferred speech profile is unavailable, using fallback", {
-          language,
-          preferredVariant,
-          selectedModelId: selectedModel.id,
-          selectedVariant: selectedModel.variant,
-        });
-        addMessage({
-          id: crypto.randomUUID(),
-          timestamp: Date.now(),
-          source: "ai_marker",
-          text: `Выбран доступный профиль распознавания, потому что предпочитаемый профиль сейчас недоступен.`,
-          isFinal: true,
-        });
-      }
-
       if (!selectedModel.active) {
-        setSttStatusText("Активируем точный профиль. Первый старт может быть дольше обычного...");
-        await setActiveVoskModel(selectedModel.id);
+        setSttStatusText("Активируем модель распознавания. Первый старт может быть дольше обычного...");
+        await setActiveWhisperModel(selectedModel.id);
       }
 
       if (restartSession) {
-        const running = await isVoskSttSessionRunning().catch(() => false);
+        const running = await isSttSessionRunning().catch(() => false);
         if (running) {
           await stopSttSessionGracefully("language_switch");
         }
@@ -1430,7 +1550,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       logInfo("speech.language", "Speech profile is active", {
         language,
         modelId: selectedModel.id,
-        variant: selectedModel.variant,
+        profile: selectedModel.profile,
       });
       return true;
     },
@@ -1502,6 +1622,29 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     settings.secondaryLanguage,
   ]);
 
+  /**
+   * Applies a transcript update to the input. The caller passes the full text of the
+   * current dictation, so the input is rebuilt from whatever was there when recording
+   * started — no delta stitching here.
+   *
+   * Declared above handleSttResult on purpose: it is one of its dependencies, and a
+   * later declaration would be in the temporal dead zone when the deps array is built.
+   */
+  const applyDictationText = useCallback((text: string) => {
+    const dictation = dictationRef.current;
+    dictation.lastText = text;
+    dictationProducedTextRef.current = true;
+    const base = dictation.baseText;
+    const spoken = text.trim();
+    const composed = !spoken
+      ? base
+      : base.trim().length === 0
+        ? spoken
+        : `${base.replace(/\s+$/, "")} ${spoken}`;
+    manualQuestionRef.current = composed;
+    setManualQuestion(composed);
+  }, []);
+
   const handleSttResult = useCallback(
     (payload: SttResultEvent) => {
       const sessionActive = useSessionStore.getState().isActive;
@@ -1538,6 +1681,37 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       sttTranscriptSeenRef.current[sourceKey] = true;
       setSttStatusText("Распознавание активно. Речь успешно поступает в приложение.");
 
+      // The dictation window is the gate for BOTH tracks. That is the whole point of
+      // the button: it is pressed at the moment a question is being asked, so what
+      // reaches the input is that question — whoever says it — instead of everything
+      // the call has produced since the last send. Which tracks feed the window is the
+      // user's "Что слушать" setting, mic / system / both.
+      if (
+        dictationActiveRef.current &&
+        dictationAcceptsTrack(dictationSourceRef.current, sourceKey)
+      ) {
+        const now = Date.now();
+        const combined = appendUtterance({
+          settled: dictationRef.current.settledText,
+          phrase: text,
+          gapMs: now - dictationRef.current.lastUtteranceAt,
+        });
+        // Only finals are committed: partials rewrite themselves on every decode and
+        // the in-flight one is rendered on top of the settled text, not merged into it.
+        if (payload.is_final) {
+          dictationRef.current.settledText = combined;
+          dictationRef.current.lastUtteranceAt = now;
+        }
+        applyDictationText(combined);
+      }
+
+      if (sourceKey === "mic") {
+        // Your own voice never enters the interview transcript: it is not what the
+        // interviewer said, and silence hallucinations would be recorded as things you
+        // said. The dictation window above is the only place it can land.
+        return;
+      }
+
       const source = sourceKey === "system" ? "interviewer" : "user";
       const pendingId = pendingMessageIdsRef.current[sourceKey];
 
@@ -1571,7 +1745,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         });
       }
     },
-    [addMessage, updateMessage],
+    [addMessage, applyDictationText, updateMessage],
   );
 
   const appendLiveSttTranscript = useCallback(
@@ -1643,13 +1817,18 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
 
       if (payload.code === "audio_detected") {
+        // Also drives the MIC/SYS dots in the header. They used to be fed from the
+        // server capture loop only, so on the local engine they stayed grey while
+        // audio was plainly working — which reads as "no sound" to the user.
         if (payload.source === "system") {
           sttSignalSeenRef.current.system = true;
+          setAudioActivity((prev) => (prev.system ? prev : { ...prev, system: true }));
           setSttStatusText(
             "Системный звук получен. Ждем первые распознанные слова собеседника.",
           );
         } else if (payload.source === "mic") {
           sttSignalSeenRef.current.mic = true;
+          setAudioActivity((prev) => (prev.mic ? prev : { ...prev, mic: true }));
           setSttStatusText(
             "Сигнал с микрофона получен. Ждем первые распознанные слова.",
           );
@@ -1687,12 +1866,16 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
 
       if (payload.code === "audio_stalled") {
+        // Mirror of audio_detected: the dot goes dark again when the stream dries up,
+        // so it reports live activity rather than "signal was seen at some point".
         if (payload.source === "system") {
+          setAudioActivity((prev) => (prev.system ? { ...prev, system: false } : prev));
           setSttStatusText(
             "Системный звук временно не поступает. Это нормально, если собеседник сейчас молчит.",
           );
           return;
         }
+        setAudioActivity((prev) => (prev.mic ? { ...prev, mic: false } : prev));
 
         setSttStatusText(payload.message);
         addMessage({
@@ -1733,6 +1916,353 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     },
     [addMessage, restartSttSession],
   );
+
+  /**
+   * Drops the local dictation state without talking to the server. Used when the
+   * socket is already gone or the server told us the session ended.
+   */
+  const finishDictationLocally = useCallback((hint: string | null) => {
+    if (!dictationActiveRef.current && dictationRef.current.finalResolvers.length === 0) {
+      return;
+    }
+    dictationActiveRef.current = false;
+    // The id is kept on purpose: a final transcript can still arrive a moment
+    // after the stop, and it should land in the input instead of being dropped.
+    setIsDictating(false);
+    setDictationHint(hint);
+    const resolvers = dictationRef.current.finalResolvers;
+    dictationRef.current.finalResolvers = [];
+    resolvers.forEach((resolve) => resolve());
+  }, []);
+
+  const handleDictationEvent = useCallback(
+    (payload: DictationServerEvent) => {
+      const activeId = dictationRef.current.id;
+      if (payload.dictationId && activeId && payload.dictationId !== activeId) {
+        // Late event from a dictation the user already ended.
+        return;
+      }
+
+      switch (payload.type) {
+        case "dictation.started":
+          setDictationHint(null);
+          break;
+        case "dictation.text": {
+          if (!dictationRef.current.id) {
+            // Text from a dictation whose result was already sent.
+            return;
+          }
+          applyDictationText(payload.text ?? "");
+          if (payload.completed) {
+            const resolvers = dictationRef.current.finalResolvers;
+            dictationRef.current.finalResolvers = [];
+            resolvers.forEach((resolve) => resolve());
+          }
+          break;
+        }
+        case "dictation.error":
+          logWarn("speech.dictation", "Dictation reported an error", {
+            code: payload.code,
+            message: payload.message,
+          });
+          finishDictationLocally(payload.message || "Диктовка недоступна.");
+          break;
+        case "dictation.stopped":
+          finishDictationLocally(null);
+          break;
+        default:
+          break;
+      }
+    },
+    [applyDictationText, finishDictationLocally],
+  );
+
+  /**
+   * Dictation reuses the recognition session that is already running for the
+   * interview: nothing is started or negotiated, the microphone results are simply
+   * routed into the input field while this is active (see handleSttResult).
+   */
+  const startDictation = useCallback(() => {
+    if (dictationRecordingRef.current) {
+      return;
+    }
+    if (!sttAcceptingResultsRef.current) {
+      // The button is deliberately live while recognition loads, so this hint is the
+      // only place the user learns whether to wait or to go fix something.
+      setDictationHint(
+        sttStartupInProgressRef.current
+          ? "Распознавание ещё загружается — диктовка включится, как только оно будет готово."
+          : "Распознавание не запущено. Нажмите «Перезапуск аудио» в шапке или проверьте устройства в настройках.",
+      );
+      return;
+    }
+
+    const dictationId = crypto.randomUUID();
+    dictationRef.current = {
+      id: dictationId,
+      baseText: manualQuestionRef.current,
+      lastText: "",
+      settledText: "",
+      lastUtteranceAt: Date.now(),
+      finalResolvers: [],
+    };
+    dictationActiveRef.current = true;
+    dictationRecordingRef.current = true;
+    setIsDictating(true);
+    setDictationHint(null);
+    logInfo("speech.dictation", "Dictation started", { dictationId });
+  }, []);
+
+  /**
+   * Stops routing and waits briefly for the tail of the phrase, so the last words
+   * still land in the input before the user hits send.
+   */
+  const stopDictation = useCallback(async () => {
+    if (!dictationRecordingRef.current) {
+      return;
+    }
+    dictationRecordingRef.current = false;
+    // Stop showing the recording state at once, but keep routing microphone results
+    // for a moment: the engine finalises the last utterance slightly after the button
+    // is released, and those words belong in the input.
+    const stoppingId = dictationRef.current.id;
+    setIsDictating(false);
+    await sleep(DICTATION_FINAL_WAIT_MS);
+    // A new dictation may have started during the tail. Finishing here would kill it,
+    // so this stop only completes the dictation it was actually issued for.
+    if (dictationRef.current.id !== stoppingId) {
+      return;
+    }
+    dictationActiveRef.current = false;
+    finishDictationLocally(null);
+    logInfo("speech.dictation", "Dictation stopped", {
+      chars: dictationRef.current.lastText.length,
+    });
+  }, [finishDictationLocally]);
+
+  /**
+   * Empties the question field and forgets the dictation that filled it, so the next
+   * capture window starts clean instead of appending to a discarded question.
+   */
+  const clearQuestion = useCallback(() => {
+    setManualQuestion("");
+    manualQuestionRef.current = "";
+    dictationRef.current.baseText = "";
+    dictationRef.current.settledText = "";
+    dictationProducedTextRef.current = false;
+  }, []);
+
+  const toggleDictation = useCallback(() => {
+    if (dictationActiveRef.current) {
+      void stopDictation();
+      return;
+    }
+    startDictation();
+  }, [startDictation, stopDictation]);
+
+  // Push-to-talk audio hint. Toggle: first press starts recording, second press
+  // drains the recorded audio on the server and sends it to Gemini as one clip.
+  // No local Whisper, no transcript text — the interviewer's voice goes to the
+  // model directly, which is what keeps stray words out of the buffer.
+  const toggleAudioHint = useCallback(() => {
+    const live = serverSttLiveRef.current;
+    if (!live.socket || live.socket.readyState !== WebSocket.OPEN || !live.streamId) {
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: "Аудиопоток к серверу ещё не подключён. Подождите пару секунд и попробуйте снова.",
+        isFinal: true,
+      });
+      return;
+    }
+    if (!audioHintRecording && audioHintsRemaining <= 0) {
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: `Лимит аудио-подсказок за собес исчерпан (${planLimits.audioHintsPerInterview} на тарифе «${planLimits.title}»).`,
+        isFinal: true,
+      });
+      return;
+    }
+    if (!audioHintRecording) {
+      audioHintStartRef.current = Date.now();
+      setAudioHintRecording(true);
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: "🎙 Записываю вопрос… нажмите ещё раз, чтобы отправить в Gemini.",
+        isFinal: true,
+      });
+      return;
+    }
+    // Second press: stop and send. The stream ran continuously, so the last
+    // `elapsed` seconds are exactly what was recorded between the two presses.
+    const elapsedSeconds = Math.max(
+      1,
+      Math.min(60, Math.ceil((Date.now() - audioHintStartRef.current) / 1000)),
+    );
+    setAudioHintRecording(false);
+    setLastLlmError(null);
+    setLlmResponse({
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      text: "",
+      isStreaming: true,
+    });
+    audioHintPendingRef.current = true;
+    try {
+      live.socket.send(
+        JSON.stringify({
+          type: "hint.audio",
+          seconds: elapsedSeconds,
+          context: buildAssistantContext({
+            topic: settings.interviewContext,
+            files: settings.contextFiles,
+          }),
+        }),
+      );
+      noteAudioHintUsed();
+    } catch (error) {
+      audioHintPendingRef.current = false;
+      finishLlmResponse(0);
+      setLastLlmError("Не удалось отправить запись на сервер.");
+      logWarn("audioHint.send", "Failed to send hint.audio", error);
+    }
+  }, [
+    audioHintRecording,
+    audioHintsRemaining,
+    addMessage,
+    noteAudioHintUsed,
+    planLimits,
+    setLlmResponse,
+    finishLlmResponse,
+    settings.interviewContext,
+    settings.contextFiles,
+  ]);
+
+  // "Last N seconds" quick hint: unlike push-to-talk there is no start/stop — one
+  // click sends the user's configured trailing window (settings, 3–15s) as an
+  // explicit `seconds`, the same protocol push-to-talk uses. Reuses its pending
+  // flag, routing and display path.
+  const sendQuickAudioHint = useCallback(() => {
+    const live = serverSttLiveRef.current;
+    if (!live.socket || live.socket.readyState !== WebSocket.OPEN || !live.streamId) {
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: "Аудиопоток к серверу ещё не подключён. Подождите пару секунд и попробуйте снова.",
+        isFinal: true,
+      });
+      return;
+    }
+    // Don't overlap with an active push-to-talk recording or an in-flight hint.
+    if (audioHintRecording || audioHintPendingRef.current) {
+      return;
+    }
+    if (audioHintsRemaining <= 0) {
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: `Лимит аудио-подсказок за собес исчерпан (${planLimits.audioHintsPerInterview} на тарифе «${planLimits.title}»).`,
+        isFinal: true,
+      });
+      return;
+    }
+    setLastLlmError(null);
+    setLlmResponse({
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      text: "",
+      isStreaming: true,
+    });
+    audioHintPendingRef.current = true;
+    setAudioHintTailSending(true);
+    try {
+      live.socket.send(
+        JSON.stringify({
+          type: "hint.audio",
+          seconds: settings.audioHintWindowSeconds,
+          context: buildAssistantContext({
+            topic: settings.interviewContext,
+            files: settings.contextFiles,
+          }),
+        }),
+      );
+      noteAudioHintUsed();
+    } catch (error) {
+      audioHintPendingRef.current = false;
+      setAudioHintTailSending(false);
+      finishLlmResponse(0);
+      setLastLlmError("Не удалось отправить запись на сервер.");
+      logWarn("audioHint.tail.send", "Failed to send hint.audio tail", error);
+    }
+  }, [
+    audioHintRecording,
+    audioHintsRemaining,
+    addMessage,
+    noteAudioHintUsed,
+    planLimits,
+    setLlmResponse,
+    finishLlmResponse,
+    settings.audioHintWindowSeconds,
+    settings.interviewContext,
+    settings.contextFiles,
+  ]);
+
+  // The live socket's message handler is created inside an effect; route audio-hint
+  // results to the current renderer through a ref so we don't rebuild the socket.
+  const handleAudioHintMessage = useCallback(
+    (payload: { type?: string; output?: string; nextSteps?: string[]; message?: string }) => {
+      audioHintPendingRef.current = false;
+      setAudioHintTailSending(false);
+      if (payload.type === "hint") {
+        const output = (payload.output ?? "").trim();
+        appendLlmText(
+          output ||
+            "Не удалось сформировать ответ по записи. Повторите вопрос короче и нажмите запись ещё раз.",
+        );
+        finishLlmResponse(0);
+        return;
+      }
+      finishLlmResponse(0);
+      setLastLlmError(payload.message || "Сервер не смог обработать запись.");
+    },
+    [appendLlmText, finishLlmResponse],
+  );
+
+  useEffect(() => {
+    audioHintMsgRef.current = handleAudioHintMessage;
+  }, [handleAudioHintMessage]);
+
+  /**
+   * Safety valve for a stuck recording: in hold mode a missed pointerup (lost
+   * pointer capture, window focus change) leaves the mic open indefinitely, and
+   * in toggle mode the user can simply forget to press stop. Cap one dictation
+   * at two minutes; the text recognised so far stays in the input.
+   */
+  useEffect(() => {
+    if (!isDictating) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      logWarn("speech.dictation", "Dictation auto-stopped on the duration cap", {
+        limitMs: DICTATION_MAX_DURATION_MS,
+      });
+      void stopDictation().then(() => {
+        setDictationHint(
+          "Запись остановлена автоматически: лимит 2 минуты. Нажмите ещё раз, чтобы продолжить.",
+        );
+      });
+    }, DICTATION_MAX_DURATION_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [isDictating, stopDictation]);
 
   useEffect(() => {
       if (!isActive) {
@@ -1836,7 +2366,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           });
         });
         serverSttLiveRef.current = { socket: null, streamId: null };
-        setIsServerLiveReady(false);
+        setIsRecognitionReady(false);
         if (SERVER_STT_OPTIMISTIC_START) {
           setIsSttStarting(false);
           setSttStartupStartedAt(null);
@@ -1869,7 +2399,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             }
           }
           serverSttLiveRef.current = { socket: null, streamId: null };
-          setIsServerLiveReady(false);
+          setIsRecognitionReady(false);
         };
 
         const connectLiveSocket = async () => {
@@ -1951,7 +2481,22 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               const payload = JSON.parse(String(event.data)) as {
                 type?: string;
                 message?: string;
+                output?: string;
+                nextSteps?: string[];
+                code?: string;
               };
+              // Push-to-talk answer (or its failure) goes to the audio-hint renderer.
+              if (
+                payload.type === "hint" ||
+                (payload.type === "error" && audioHintPendingRef.current)
+              ) {
+                audioHintMsgRef.current(payload);
+                return;
+              }
+              if (payload.type?.startsWith("dictation.")) {
+                handleDictationEvent(payload as DictationServerEvent);
+                return;
+              }
               if (payload.type === "error" && payload.message) {
                 setSttStatusText(`Live-поток: ${payload.message}`);
               }
@@ -1962,16 +2507,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
           connection.socket.onclose = () => {
             if (!disposed) {
-              setIsServerLiveReady(false);
+              setIsRecognitionReady(false);
               setSttStatusText("Live-поток аудио отключен. Пытаемся переподключиться...");
             }
+            // The dictation session lives on this socket; if it drops mid-phrase the
+            // user has to know their words stopped being captured.
+            finishDictationLocally("Соединение с распознаванием прервалось.");
           };
 
           serverSttLiveRef.current = {
             socket: connection.socket,
             streamId: connection.streamId,
           };
-          setIsServerLiveReady(true);
+          setIsRecognitionReady(true);
           return { lang };
         };
 
@@ -2184,8 +2732,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               throw new Error("Live STT websocket не подключен.");
             }
 
+            const dictating = dictationActiveRef.current;
             const chunk = await captureServerSttChunk({
               durationSeconds: SERVER_STT_STREAM_CHUNK_SECONDS,
+              durationMs: dictating ? DICTATION_CHUNK_MS : undefined,
               microphoneDeviceId: liveSettings.microphoneDeviceId || undefined,
               systemAudioDeviceId: liveSettings.systemAudioDeviceId || undefined,
             });
@@ -2216,6 +2766,12 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             const systemDetailNormalized = systemDetailRaw.toLowerCase();
             const micHasLocalSignal = liveTrackHasLocalSignal(chunk.microphone);
             const systemHasLocalSignal = liveTrackHasLocalSignal(chunk.system_audio);
+
+            setAudioActivity((prev) =>
+              prev.mic === micHasLocalSignal && prev.system === systemHasLocalSignal
+                ? prev
+                : { mic: micHasLocalSignal, system: systemHasLocalSignal },
+            );
 
             silentMicChunkCount = micHasLocalSignal ? 0 : silentMicChunkCount + 1;
             silentSystemChunkCount = systemHasLocalSignal ? 0 : silentSystemChunkCount + 1;
@@ -2317,7 +2873,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             );
             maybeAutoTranscribeLatest();
 
-            if (audioAutoProbeInFlight) {
+            if (dictating) {
+              setSttStatusText("Идёт запись вопроса. Слова появляются в строке ввода.");
+            } else if (audioAutoProbeInFlight) {
               setSttStatusText("Проверяем реальные аудиоустройства. Продолжайте говорить...");
             } else if (!micHasLocalSignal && !systemHasLocalSignal) {
               setSttStatusText(
@@ -2345,7 +2903,11 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             }
 
             consecutiveErrors = 0;
-            await sleep(SERVER_STT_LOOP_GAP_MS);
+            // No idle gap while dictating: every pause here is a pause before the
+            // next words show up in the input field.
+            if (!dictationActiveRef.current) {
+              await sleep(SERVER_STT_LOOP_GAP_MS);
+            }
           } catch (error) {
             if (disposed) {
               return;
@@ -2411,7 +2973,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           }),
         );
         serverSttLiveRef.current = { socket: null, streamId: null };
-        setIsServerLiveReady(false);
+        setIsRecognitionReady(false);
         setIsSttStarting(false);
         setSttStartupStartedAt(null);
         setSttStartupElapsedMs(0);
@@ -2432,7 +2994,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         microphoneDeviceId: activeSettings.microphoneDeviceId || "(default)",
         systemAudioDeviceId: activeSettings.systemAudioDeviceId || "(default)",
       });
-      const { isTauri, isVoskSttSessionRunning } = await import("@/lib/tauri");
+      const { isTauri, isSttSessionRunning } = await import("@/lib/tauri");
       if (disposed) {
         return;
       }
@@ -2472,7 +3034,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return;
         }
         setSttStatusText("Запускаем захват микрофона и системного звука...");
-        const alreadyRunning = await isVoskSttSessionRunning().catch(() => false);
+        const alreadyRunning = await isSttSessionRunning().catch(() => false);
         if (disposed) {
           return;
         }
@@ -2485,6 +3047,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           logWarn("speech.setup", "Speech session already running, reusing existing session");
         }
         sttAcceptingResultsRef.current = true;
+        // Must be set on both paths. Setting it only inside the start helper left the
+        // dictation and send buttons dead whenever the effect re-ran over a session
+        // that was still alive.
+        setIsRecognitionReady(true);
         setActiveSttLanguage(primaryLanguage);
         logInfo("speech.setup", "Speech capture pipeline started", {
           language: primaryLanguage,
@@ -2642,6 +3208,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     startSttSessionWithRecovery,
     restartSttSession,
     serverSttRestartNonce,
+    handleDictationEvent,
+    finishDictationLocally,
   ]);
 
   const handleChatScroll = useCallback(() => {
@@ -2680,25 +3248,39 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     }
   }, [lastLlmResponse?.text]);
 
-  const closeCropDialog = useCallback((result: string | null) => {
+  const closeCropDialog = useCallback((image: string | null) => {
     const resolver = cropResolverRef.current;
     cropResolverRef.current = null;
     cropStartRef.current = null;
     setCropDragging(false);
     setCropRect(null);
     setCropDialogImageBase64(null);
-    resolver?.(result);
+    // Read the prompt off the ref: this callback must stay stable across keystrokes.
+    resolver?.(image === null ? null : { image, prompt: cropPromptRef.current.trim() });
   }, []);
 
-  const openCropDialog = useCallback((imageBase64: string): Promise<string | null> => {
-    cropStartRef.current = null;
-    setCropDragging(false);
-    setCropRect(null);
-    setCropDialogImageBase64(imageBase64);
-    return new Promise<string | null>((resolve) => {
-      cropResolverRef.current = resolve;
-    });
-  }, []);
+  const openCropDialog = useCallback(
+    (imageBase64: string, initialPrompt: string): Promise<CropDialogResult | null> => {
+      // Only one dialog can be on screen, so a second open would orphan the first
+      // promise and leave that send awaiting forever. Cancel it explicitly.
+      const orphaned = cropResolverRef.current;
+      if (orphaned) {
+        cropResolverRef.current = null;
+        logWarn("llm.screenshot", "Cancelled a pending crop dialog before opening a new one");
+        orphaned(null);
+      }
+      cropStartRef.current = null;
+      setCropDragging(false);
+      setCropRect(null);
+      cropPromptRef.current = initialPrompt;
+      setCropPrompt(initialPrompt);
+      setCropDialogImageBase64(imageBase64);
+      return new Promise<CropDialogResult | null>((resolve) => {
+        cropResolverRef.current = resolve;
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     return () => {
@@ -2708,6 +3290,52 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
     };
   }, []);
+
+  const attachImageFromClipboard = useCallback(
+    (event: ReactClipboardEvent<HTMLInputElement>) => {
+      const imageItem = Array.from(event.clipboardData?.items ?? []).find(
+        (item) => item.kind === "file" && item.type.startsWith("image/"),
+      );
+      const file = imageItem?.getAsFile();
+      if (!file) {
+        return;
+      }
+      // Keep the paste from also dropping a file path or stray text into the input.
+      event.preventDefault();
+      if (uploadsRemaining <= 0) {
+        addMessage({
+          id: crypto.randomUUID(),
+          timestamp: Date.now(),
+          source: "ai_marker",
+          text: `Лимит загрузок за собес исчерпан (${planLimits.uploadsPerInterview} на тарифе «${planLimits.title}»).`,
+          isFinal: true,
+        });
+        return;
+      }
+      void (async () => {
+        try {
+          const base64 = await blobToBase64Png(file);
+          setPastedImageBase64(base64);
+          logInfo("llm.screenshot", "Image attached from clipboard", {
+            base64Length: base64.length,
+            type: file.type,
+          });
+        } catch (error) {
+          const detail =
+            error instanceof Error ? error.message : "Неизвестная ошибка чтения буфера обмена.";
+          logWarn("llm.screenshot", "Failed to read image from clipboard", { detail, error });
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text: `Изображение не приложено: ${detail}`,
+            isFinal: true,
+          });
+        }
+      })();
+    },
+    [addMessage, planLimits, uploadsRemaining],
+  );
 
   const applyCropSelection = useCallback(async () => {
     if (!cropDialogImageBase64 || !cropRect) {
@@ -2743,7 +3371,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           id: crypto.randomUUID(),
           timestamp: Date.now(),
           source: "ai_marker",
-          text: "Лицензионный ключ не задан. Укажите его в настройках.",
+          text: "Лицензионный ключ не задан. Активируйте его в разделе «Кабинет».",
           isFinal: true,
         });
         setLastLlmError("Лицензионный ключ не задан.");
@@ -2752,125 +3380,20 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
       setLastLlmError(null);
 
-      let contextMessages = contextBuffer;
-      let rejectedLiveTranscriptReasons: string[] = [];
-      const manualQuestionText = manualQuestion.trim();
-      if (STT_ENGINE_SERVER_ONLY && !withScreenshot && manualQuestionText.length === 0) {
-        const streamId = serverSttLiveRef.current.streamId;
-        if (streamId) {
-          try {
-            setSttStatusText(
-              "Дочитываем свежий аудио-фрагмент перед запросом...",
-            );
-            if (SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS > 0) {
-              await sleep(SERVER_STT_PRE_TRANSCRIBE_FLUSH_MS);
-            }
-            const contextHint = settings.interviewContext.trim();
-            const latest = await requestLiveSttTranscribeLatest({
-              licenseKey: settings.apiKey,
-              streamId,
-              language: settings.primaryLanguage,
-              baseUrl: settings.customBaseUrl.trim() || PROXY_BASE_URL,
-              seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
-              saveAudioDebug: SERVER_STT_SAVE_DEBUG_AUDIO,
-              debugTag: "send",
-              consumeAfterRead: true,
-              retainTailSeconds: SERVER_STT_BUFFER_RETAIN_TAIL_SECONDS,
-              contextHint: contextHint
-                ? contextHint.slice(0, SERVER_STT_CONTEXT_HINT_MAX_CHARS)
-                : undefined,
-            });
-            if (latest.debugMicPath || latest.debugSystemPath) {
-              logInfo("llm.request", "Saved live STT debug audio", {
-                streamId,
-                micPath: latest.debugMicPath ?? null,
-                systemPath: latest.debugSystemPath ?? null,
-              });
-              addMessage({
-                id: crypto.randomUUID(),
-                timestamp: Date.now(),
-                source: "ai_marker",
-                text: `Сохранена отладочная запись: mic=${latest.debugMicPath ?? "-"} | system=${latest.debugSystemPath ?? "-"}`,
-                isFinal: true,
-              });
-            }
-            const { systemText, micText, rejectedReasons } = appendLiveSttTranscript(latest);
-            rejectedLiveTranscriptReasons = rejectedReasons;
-            logInfo("speech.live.transcribeLatest", "Received live STT transcript window", {
-              streamId,
-              seconds: SERVER_STT_TRANSCRIBE_WINDOW_SECONDS,
-              transcriptChars: latest.transcript.trim().length,
-              transcriptPreview: latest.transcript.trim().slice(0, 200),
-              microphone: {
-                available: latest.microphone.available,
-                bufferedMs: latest.microphone.bufferedMs,
-                textChars: micText.length,
-                textPreview: micText.slice(0, 200),
-                detail: latest.microphone.detail,
-              },
-              systemAudio: {
-                available: latest.systemAudio.available,
-                bufferedMs: latest.systemAudio.bufferedMs,
-                textChars: systemText.length,
-                textPreview: systemText.slice(0, 200),
-                detail: latest.systemAudio.detail,
-              },
-            });
-
-            if (!systemText && !micText) {
-              const details = [...rejectedReasons];
-              if (details.length === 0) {
-                const micDetail = toFriendlyLiveTrackDetail(latest.microphone.detail || "");
-                const systemDetail = toFriendlyLiveTrackDetail(latest.systemAudio.detail || "");
-                if (micDetail !== "ok") {
-                  details.push(`микрофон: ${micDetail}`);
-                }
-                const shouldReportSystemDetail =
-                  latest.systemAudio.available || latest.systemAudio.bufferedMs >= 800;
-                if (shouldReportSystemDetail && systemDetail !== "ok") {
-                  details.push(`системный звук: ${systemDetail}`);
-                }
-              }
-              addMessage({
-                id: crypto.randomUUID(),
-                timestamp: Date.now(),
-                source: "ai_marker",
-                text:
-                  details.length > 0
-                    ? `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек речь не распознана. Детали: ${details.join(" | ")}.`
-                    : `В последних ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} сек не найдено явной речи. Можно отправить ручной вопрос или проговорить вопрос и нажать снова.`,
-                isFinal: true,
-              });
-            }
-
-            contextMessages = useSessionStore.getState().contextBuffer;
-            setSttStatusText(
-              "Последний аудио-фрагмент обработан. Готовим ответ помощника...",
-            );
-          } catch (error) {
-            const detail = toErrorDetail(error);
-            logWarn("llm.request", "Failed to transcribe latest live STT window", {
-              streamId,
-              detail,
-            });
-            addMessage({
-              id: crypto.randomUUID(),
-              timestamp: Date.now(),
-              source: "ai_marker",
-              text: `Не удалось распознать последние ${SERVER_STT_TRANSCRIBE_WINDOW_SECONDS} секунд: ${detail}`,
-              isFinal: true,
-            });
-          } finally {
-            serverSttLiveRef.current.socket?.close();
-            serverSttLiveRef.current = { socket: null, streamId: null };
-            setIsServerLiveReady(false);
-            setServerSttRestartNonce((value) => value + 1);
-            logInfo("speech.live.reset", "Restarting live STT stream after send to clear buffers", {
-              streamId,
-            });
-          }
-        }
+      // Sending while still dictating: close the phrase and let the tail land in
+      // the input, otherwise the last words of the question would be dropped.
+      if (dictationActiveRef.current) {
+        await stopDictation();
       }
+
+      let contextMessages = contextBuffer;
+      const rejectedLiveTranscriptReasons: string[] = [];
+      const manualQuestionText = manualQuestionRef.current.trim();
+      // The dictated text is deliberately NOT cleared here. This runs before the
+      // scissors dialog, and cancelling it returns early — clearing now threw away a
+      // question the user had just dictated. The reset happens at the commit point
+      // below, once the request is certain to go out.
+      const hadDictatedText = dictationProducedTextRef.current;
 
       let transcriptCandidateMessages = getTranscriptMessages(contextMessages);
       if (!manualQuestionText && transcriptCandidateMessages.length === 0) {
@@ -2899,17 +3422,13 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           logInfo("llm.request", "Skipped transcript memory fallback for audio-only request");
         }
       }
-      const intentSourceText =
-        manualQuestionText || transcriptCandidateMessages.map((message) => message.text).join("\n");
-      const requestIntent = resolveRequestIntentMode(
-        manualQuestionText,
-        intentSourceText,
-        withScreenshot,
-        intentModeOverride,
-      );
+      // A clipboard image counts as visual context exactly like the scissors do,
+      // so intent detection and the empty-question guard must both see it.
+      const clipboardImageBase64 = withScreenshot ? null : pastedImageBase64;
+      const willAttachImage = withScreenshot || Boolean(clipboardImageBase64);
       const hasTextQuestion =
         transcriptCandidateMessages.length > 0 || manualQuestionText.length > 0;
-      if (!hasTextQuestion && !withScreenshot) {
+      if (!hasTextQuestion && !willAttachImage) {
         logWarn(
           "llm.request",
           "Skipped send request: both transcript buffer and manual question are empty",
@@ -2923,8 +3442,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         });
         return;
       }
-      if (!hasTextQuestion && withScreenshot) {
-        logInfo("llm.request", "Proceeding with screenshot-only request");
+      if (!hasTextQuestion && willAttachImage) {
+        logInfo("llm.request", "Proceeding with image-only request", {
+          source: withScreenshot ? "screenshot" : "clipboard",
+        });
       }
 
       const resp: LlmResponse = {
@@ -2934,7 +3455,6 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         isStreaming: true,
       };
       setLlmResponse(resp);
-      setLastRequestIntent(requestIntent);
       setLastHintMeta(null);
       setFeedbackUi({
         sending: null,
@@ -2942,45 +3462,125 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         отзываId: null,
         error: null,
       });
-      addMessage({
-        id: crypto.randomUUID(),
-        timestamp: Date.now(),
-        source: "ai_marker",
-        text: `Запрос отправлен. Режим: ${getIntentModeLabel(requestIntent.mode)}.`,
-        isFinal: true,
-      });
-      if (manualQuestionText) {
+      /** Unwinds the pending response panel so a send that never happens leaves no trace. */
+      const abortBeforeRequest = (markerText: string, reason: string) => {
+        logInfo("llm.request", "Send aborted before the request left", { reason });
+        useSessionStore.setState((s) => ({
+          lastLlmResponse: null,
+          llmResponses: s.llmResponses.filter((response) => response.id !== resp.id),
+          isLlmLoading: false,
+        }));
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
-          source: "user",
-          text: manualQuestionText,
+          source: "ai_marker",
+          text: markerText,
           isFinal: true,
         });
-        setManualQuestion("");
-      }
-      flushContextBuffer();
+      };
 
-      const effectiveContextMessages = manualQuestionText
+      // The scissors dialog carries its own prompt field, so the screenshot has to
+      // be taken before the question is assembled — whatever the user types there
+      // is the question, and it must reach intent detection too.
+      let screenshotBase64: string | null = null;
+      let screenshotFailureDetail: string | null = null;
+      let questionText = manualQuestionText;
+
+      if (withScreenshot) {
+        // Тарифный гейт: закрывает кнопку, F9 и внутриоконный хоткей разом.
+        if (snipsRemaining <= 0) {
+          abortBeforeRequest(
+            planLimits.scissorsPerInterview === 0
+              ? `Ножницы недоступны на тарифе «${planLimits.title}».`
+              : `Лимит ножниц за собес исчерпан (${planLimits.scissorsPerInterview} на тарифе «${planLimits.title}»).`,
+            "snip_limit",
+          );
+          return;
+        }
+        logInfo("llm.screenshot", "Starting screenshot capture flow");
+        addMessage({
+          id: crypto.randomUUID(),
+          timestamp: Date.now(),
+          source: "ai_marker",
+          text: "Выдели область ножницами и допиши вопрос, если нужно. Отмена отменит и сам запрос.",
+          isFinal: true,
+        });
+        try {
+          const fullScreenshotBase64 = await captureScreenshotAsBase64Png();
+          const cropResult = await openCropDialog(fullScreenshotBase64, manualQuestionText);
+          if (cropResult === null) {
+            // Cancel has to unwind the whole send: without the screenshot there is
+            // nothing left to ask, and the UI would sit waiting for an answer
+            // nobody requested.
+            abortBeforeRequest(
+              "Ножницы отменены — запрос не отправлен.",
+              "crop_cancelled",
+            );
+            return;
+          }
+          screenshotBase64 = cropResult.image;
+          questionText = cropResult.prompt;
+          if (screenshotBase64 !== fullScreenshotBase64) {
+            addMessage({
+              id: crypto.randomUUID(),
+              timestamp: Date.now(),
+              source: "ai_marker",
+              text: "Добавлена выделенная область скриншота.",
+              isFinal: true,
+            });
+          }
+        } catch (err: unknown) {
+          const detail = toFriendlyScreenshotError(err);
+          logWarn("llm.screenshot", "Screenshot capture failed", { detail, error: err });
+          if (!hasTextQuestion) {
+            // Nothing was captured and there is no question to fall back on, so
+            // there is nothing worth asking the service.
+            abortBeforeRequest(
+              `Скриншот не получен (${detail}), а вопроса нет — запрос не отправлен.`,
+              "screenshot_failed_without_question",
+            );
+            return;
+          }
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text: `Скриншот не добавлен: ${detail}`,
+            isFinal: true,
+          });
+          screenshotFailureDetail = detail;
+        }
+      }
+
+      const intentSourceText =
+        questionText || transcriptCandidateMessages.map((message) => message.text).join("\n");
+      const requestIntent = resolveRequestIntentMode(
+        questionText,
+        intentSourceText,
+        willAttachImage,
+      );
+      setLastRequestIntent(requestIntent);
+
+      const effectiveContextMessages = questionText
         ? []
         : transcriptCandidateMessages.slice(Math.max(0, transcriptCandidateMessages.length - 10));
 
       const transcriptLines = effectiveContextMessages.map(
         (m) => `[${m.source === "interviewer" ? "Интервьюер" : "Вы"}]: ${m.text}`,
       );
-      if (manualQuestionText) {
-        transcriptLines.push(`[Вы]: ${manualQuestionText}`);
+      if (questionText) {
+        transcriptLines.push(`[Вы]: ${questionText}`);
       }
-      if (transcriptLines.length === 0 && withScreenshot) {
+      if (transcriptLines.length === 0 && willAttachImage) {
         transcriptLines.push(
-          "[Вы]: Проанализируй скриншот и сначала определи намерение: дописать код, отладить ошибку, сделать ревью или решить задачу.",
+          "[Вы]: Проанализируй изображение и сначала определи намерение: дописать код, отладить ошибку, сделать ревью или решить задачу.",
         );
       }
       const transcript = transcriptLines.join("\n");
 
-      let requestQuestion = manualQuestionText || transcript;
-      if (!requestQuestion.trim() && withScreenshot) {
-        requestQuestion = "Проанализируй скриншот и помоги с ответом на вопрос пользователя.";
+      let requestQuestion = questionText || transcript;
+      if (!requestQuestion.trim() && willAttachImage) {
+        requestQuestion = "Проанализируй изображение и помоги с ответом на вопрос пользователя.";
       }
       let imageBase64Png: string | undefined;
 
@@ -3000,77 +3600,96 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         intentReason: requestIntent.reason,
         transcriptMessages: effectiveContextMessages.length,
         transcriptChars: transcript.length,
-        manualQuestionChars: manualQuestionText.length,
+        manualQuestionChars: questionText.length,
         questionChars: requestQuestion.length,
         language: settings.primaryLanguage,
       });
 
-      if (withScreenshot) {
-        logInfo("llm.screenshot", "Starting screenshot capture flow");
+      if (screenshotFailureDetail) {
+        appendToQuestion(`Скриншот не добавлен: ${screenshotFailureDetail}`);
+      }
+
+      if (screenshotBase64) {
+        appendToQuestion(
+          "Скриншот приложен. Если вопрос относится к коду или ошибке на экране, учитывай это в ответе.",
+        );
+        imageBase64Png = screenshotBase64;
+        noteSnipUsed();
+        logInfo("llm.screenshot", "Screenshot attached as image", {
+          base64Length: screenshotBase64.length,
+          handlingMode: settings.imageHandlingMode,
+        });
+
+        if (settings.imageHandlingMode === "ocr_text") {
+          const ocrText = await tryExtractOcrText(screenshotBase64);
+          if (ocrText) {
+            appendToQuestion(`Текст/код со скриншота:\n${ocrText.slice(0, 2500)}`);
+            logInfo("llm.screenshot", "OCR text extracted from screenshot", {
+              ocrChars: ocrText.length,
+            });
+          } else {
+            appendToQuestion("Скриншот сделан, но OCR не смог извлечь текст.");
+            logWarn("llm.screenshot", "Screenshot captured but OCR returned empty text");
+          }
+        }
+      }
+
+      if (clipboardImageBase64) {
+        appendToQuestion(
+          "К вопросу приложено изображение из буфера обмена. Если на нём код или ошибка, учитывай это в ответе.",
+        );
+        imageBase64Png = clipboardImageBase64;
+        noteUploadUsed();
+        logInfo("llm.screenshot", "Clipboard image attached", {
+          base64Length: clipboardImageBase64.length,
+          handlingMode: settings.imageHandlingMode,
+        });
+
+        if (settings.imageHandlingMode === "ocr_text") {
+          const ocrText = await tryExtractOcrText(clipboardImageBase64);
+          if (ocrText) {
+            appendToQuestion(`Текст/код с изображения:\n${ocrText.slice(0, 2500)}`);
+            logInfo("llm.screenshot", "OCR text extracted from clipboard image", {
+              ocrChars: ocrText.length,
+            });
+          } else {
+            logWarn("llm.screenshot", "Clipboard image attached but OCR returned empty text");
+          }
+        }
+      }
+
+      // Only now is the request certain to go out, so this is the point where the
+      // input is consumed. Doing it earlier lost the typed question on cancel.
+      addMessage({
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        source: "ai_marker",
+        text: `Запрос отправлен. Режим: ${getIntentModeLabel(requestIntent.mode)}.`,
+        isFinal: true,
+      });
+      if (questionText) {
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
-          source: "ai_marker",
-          text: "Выдели нужную область ножницами. Если отменить, отправим только текстовый запрос.",
+          source: "user",
+          text: questionText,
           isFinal: true,
         });
-        try {
-          const fullScreenshotBase64 = await captureScreenshotAsBase64Png();
-          const screenshotBase64 = await openCropDialog(fullScreenshotBase64);
-          if (screenshotBase64 === null) {
-            addMessage({
-              id: crypto.randomUUID(),
-              timestamp: Date.now(),
-              source: "ai_marker",
-              text: "Выделение скриншота отменено. Отправляем только текстовый запрос.",
-              isFinal: true,
-            });
-          } else if (screenshotBase64 !== fullScreenshotBase64) {
-            addMessage({
-              id: crypto.randomUUID(),
-              timestamp: Date.now(),
-              source: "ai_marker",
-              text: "Добавлена выделенная область скриншота.",
-              isFinal: true,
-            });
-          }
-
-          if (screenshotBase64 !== null) {
-            appendToQuestion(
-              "Скриншот приложен. Если вопрос относится к коду или ошибке на экране, учитывай это в ответе.",
-            );
-            imageBase64Png = screenshotBase64;
-            logInfo("llm.screenshot", "Screenshot attached as image", {
-              base64Length: screenshotBase64.length,
-              handlingMode: settings.imageHandlingMode,
-            });
-
-            if (settings.imageHandlingMode === "ocr_text") {
-              const ocrText = await tryExtractOcrText(screenshotBase64);
-              if (ocrText) {
-                appendToQuestion(`Текст/код со скриншота:\n${ocrText.slice(0, 2500)}`);
-                logInfo("llm.screenshot", "OCR text extracted from screenshot", {
-                  ocrChars: ocrText.length,
-                });
-              } else {
-                appendToQuestion("Скриншот сделан, но OCR не смог извлечь текст.");
-                logWarn("llm.screenshot", "Screenshot captured but OCR returned empty text");
-              }
-            }
-          }
-        } catch (err: unknown) {
-          const detail = toFriendlyScreenshotError(err);
-          logWarn("llm.screenshot", "Screenshot capture failed", { detail, error: err });
-          addMessage({
-            id: crypto.randomUUID(),
-            timestamp: Date.now(),
-            source: "ai_marker",
-            text: `Скриншот не добавлен: ${detail}`,
-            isFinal: true,
-          });
-          appendToQuestion(`Скриншот не добавлен: ${detail}`);
-        }
       }
+      if (manualQuestionText) {
+        setManualQuestion("");
+        manualQuestionRef.current = "";
+      }
+      if (hadDictatedText) {
+        // Stop accepting any trailing transcript for the dictation that was just sent.
+        dictationProducedTextRef.current = false;
+        dictationRef.current.id = null;
+        setDictationHint(null);
+      }
+      if (clipboardImageBase64) {
+        setPastedImageBase64(null);
+      }
+      flushContextBuffer();
 
       abortRef.current?.abort();
       const requestController = new AbortController();
@@ -3092,6 +3711,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             customBaseUrl: settings.customBaseUrl.trim() || PROXY_BASE_URL,
             question: requestQuestion,
             language: settings.primaryLanguage,
+            context: buildAssistantContext({
+              topic: settings.interviewContext,
+              files: settings.contextFiles,
+            }),
             imageBase64Png,
             timeoutMs: proxyUiTimeoutMs,
             signal: requestController.signal,
@@ -3099,6 +3722,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           proxyUiTimeoutMs + 1000,
           proxyUiTimeoutMessage,
         );
+        // A successful hint after an expiry episode means the license was
+        // renewed (e.g. from the phone/bot). Clear the badge and announce once.
+        if (licenseExpiredAnnouncedRef.current) {
+          licenseExpiredAnnouncedRef.current = false;
+          useLicenseStore.getState().noteServerLicenseRecovered();
+          addMessage({
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            source: "ai_marker",
+            text: "Лицензия продлена, подсказки снова доступны.",
+            isFinal: true,
+          });
+        }
         const formatted = formatProxyHintResponse(response, {
           expectedIntentMode: requestIntent.mode,
         });
@@ -3158,6 +3794,40 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           finishLlmResponse(0);
           return;
         }
+
+        // License expired mid-interview: never interrupt the interview. Announce
+        // once, keep transcription running, and let the next F8/F9 retry (which
+        // will recover automatically if the user renews from their phone).
+        if (err instanceof ProxyApiError && err.code === "LICENSE_EXPIRED") {
+          useLicenseStore.getState().noteServerLicenseError(err.code);
+          logWarn("assistant.request", "License expired during interview", {
+            code: err.code,
+          });
+          setLastLlmError(message);
+          if (!licenseExpiredAnnouncedRef.current) {
+            licenseExpiredAnnouncedRef.current = true;
+            addMessage({
+              id: crypto.randomUUID(),
+              timestamp: Date.now(),
+              source: "ai_marker",
+              text: "Срок действия лицензии истёк — подсказки приостановлены. Расшифровка продолжается. Продлить можно с телефона в боте или в разделе «Кабинет» после интервью.",
+              isFinal: true,
+            });
+          }
+          finishLlmResponse(0);
+          return;
+        }
+
+        if (
+          err instanceof ProxyApiError &&
+          (err.code === "AUTH_TOKEN_INVALID" ||
+            err.code === "AUTH_TOKEN_REVOKED" ||
+            err.code === "AUTH_TOKEN_REQUIRED" ||
+            err.code === "TOKEN_INVALID")
+        ) {
+          useLicenseStore.getState().noteServerLicenseError(err.code);
+        }
+
         logError("assistant.request", "Service request failed", { message, error: err });
         setLastLlmError(message);
         addMessage({
@@ -3178,16 +3848,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     [
       addMessage,
       appendLlmText,
-      appendLiveSttTranscript,
       contextBuffer,
       finishLlmResponse,
       flushContextBuffer,
-      intentModeOverride,
       isLlmLoading,
-      manualQuestion,
+      noteSnipUsed,
+      noteUploadUsed,
       openCropDialog,
+      pastedImageBase64,
+      planLimits,
       setLlmResponse,
       settings,
+      snipsRemaining,
+      stopDictation,
     ],
   );
 
@@ -3296,6 +3969,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             : 0,
       };
 
+      const liveSettings = useSettingsStore.getState();
+      const trimmedContext = liveSettings.interviewContext.trim();
       const record: SessionRecord = {
         id: crypto.randomUUID(),
         startedAt: startedAtSnapshot,
@@ -3304,6 +3979,14 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         provider: "custom",
         mode: snapshot.mode,
         safeModeReason: snapshot.safeModeReason,
+        interviewContext: trimmedContext || undefined,
+        contextFiles:
+          liveSettings.contextFiles.length > 0
+            ? liveSettings.contextFiles.map((file) => ({
+                name: file.name,
+                size: file.size,
+              }))
+            : undefined,
         metrics: metricsSnapshot,
         transcript: snapshot.messages.slice(-120),
         aiResponses: snapshot.llmResponses.slice(-30),
@@ -3592,21 +4275,39 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const switchLanguageHkLabel = formatHotkey(
     settings.hotkeys.find((h) => h.action === "switch_stt_language")?.keys ?? [],
   );
+  // Once recognition is running, sending is always allowed: the transcript may fill
+  // in between the click and the request, and blocking the button until something has
+  // already been recognised just makes the app look frozen.
   const hasQuestionToSend =
     contextBuffer.length > 0 ||
     manualQuestion.trim().length > 0 ||
-    (STT_ENGINE_SERVER_ONLY && isServerLiveReady);
-  const visibleMessages = showFullTranscript ? messages : messages.slice(-4);
+    Boolean(pastedImageBase64) ||
+    isRecognitionReady;
+  const dictationTrigger = settings.dictationTrigger;
+  const dictationSourceHint =
+    settings.dictationSource === "system"
+      ? t("Слушаем звук компьютера...")
+      : settings.dictationSource === "both"
+        ? t("Слушаем микрофон и звук компьютера...")
+        : t("Слушаем микрофон...");
+  // The button captures whoever the "Что слушать" setting points at, so calling it
+  // "record your question by voice" was wrong for two of the three modes.
+  const dictationLabel =
+    settings.dictationSource === "mic"
+      ? t("Записать вопрос голосом")
+      : settings.dictationSource === "system"
+        ? t("Поймать вопрос собеседника")
+        : t("Поймать вопрос: микрофон и звук компьютера");
+  const visibleMessages = selectVisibleMessages(messages, { showFullTranscript });
+  const hiddenPhraseCount = countHiddenPhrases(messages, visibleMessages);
   const приложениеRootClassName = isEmbeddedMode
-    ? "flex h-full min-h-0 w-full flex-col bg-black/20 text-zinc-100"
-    : "h-screen w-screen flex flex-col bg-black/35 text-zinc-100 backdrop-blur-[1px]";
+    ? "flex h-full min-h-0 w-full flex-col bg-bg-primary text-text-primary"
+    : "overlay-surface h-screen w-screen flex flex-col bg-bg-primary/70 text-text-primary backdrop-blur-[2px]";
   const newMessagesButtonClassName = isEmbeddedMode
-    ? "absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-900/95 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg transition-colors hover:bg-zinc-800"
-    : "fixed bottom-36 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-900/95 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg transition-colors hover:bg-zinc-800";
+    ? "absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-bg-card px-3 py-1.5 text-xs font-medium text-text-primary shadow-[0_10px_30px_-14px_rgba(24,28,55,0.4)] transition-colors hover:bg-bg-tertiary/50"
+    : "fixed bottom-36 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-bg-card px-3 py-1.5 text-xs font-medium text-text-primary shadow-lg transition-colors hover:bg-bg-tertiary/50";
   const chatAreaClassName =
-    lastLlmResponse && !showFullTranscript
-      ? "max-h-36 overflow-y-auto px-3 py-2 space-y-2 relative shrink-0 border-b border-zinc-800/70 bg-black/10"
-      : "flex-1 overflow-y-auto px-3 py-3 space-y-2.5 relative";
+    "relative flex-1 min-h-0 overflow-y-auto px-4 py-4";
   const isSafeMode = sessionMode === "safe";
   const sttNeedsAttention =
     !isSafeMode &&
@@ -3624,7 +4325,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const modelLoadingTitle = isSttStarting
     ? STT_ENGINE_SERVER_ONLY
       ? "Подключаем серверное распознавание"
-      : "Загружаем точный профиль распознавания"
+      : "Загружаем модель распознавания"
     : sttWarmupUi?.title ?? "Подготавливаем распознавание";
   const modelLoadingProgressPercent = isSttStarting
     ? startupProgressPercent
@@ -3638,8 +4339,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         ? "Старт затянулся: проверяем резервный endpoint и повторяем сетевой запрос. Обычно это восстанавливается автоматически."
         : "Проверяем аудио и отправляем первые чанки речи на сервер. Обычно это занимает 5-20 секунд."
       : sttStartupElapsedMs > LIVE_MODEL_LOADING_ESTIMATE_MS
-        ? "Large почти загружен или Windows продолжает читать большой языковой граф. Это не зависание: дождитесь статуса готовности."
-        : "Large весит около 3.5 ГБ и загружается в память. Во время загрузки не нажимайте перезапуск аудио."
+        ? "Модель почти загружена или система ещё читает её с диска. Это не зависание: дождитесь статуса готовности."
+        : "Модель распознавания загружается в память. Во время загрузки не нажимайте перезапуск аудио."
     : sttWarmupUi?.hint ?? sttStatusText;
 
   const openAudioSettings = () => {
@@ -3648,50 +4349,131 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     setView("settings");
   };
 
+  const sessionModeChip = isSafeMode
+    ? {
+        label: "Режим без аудио",
+        title: t("Распознавание выключено: доступны ручной вопрос и ножницы."),
+        className: "border-accent/25 bg-accent-muted text-accent",
+        spinner: false,
+      }
+    : isSttStarting || isSttRecovering
+      ? {
+          label: "Запускается",
+          title: t("Распознавание загружается — диктовка включится следом."),
+          className: "border-border bg-bg-secondary/60 text-text-secondary",
+          spinner: true,
+        }
+      : isRecognitionReady
+        ? {
+            label: "Слушаю",
+            title: t("Речь собеседника попадает в поле вопроса."),
+            className: "border-success/25 bg-success-muted text-success",
+            spinner: false,
+          }
+        : {
+            label: "Звук не идёт",
+            title: t("Распознавание не запущено — перезапустите аудио или проверьте устройства."),
+            className: "border-warning/25 bg-warning-muted text-warning",
+            spinner: false,
+          };
+
   return (
     <div className={приложениеRootClassName}>
       {/* Header */}
-      <div
-        className="flex items-center justify-between px-3 py-2 border-b border-zinc-700/60 bg-black/35 shrink-0"
-      >
-        <div className="flex items-center gap-3 text-zinc-300">
-          <div className="flex items-center gap-1.5">
-            <Mic className="w-3.5 h-3.5" />
-            <span className="text-[10px] text-zinc-400">MIC</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <Volume2 className="w-3.5 h-3.5" />
-            <span className="text-[10px] text-zinc-400">SYS</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <Languages className="w-3.5 h-3.5" />
-            <span className="text-[10px] text-zinc-400">
-              {getLanguageLabel(activeSttLanguage)}
+      <div className="flex items-center justify-between gap-4 border-b border-border bg-bg-card/80 px-4 py-2.5 shrink-0 backdrop-blur-sm">
+        <div className="flex items-center gap-3.5">
+          {/* Ambient status: no chrome, so the timer stays the only anchor here */}
+          <div className="flex items-center gap-2.5">
+            <AudioSignal
+              icon={<Mic className="h-[15px] w-[15px]" />}
+              label={t("Микрофон")}
+              active={audioActivity.mic}
+            />
+            <AudioSignal
+              icon={<Volume2 className="h-[15px] w-[15px]" />}
+              label={t("Системный звук")}
+              active={audioActivity.system}
+            />
+            <span
+              className="text-[11px] font-medium tracking-[0.06em] text-text-muted"
+              title={getLanguageLabel(activeSttLanguage)}
+            >
+              {getLanguageShortLabel(activeSttLanguage)}
             </span>
           </div>
-          {isSafeMode && (
-            <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-100">
-              Режим без аудио
-            </span>
-          )}
-        </div>
-
-        <div className="flex items-center gap-1.5 text-zinc-300">
-          <Clock className="w-3.5 h-3.5" />
-          <span className="text-xs font-mono">{formatElapsed(elapsedMs)}</span>
-        </div>
-
-        <div className="flex items-center gap-1.5">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowFullTranscript((current) => !current)}
+          {/* The chip used to appear only in audio-free mode, so a live session showed
+              nothing at all and there was no way to tell "listening" from "still
+              loading" from "dead". Every state names itself now. */}
+          <span
+            className={`inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 text-[10px] font-semibold uppercase tracking-[0.12em] ${sessionModeChip.className}`}
+            title={sessionModeChip.title}
           >
-            {showFullTranscript ? "Компактно" : "Транскрипт"}
-          </Button>
+            {sessionModeChip.spinner && <Loader2 className="h-3 w-3 animate-spin" />}
+            {t(sessionModeChip.label)}
+          </span>
+          {/* Служебная капсула счётчиков: таймер + остатки лимитов за собес одной
+              группой с разделителями — компактнее и спокойнее, чем ряд отдельных
+              пилюль. Ножницы скрыты на фри — там их нет вовсе, «0» читался бы как
+              исчерпанный лимит. */}
+          <div className="flex h-7 shrink-0 items-center overflow-hidden rounded-full border border-border bg-bg-secondary/60">
+            <span className="inline-flex h-full items-center gap-1 px-2">
+              <Clock className="h-3.5 w-3.5 text-text-muted" />
+              <span className="font-mono text-xs tabular-nums text-text-primary">
+                {formatElapsed(elapsedMs)}
+              </span>
+            </span>
+            {planLimits.scissorsPerInterview > 0 && (
+              <HeaderLimitSegment
+                icon={Scissors}
+                remaining={snipsRemaining}
+                total={planLimits.scissorsPerInterview}
+                title={t("Ножницы: осталось {n} из {total} за собес", {
+                  n: snipsRemaining,
+                  total: planLimits.scissorsPerInterview,
+                })}
+              />
+            )}
+            <HeaderLimitSegment
+              icon={Paperclip}
+              remaining={uploadsRemaining}
+              total={planLimits.uploadsPerInterview}
+              title={t("Загрузки: осталось {n} из {total} за собес", {
+                n: uploadsRemaining,
+                total: planLimits.uploadsPerInterview,
+              })}
+            />
+            <HeaderLimitSegment
+              icon={AudioLines}
+              remaining={audioHintsRemaining}
+              total={planLimits.audioHintsPerInterview}
+              title={t("Аудио-подсказки: осталось {n} из {total} за собес", {
+                n: audioHintsRemaining,
+                total: planLimits.audioHintsPerInterview,
+              })}
+            />
+          </div>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Узкое окно: подписи кнопок прячутся, остаются иконки с тултипами. */}
+          <button
+            type="button"
+            onClick={() => setShowFullTranscript((current) => !current)}
+            title={showFullTranscript ? t("Компактно") : t("Транскрипт")}
+            className="inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-lg border border-transparent px-2.5 text-xs font-medium text-text-secondary hover:border-border hover:bg-bg-tertiary/60 hover:text-text-primary transition-colors"
+          >
+            <AlignLeft className="h-3.5 w-3.5 min-[880px]:hidden" />
+            <span className="hidden min-[880px]:inline">
+              {showFullTranscript ? t("Компактно") : t("Транскрипт")}
+            </span>
+          </button>
           <Button
             variant="secondary"
-            size="sm"
+            size="xs"
+            className="shrink-0 whitespace-nowrap"
+            title={
+              isSafeMode ? t("Аудио выкл.") : isSttStarting ? t("Загрузка...") : t("Перезапуск аудио")
+            }
             onClick={() => {
               void restartSttSession("manual");
             }}
@@ -3705,13 +4487,20 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 <RotateCcw className="w-3 h-3" />
               )
             }
-            className="min-w-[135px]"
           >
-            {isSafeMode ? "Аудио выкл." : isSttStarting ? "Загрузка..." : "Перезапуск аудио"}
+            <span className="hidden min-[880px]:inline">
+              {isSafeMode ? t("Аудио выкл.") : isSttStarting ? t("Загрузка...") : t("Перезапуск аудио")}
+            </span>
           </Button>
           <Button
             variant="danger"
-            size="sm"
+            size="xs"
+            className="shrink-0 whitespace-nowrap"
+            title={
+              isEndingInterview
+                ? t("Завершаем...")
+                : t("Завершить интервью ({key})", { key: endHkLabel })
+            }
             onClick={endInterview}
             disabled={isEndingInterview}
             icon={
@@ -3721,48 +4510,56 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 <Square className="w-3 h-3" />
               )
             }
-            className="min-w-[105px]"
           >
-            {isEndingInterview ? "Завершаем..." : `Завершить (${endHkLabel})`}
+            {isEndingInterview ? (
+              <span className="hidden min-[880px]:inline">{t("Завершаем...")}</span>
+            ) : (
+              <span className="hidden items-center gap-1.5 min-[880px]:flex">
+                {t("Завершить")}
+                <kbd className="rounded bg-white/20 px-1.5 py-0.5 font-mono text-[10px] leading-none tracking-normal text-white/90">
+                  {endHkLabel}
+                </kbd>
+              </span>
+            )}
           </Button>
         </div>
       </div>
 
       {modelLoadingBannerVisible && (
-        <div className="mx-3 mt-2 overflow-hidden rounded-xl border border-cyan-300/30 bg-cyan-950/45 shadow-[0_0_30px_rgba(34,211,238,0.12)]">
-          <div className="flex flex-col gap-3 px-3 py-3 md:flex-row md:items-center md:justify-between">
+        <div className="mx-4 mt-3 overflow-hidden rounded-xl border border-accent/20 bg-accent-muted">
+          <div className="flex flex-col gap-3 px-3.5 py-3 md:flex-row md:items-center md:justify-between">
             <div className="flex min-w-0 items-start gap-3">
-              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-300/30 bg-cyan-300/10">
-                <Loader2 className="h-4 w-4 animate-spin text-cyan-100" />
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-accent/25 bg-bg-card">
+                <Loader2 className="h-4 w-4 animate-spin text-accent" />
               </div>
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-semibold text-cyan-50">
+                  <span className="text-sm font-semibold text-text-primary">
                     {modelLoadingTitle}
                   </span>
-                  <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-100">
-                    Не зависло
+                  <span className="rounded-full border border-accent/20 bg-bg-card px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-accent">
+                    {t("Не зависло")}
                   </span>
                   {modelLoadingElapsedLabel && (
-                    <span className="font-mono text-[11px] text-cyan-200/80">
+                    <span className="font-mono text-[11px] text-text-muted">
                       {modelLoadingElapsedLabel}
                     </span>
                   )}
                 </div>
-                <p className="mt-1 text-xs leading-relaxed text-cyan-100/80">
+                <p className="mt-1 text-xs leading-relaxed text-text-secondary">
                   {modelLoadingHint}
                 </p>
               </div>
             </div>
 
-            <div className="w-full shrink-0 md:w-64">
-              <div className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-100/75">
-                <span>Подготовка</span>
-                <span>{modelLoadingProgressPercent}%</span>
+            <div className="w-full shrink-0 md:w-56">
+              <div className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-[0.12em] text-text-muted">
+                <span>{t("Подготовка")}</span>
+                <span className="font-mono tabular-nums text-text-secondary">{modelLoadingProgressPercent}%</span>
               </div>
-              <div className="h-2 overflow-hidden rounded-full bg-cyan-950">
+              <div className="h-1.5 overflow-hidden rounded-full bg-bg-card">
                 <div
-                  className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-sky-300 to-emerald-300 transition-[width] duration-500 ease-out"
+                  className="h-full rounded-full bg-accent transition-[width] duration-500 ease-out"
                   style={{ width: `${modelLoadingProgressPercent}%` }}
                 />
               </div>
@@ -3772,80 +4569,46 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       )}
 
       {isSafeMode && (
-        <div className="mx-3 mt-2 rounded-lg border border-cyan-400/25 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-50">
+        <div className="mx-4 mt-3 rounded-xl border border-accent/20 bg-accent-muted px-3.5 py-2.5 text-xs text-text-secondary">
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div className="leading-relaxed">
-              Режим без аудио активен: распознавание не запускается.
-              Доступны ручной вопрос, ножницы и ответы помощника.
+              {t("Режим без аудио активен: распознавание не запускается. Доступны ручной вопрос, ножницы и ответы помощника.")}
             </div>
-            <div className="flex shrink-0 flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={openAudioSettings}
-                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
-              >
-                Настроить звук
-              </button>
-              <button
-                type="button"
-                onClick={() => setView("dashboard")}
-                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
-              >
-                WAV-тест
-              </button>
-              <button
-                type="button"
-                onClick={resumeLiveMode}
-                className="rounded-md border border-cyan-300/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-50 hover:bg-cyan-300/10"
-              >
-                Вернуть звук
-              </button>
+            <div className="flex shrink-0 flex-wrap gap-1.5">
+              <BannerAction onClick={openAudioSettings}>{t("Настроить звук")}</BannerAction>
+              <BannerAction onClick={() => setView("dashboard")}>{t("WAV-тест")}</BannerAction>
+              <BannerAction onClick={resumeLiveMode}>{t("Вернуть звук")}</BannerAction>
             </div>
           </div>
         </div>
       )}
 
       {sttNeedsAttention && (
-        <div className="mx-3 mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+        <div className="mx-4 mt-3 rounded-xl border border-warning/25 bg-warning-muted px-3.5 py-2.5 text-xs text-text-secondary">
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div className="leading-relaxed">
-              Аудио требует внимания: можно перезапустить захват, открыть устройства или перейти
-              на главную и записать WAV-тест.
+              {t("Аудио требует внимания: можно перезапустить захват, открыть устройства или перейти на главную и записать WAV-тест.")}
             </div>
-            <div className="flex shrink-0 flex-wrap gap-2">
-              <button
-                type="button"
+            <div className="flex shrink-0 flex-wrap gap-1.5">
+              <BannerAction
                 onClick={() => void restartSttSession("manual")}
                 disabled={isSttRecovering || isSttStarting}
-                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10 disabled:opacity-50"
+                tone="warning"
               >
-                {isSttStarting ? "Загрузка..." : "Перезапустить"}
-              </button>
-              <button
-                type="button"
-                onClick={openAudioSettings}
-                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
-              >
-                Устройства
-              </button>
-              <button
-                type="button"
-                onClick={() => setView("dashboard")}
-                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
-              >
-                WAV-тест
-              </button>
-              <button
-                type="button"
+                {isSttStarting ? t("Загрузка...") : t("Перезапустить")}
+              </BannerAction>
+              <BannerAction onClick={openAudioSettings} tone="warning">{t("Устройства")}</BannerAction>
+              <BannerAction onClick={() => setView("dashboard")} tone="warning">{t("WAV-тест")}</BannerAction>
+              <BannerAction
                 onClick={() =>
                   void activateSafeMode(
                     "Распознавание отключено вручную из панели восстановления.",
                   )
                 }
-                className="rounded-md border border-amber-400/25 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-amber-50 hover:bg-amber-400/10"
+                tone="warning"
               >
-                Без аудио
-              </button>
+                {t("Без аудио")}
+              </BannerAction>
             </div>
           </div>
         </div>
@@ -3857,46 +4620,66 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         onScroll={handleChatScroll}
         className={chatAreaClassName}
       >
-        {messages.length === 0 && (
-          <div className="flex items-center justify-center h-full">
-            <div className="w-full max-w-xl px-4">
-              {sttWarmupUi && !modelLoadingBannerVisible && (
-                <div className="mb-4 rounded-md border border-zinc-700/70 bg-zinc-950/80 px-4 py-3">
-                  <div className="flex items-center justify-between gap-3 text-xs text-zinc-300">
-                    <span className="font-medium text-zinc-100">{sttWarmupUi.title}</span>
-                    <span className="font-mono text-zinc-400">
-                      {sttWarmupUi.progressPercent}%
-                    </span>
+        <div className="mx-auto flex min-h-full max-w-3xl flex-col justify-end">
+          {messages.length === 0 && (
+            <div className="flex flex-1 items-center justify-center">
+              <div className="w-full max-w-md px-4">
+                {sttWarmupUi && !modelLoadingBannerVisible && (
+                  <div className="mb-4 rounded-xl border border-border bg-bg-card px-4 py-3 shadow-[0_1px_2px_rgba(20,22,40,0.04)]">
+                    <div className="flex items-center justify-between gap-3 text-xs">
+                      <span className="font-medium text-text-primary">{sttWarmupUi.title}</span>
+                      <span className="font-mono tabular-nums text-text-muted">
+                        {sttWarmupUi.progressPercent}%
+                      </span>
+                    </div>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-bg-tertiary">
+                      <div
+                        className="h-full rounded-full bg-accent transition-[width] duration-300 ease-out"
+                        style={{ width: `${sttWarmupUi.progressPercent}%` }}
+                      />
+                    </div>
+                    <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
+                      {sttWarmupUi.hint}
+                    </p>
                   </div>
-                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
-                    <div
-                      className="h-full rounded-full bg-cyan-500 transition-[width] duration-300 ease-out"
-                      style={{ width: `${sttWarmupUi.progressPercent}%` }}
-                    />
-                  </div>
-                  <p className="mt-2 text-[11px] leading-relaxed text-zinc-400">
-                    {sttWarmupUi.hint}
-                  </p>
+                )}
+                <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-border bg-bg-card text-text-muted">
+                  <Mic className="h-4 w-4" />
                 </div>
-              )}
-              <p className="text-center text-sm text-text-muted">
-                {sttStatusText}
-              </p>
+                <p className="mt-3 text-center text-sm text-text-secondary">
+                  {sttStatusText}
+                </p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {!showFullTranscript && messages.length > visibleMessages.length && (
-          <div className="text-center text-[10px] text-zinc-500">
-            Показаны последние {visibleMessages.length} фразы. Полный транскрипт раскрывается вверху.
-          </div>
-        )}
+          {!showFullTranscript && hiddenPhraseCount > 0 && (
+            <div className="pb-3 text-center text-[10px] text-text-muted">
+              {t("Скрыто фраз: {count}. Полный транскрипт раскрывается вверху.", { count: hiddenPhraseCount })}
+            </div>
+          )}
 
-        {visibleMessages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
-        ))}
+          {visibleMessages.length > 0 && (
+            <ol className="space-y-3">
+              {visibleMessages.map((msg, index) => {
+                const next = visibleMessages[index + 1];
+                return (
+                  <MessageEntry
+                    key={msg.id}
+                    message={msg}
+                    connectDown={
+                      msg.source !== "ai_marker" &&
+                      Boolean(next) &&
+                      next.source !== "ai_marker"
+                    }
+                  />
+                );
+              })}
+            </ol>
+          )}
 
-        <div ref={chatEndRef} />
+          <div ref={chatEndRef} />
+        </div>
 
         {!isAtBottom && newMsgCount > 0 && (
           <button
@@ -3904,78 +4687,43 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
             className={newMessagesButtonClassName}
           >
             <ChevronDown className="w-3.5 h-3.5" />
-            {newMsgCount} new message{newMsgCount > 1 ? "s" : ""}
+            {t("{newMsgCount} новых", { newMsgCount })}
           </button>
         )}
       </div>
 
       {/* AI Response Panel */}
       {lastLlmResponse && (
-        <div className="mx-3 mb-2 bg-black/50 border border-zinc-700/80 rounded-lg overflow-hidden shrink-0">
-          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-zinc-700/70 bg-zinc-900/55">
-            <Bot className="w-3.5 h-3.5 text-zinc-200" />
-            <span className="text-xs font-medium text-zinc-300">Подсказка</span>
+        <div className="mx-4 mb-3 flex max-h-[48vh] shrink-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg-card shadow-[0_1px_2px_rgba(20,22,40,0.04),0_18px_44px_-28px_rgba(24,28,55,0.24)]">
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-bg-secondary/60 px-3 py-2">
+            <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-accent shadow-[0_2px_6px_-2px_rgba(59,91,219,0.55)]">
+              <Bot className="h-3 w-3 text-white" />
+            </span>
+            <span className="text-xs font-semibold text-text-primary">{t("Подсказка")}</span>
             {lastRequestIntent && (
               <span
-                className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] text-cyan-100"
+                className="rounded-full border border-accent/20 bg-accent-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] text-accent"
                 title={lastRequestIntent.reason}
               >
-                {getIntentModeLabel(lastRequestIntent.mode)}
+                {t(getIntentModeLabel(lastRequestIntent.mode))}
               </span>
             )}
             <button
               type="button"
               onClick={() => {
-                setResponseExpanded((current) => !current);
-              }}
-              className="ml-auto inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[10px] text-zinc-300 hover:bg-zinc-800/70"
-              title={responseExpanded ? "Свернуть" : "Развернуть"}
-            >
-              {responseExpanded ? (
-                <Minimize2 className="h-3 w-3" />
-              ) : (
-                <Maximize2 className="h-3 w-3" />
-              )}
-              {responseExpanded ? "Свернуть" : "Развернуть"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
                 void copyLastResponse();
               }}
-              className="inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[10px] text-zinc-300 hover:bg-zinc-800/70"
-              title="Копировать"
+              className="ml-auto inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-tertiary/60 hover:text-text-primary transition-colors"
+              title={t("Копировать")}
             >
               <Copy className="h-3 w-3" />
-              {copiedResponse ? "Скопировано" : "Копировать"}
+              {copiedResponse ? t("Скопировано") : t("Копировать")}
             </button>
-            {!lastLlmResponse.isStreaming && (
-              <div className="flex items-center gap-1">
-                <FeedbackButton
-                  label="Хорошо"
-                  active={отзываUi.sentRating === "good"}
-                  loading={отзываUi.sending === "good"}
-                  onClick={() => void sendAiFeedback("good")}
-                />
-                <FeedbackButton
-                  label="Плохо"
-                  active={отзываUi.sentRating === "bad"}
-                  loading={отзываUi.sending === "bad"}
-                  onClick={() => void sendAiFeedback("bad")}
-                />
-                <FeedbackButton
-                  label="Не тот режим"
-                  active={отзываUi.sentRating === "wrong_mode"}
-                  loading={отзываUi.sending === "wrong_mode"}
-                  onClick={() => void sendAiFeedback("wrong_mode")}
-                />
-              </div>
-            )}
             {lastLlmResponse.isStreaming && (
-              <Loader2 className="w-3 h-3 text-zinc-300 animate-spin" />
+              <Loader2 className="w-3 h-3 text-accent animate-spin" />
             )}
             {!lastLlmResponse.isStreaming && lastLlmResponse.totalLatencyMs && (
-              <span className="text-[10px] text-zinc-500">
+              <span className="font-mono text-[10px] tabular-nums text-text-muted">
                 {(lastLlmResponse.totalLatencyMs / 1000).toFixed(1)}s
               </span>
             )}
@@ -3983,20 +4731,42 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           <div
             ref={aiPanelRef}
             onScroll={handleAiPanelScroll}
-            className={`px-3 py-2 overflow-y-auto bg-black/20 ${responseExpanded ? "max-h-[62vh]" : "max-h-[46vh]"}`}
+            className="min-h-0 flex-1 overflow-y-auto px-4 py-3"
           >
-            <p className="text-xs text-zinc-100 whitespace-pre-wrap leading-relaxed select-text">
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-text-primary select-text">
               {lastLlmResponse.text || (
-                <span className="text-zinc-500">Ждем ответ...</span>
+                <span className="text-text-muted">{t("Ждём ответ...")}</span>
               )}
             </p>
+            {!lastLlmResponse.isStreaming && (
+              <div className="mt-3 flex flex-wrap items-center gap-1 border-t border-border pt-2">
+                <FeedbackButton
+                  label={t("Хорошо")}
+                  active={отзываUi.sentRating === "good"}
+                  loading={отзываUi.sending === "good"}
+                  onClick={() => void sendAiFeedback("good")}
+                />
+                <FeedbackButton
+                  label={t("Плохо")}
+                  active={отзываUi.sentRating === "bad"}
+                  loading={отзываUi.sending === "bad"}
+                  onClick={() => void sendAiFeedback("bad")}
+                />
+                <FeedbackButton
+                  label={t("Не тот режим")}
+                  active={отзываUi.sentRating === "wrong_mode"}
+                  loading={отзываUi.sending === "wrong_mode"}
+                  onClick={() => void sendAiFeedback("wrong_mode")}
+                />
+              </div>
+            )}
             {отзываUi.отзываId && (
-              <div className="mt-2 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-100">
-                Оценка отправлена: {отзываUi.отзываId}
+              <div className="mt-2 rounded-lg border border-success/25 bg-success-muted px-2 py-1 text-[10px] text-success">
+                {t("Оценка отправлена: {feedbackId}", { feedbackId: отзываUi.отзываId })}
               </div>
             )}
             {отзываUi.error && (
-              <div className="mt-2 rounded-md border border-red-500/25 bg-red-500/10 px-2 py-1 text-[10px] text-red-100">
+              <div className="mt-2 rounded-lg border border-danger/25 bg-danger-muted px-2 py-1 text-[10px] text-danger">
                 {отзываUi.error}
               </div>
             )}
@@ -4005,61 +4775,227 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       )}
 
       {lastLlmError && (
-        <div className="mx-3 mb-2 rounded-lg border border-red-900/70 bg-black/55 px-3 py-2 shrink-0">
-          <p className="text-[11px] text-red-200 leading-relaxed">
-            Ошибка сервиса: {lastLlmError}
+        <div className="mx-4 mb-3 shrink-0 rounded-xl border border-danger/25 bg-danger-muted px-3 py-2">
+          <p className="text-[11px] leading-relaxed text-danger">
+            {t("Ошибка сервиса: {error}", { error: lastLlmError })}
           </p>
         </div>
       )}
 
-      {/* Manual question input */}
-      <div className="px-3 pb-2 shrink-0">
-        <div className="mb-1.5 flex items-center gap-1 overflow-x-auto rounded-lg border border-zinc-800/70 bg-black/25 px-1.5 py-1">
-          {INTERVIEW_INTENT_OPTIONS.map((option) => {
-            const active = intentModeOverride === option.mode;
-            return (
-              <button
-                key={option.mode}
-                type="button"
-                onClick={() => setIntentModeOverride(option.mode)}
-                title={option.hint}
-                className={`shrink-0 rounded-md px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] transition-colors ${
-                  active
-                    ? "border border-cyan-400/35 bg-cyan-400/15 text-cyan-100"
-                    : "border border-transparent text-zinc-500 hover:border-zinc-700 hover:text-zinc-200"
-                }`}
-              >
-                {option.shortLabel}
-              </button>
-            );
-          })}
-        </div>
-        <div className="flex items-center gap-2 rounded-lg border border-zinc-700/70 bg-black/40 px-2 py-1.5">
-          <input
-            type="text"
-            value={manualQuestion}
-            onChange={(event) => setManualQuestion(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void sendToLlm(false);
+      {/* Composer: question + actions, visually one block */}
+      <div className="shrink-0 border-t border-border bg-bg-secondary/40 px-4 pt-2.5 pb-3">
+        {/* p-3 matches the 12px corner radius so controls clear the rounded corners */}
+        <div className="space-y-2 rounded-xl border border-border bg-bg-card p-3 transition-colors focus-within:border-border-active focus-within:ring-2 focus-within:ring-accent/15">
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={manualQuestion}
+              onChange={(event) => {
+                dictationProducedTextRef.current = false;
+                setManualQuestion(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendToLlm(false);
+                }
+              }}
+              onPaste={attachImageFromClipboard}
+              placeholder={
+                isDictating
+                  ? // "Говорите" is only true when the window listens to your mic; on
+                    // the system track it is the interviewer who is being captured.
+                    settings.dictationSource === "system"
+                    ? t("Ловим вопрос собеседника — текст появится здесь")
+                    : t("Говорите — текст появится здесь")
+                  : t("Введите вопрос вручную или отправьте ножницы без текста")
               }
-            }}
-            placeholder="Введите вопрос вручную или отправьте ножницы без текста"
-            className="h-8 w-full bg-transparent px-2 text-sm text-zinc-100 placeholder:text-zinc-500 outline-none"
-          />
+              className="h-9 w-full flex-1 bg-transparent text-sm text-text-primary placeholder:text-text-muted outline-none"
+            />
+            {manualQuestion.length > 0 && (
+              // The field fills itself from the interviewer's speech, so there has to be
+              // a one-click way out when it collects something you never meant to send.
+              <button
+                type="button"
+                onClick={clearQuestion}
+                title={t("Очистить вопрос")}
+                aria-label={t("Очистить вопрос")}
+                className="flex h-9 w-7 shrink-0 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-bg-tertiary/60 hover:text-text-primary"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+            <button
+              type="button"
+              // Push-to-talk audio hint: click to start recording the interviewer,
+              // click again to send that clip straight to Gemini. No local dictation.
+              onClick={toggleAudioHint}
+              disabled={isSafeMode || (!audioHintRecording && audioHintsRemaining <= 0)}
+              title={
+                isSafeMode
+                  ? t("Режим без аудио: запись недоступна")
+                  : !audioHintRecording && audioHintsRemaining <= 0
+                    ? t("Лимит аудио-подсказок за собес исчерпан")
+                    : !isRecognitionReady
+                      ? t("Аудиопоток ещё подключается")
+                      : audioHintRecording
+                        ? t("Остановить и отправить вопрос в Gemini")
+                        : t("Записать вопрос голосом для Gemini")
+              }
+              aria-pressed={audioHintRecording}
+              aria-label={t("Голосовой вопрос в Gemini")}
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                audioHintRecording
+                  ? "border-danger/30 bg-danger-muted text-danger"
+                  : isRecognitionReady
+                    ? "border-border text-text-secondary hover:bg-bg-tertiary/60 hover:text-text-primary"
+                    : "border-border/60 text-text-muted hover:bg-bg-tertiary/60"
+              }`}
+            >
+              {audioHintRecording ? (
+                <span className="relative flex h-3 w-3">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-danger/60" />
+                  <span className="relative inline-flex h-3 w-3 rounded-full bg-danger" />
+                </span>
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+            </button>
+            <button
+              type="button"
+              // "Last N seconds" quick hint: one click sends the trailing window of the
+              // live audio stream straight to Gemini. Separate from push-to-talk (Mic) —
+              // no start/stop. Window length (3–15s) is the user's setting (speech tab).
+              onClick={sendQuickAudioHint}
+              disabled={
+                isSafeMode ||
+                audioHintRecording ||
+                audioHintTailSending ||
+                audioHintsRemaining <= 0
+              }
+              title={
+                isSafeMode
+                  ? t("Режим без аудио: запись недоступна")
+                  : audioHintsRemaining <= 0
+                    ? t("Лимит аудио-подсказок за собес исчерпан")
+                    : !isRecognitionReady
+                      ? t("Аудиопоток ещё подключается")
+                      : t("Отправить последние {n} сек в Gemini (осталось {r})", {
+                          n: settings.audioHintWindowSeconds,
+                          r: audioHintsRemaining,
+                        })
+              }
+              aria-label={t("Отправить последние секунды в Gemini")}
+              className={`flex h-9 shrink-0 items-center justify-center gap-1 rounded-lg border px-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                isRecognitionReady && !audioHintRecording
+                  ? "border-border text-text-secondary hover:bg-bg-tertiary/60 hover:text-text-primary"
+                  : "border-border/60 text-text-muted hover:bg-bg-tertiary/60"
+              }`}
+            >
+              {audioHintTailSending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <History className="h-4 w-4" />
+              )}
+              <span className="tabular-nums">{settings.audioHintWindowSeconds}с</span>
+            </button>
+          </div>
+          {pastedImageBase64 && (
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-secondary/60 p-1.5">
+              <img
+                src={`data:image/png;base64,${pastedImageBase64}`}
+                alt={t("Изображение из буфера обмена")}
+                className="h-9 w-14 shrink-0 rounded border border-border object-cover"
+              />
+              <span className="text-[11px] text-text-secondary">
+                {t("Изображение приложено к следующему запросу")}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPastedImageBase64(null)}
+                className="ml-auto inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-bg-tertiary/60 hover:text-text-primary"
+                title={t("Убрать изображение")}
+                aria-label={t("Убрать изображение")}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {(isDictating || dictationHint) && (
+            <div
+              className={`text-[11px] leading-relaxed ${
+                dictationHint ? "text-warning" : "text-text-muted"
+              }`}
+            >
+              {dictationHint ?? dictationSourceHint}
+            </div>
+          )}
+          {/* Actions live inside the composer card — one unit instead of a detached bar.
+              flex-wrap is a safety net: the pair fits from the 400px minimum overlay
+              width upward, and stacks instead of overflowing if it ever gets tighter. */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => sendToLlm(false)}
+              disabled={isLlmLoading || !hasQuestionToSend}
+              icon={
+                isLlmLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )
+              }
+              className="flex-[3]"
+            >
+              <span className="flex items-center gap-2">
+                {t("Отправить")}
+                <kbd className="rounded-md bg-white/20 px-1.5 py-1 font-mono text-[10px] leading-none tracking-normal text-white/90">
+                  {sendHkLabel}
+                </kbd>
+              </span>
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => sendToLlm(true)}
+              disabled={isLlmLoading || snipsRemaining <= 0}
+              title={
+                planLimits.scissorsPerInterview === 0
+                  ? t("Ножницы недоступны на тарифе «{plan}»", { plan: planLimits.title })
+                  : snipsRemaining <= 0
+                    ? t("Лимит ножниц за собес исчерпан")
+                    : t("Осталось {n} за собес", { n: snipsRemaining })
+              }
+              icon={
+                isLlmLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Scissors className="h-4 w-4" />
+                )
+              }
+              className="flex-[2]"
+            >
+              <span className="flex items-center gap-2">
+                {t("Ножницы")}
+                <kbd className="rounded-md bg-bg-tertiary px-1.5 py-1 font-mono text-[10px] leading-none tracking-normal text-text-secondary">
+                  {sendScreenHkLabel}
+                </kbd>
+              </span>
+            </Button>
+          </div>
         </div>
       </div>
 
       {cropDialogImageBase64 && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-          <div className="w-full max-w-5xl rounded-2xl border border-zinc-600/70 bg-zinc-950/95 shadow-2xl">
-            <div className="border-b border-zinc-700/70 px-4 py-3">
-              <div className="text-sm font-semibold text-zinc-100">
-                Ножницы: выделите область для отправки
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-5xl rounded-2xl border border-border bg-bg-card shadow-[0_30px_60px_-20px_rgba(24,28,55,0.35)]">
+            <div className="border-b border-border px-4 py-3">
+              <div className="text-sm font-semibold text-text-primary">
+                {t("Ножницы: выделите область для отправки")}
               </div>
-              <div className="mt-1 text-xs text-zinc-400">
-                Зажмите левую кнопку мыши и выделите нужный фрагмент.
+              <div className="mt-1 text-xs text-text-secondary">
+                {t("Зажмите левую кнопку мыши и выделите нужный фрагмент.")}
               </div>
             </div>
 
@@ -4128,9 +5064,9 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
                 <img
                   ref={cropImageRef}
                   src={`data:image/png;base64,${cropDialogImageBase64}`}
-                  alt="Скриншот для выделения"
+                  alt={t("Скриншот для выделения")}
                   draggable={false}
-                  className="max-h-[62vh] max-w-full rounded-md border border-zinc-700/70 object-contain"
+                  className="max-h-[62vh] max-w-full rounded-md border border-border object-contain"
                 />
                 {cropRect && (
                   <div
@@ -4146,97 +5082,193 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 border-t border-zinc-700/70 px-4 py-3">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => closeCropDialog(null)}
-              >
-                Отмена
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => closeCropDialog(cropDialogImageBase64)}
-              >
-                Отправить весь экран
-              </Button>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => {
-                  void applyCropSelection();
+            <div className="space-y-2 border-t border-border px-4 py-3">
+              <input
+                type="text"
+                value={cropPrompt}
+                autoFocus
+                onChange={(event) => {
+                  cropPromptRef.current = event.target.value;
+                  setCropPrompt(event.target.value);
                 }}
-                disabled={!cropRect}
-                icon={<Scissors className="h-4 w-4" />}
-              >
-                Отправить выделение
-              </Button>
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" || event.shiftKey) {
+                    return;
+                  }
+                  event.preventDefault();
+                  // Enter sends what is on screen: the selection if one exists,
+                  // otherwise the whole screenshot.
+                  if (cropRect) {
+                    void applyCropSelection();
+                  } else {
+                    closeCropDialog(cropDialogImageBase64);
+                  }
+                }}
+                placeholder={t("Вопрос к скриншоту — необязательно")}
+                className="h-9 w-full rounded-lg border border-border bg-bg-card px-3 text-sm text-text-primary placeholder:text-text-muted outline-none transition-colors focus:border-border-active focus:ring-2 focus:ring-accent/15"
+              />
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => closeCropDialog(null)}
+                >
+                  {t("Отмена")}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => closeCropDialog(cropDialogImageBase64)}
+                >
+                  {t("Отправить весь экран")}
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => {
+                    void applyCropSelection();
+                  }}
+                  disabled={!cropRect}
+                  icon={<Scissors className="h-4 w-4" />}
+                >
+                  {t("Отправить выделение")}
+                </Button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Action bar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-t border-zinc-700/70 bg-black/35 shrink-0">
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => sendToLlm(false)}
-          disabled={isLlmLoading || !hasQuestionToSend}
-          icon={isLlmLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-          className="flex-1"
-        >
-          Отправить ({sendHkLabel})
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => sendToLlm(true)}
-          disabled={isLlmLoading}
-          icon={isLlmLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scissors className="w-4 h-4" />}
-          className="flex-1"
-        >
-          Ножницы: вырезать и отправить ({sendScreenHkLabel})
-        </Button>
-      </div>
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function AudioSignal({
+  icon,
+  label,
+  active,
+}: {
+  icon: ReactNode;
+  label: string;
+  active: boolean;
+}) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1 transition-colors duration-300 ${
+        active ? "text-success" : "text-text-muted"
+      }`}
+      title={label}
+    >
+      {icon}
+      <span
+        className={`h-[5px] w-[5px] rounded-full ${
+          active ? "bg-success" : "bg-text-muted/30"
+        }`}
+        aria-hidden="true"
+      />
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
+function BannerAction({
+  onClick,
+  disabled,
+  tone = "accent",
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  tone?: "accent" | "warning";
+  children: ReactNode;
+}) {
+  const toneClasses =
+    tone === "warning"
+      ? "border-warning/25 text-warning hover:bg-warning-muted"
+      : "border-accent/25 text-accent hover:bg-accent-muted";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`rounded-lg border bg-bg-card px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.1em] transition-colors disabled:opacity-50 ${toneClasses}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MessageEntry({
+  message,
+  connectDown,
+}: {
+  message: ChatMessage;
+  connectDown: boolean;
+}) {
+  const t = useT();
   if (message.source === "ai_marker") {
+    // Notices used to be centred 10.5px text at 80% of an already muted grey — about
+    // 2.5:1 against the surface, and a wall of it whenever audio failed to start.
+    // Left-aligned in a quiet card instead: readable, and visibly not speech.
     return (
-      <div className="flex justify-center">
-        <span className="text-[10px] text-zinc-200 bg-zinc-900/80 border border-zinc-700 px-2 py-0.5 rounded-full">
+      <li className="relative flex py-0.5">
+        <div className="w-full rounded-lg border border-border/70 bg-bg-secondary/70 px-3 py-2 text-xs leading-relaxed text-text-secondary">
           {message.text}
-        </span>
-      </div>
+        </div>
+      </li>
     );
   }
 
   const isInterviewer = message.source === "interviewer";
+  const timeLabel = formatMessageTime(message.timestamp);
 
   return (
-    <div className={`flex ${isInterviewer ? "justify-start" : "justify-end"}`}>
-      <div
-        className={`
-          max-w-[75%] px-3 py-2 rounded-xl text-xs leading-relaxed select-text
-          ${
-            isInterviewer
-              ? "bg-zinc-800/70 text-zinc-100 border border-zinc-700/80 rounded-bl-sm"
-              : "bg-zinc-700/70 text-zinc-100 border border-zinc-600/80 rounded-br-sm"
-          }
-          ${!message.isFinal ? "opacity-60 italic" : ""}
-        `}
-      >
-        <div className="text-[10px] text-zinc-400 mb-0.5 font-medium">
-          {isInterviewer ? "Interviewer" : "You"}
-        </div>
-        {message.text}
+    <li
+      className={`relative grid grid-cols-[76px_1fr] items-start ${
+        !message.isFinal ? "opacity-70" : ""
+      }`}
+    >
+      <div className="flex flex-col items-end pr-3">
+        <span className="font-mono text-[10px] tracking-[0.06em] text-text-muted tabular-nums">
+          {timeLabel}
+        </span>
       </div>
-    </div>
+      <div className="relative pl-5">
+        {/* Rail segment down to the next entry's dot: 12px row gap + 8px dot offset */}
+        {connectDown && (
+          <span
+            className="absolute left-0 top-2 -bottom-5 w-px -translate-x-1/2 bg-border"
+            aria-hidden
+          />
+        )}
+        <span
+          className={`absolute left-0 top-[3px] h-2.5 w-2.5 -translate-x-1/2 rounded-full ring-4 ring-bg-primary ${
+            isInterviewer ? "bg-accent" : "bg-text-primary"
+          }`}
+          aria-hidden
+        />
+        <div className="mb-0.5 flex items-baseline gap-2">
+          <span
+            className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${
+              isInterviewer ? "text-accent" : "text-text-primary"
+            }`}
+          >
+            {isInterviewer ? t("Собеседник") : t("Вы")}
+          </span>
+        </div>
+        <p className="select-text whitespace-pre-wrap text-[14px] leading-[1.55] text-text-primary">
+          {message.text}
+        </p>
+      </div>
+    </li>
   );
+}
+
+function formatMessageTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const hh = date.getHours().toString().padStart(2, "0");
+  const mm = date.getMinutes().toString().padStart(2, "0");
+  return `${hh}:${mm}`;
 }
 
 function FeedbackButton({
@@ -4255,10 +5287,10 @@ function FeedbackButton({
       type="button"
       onClick={onClick}
       disabled={loading}
-      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors ${
+      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] transition-colors ${
         active
-          ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-100"
-          : "border-zinc-700 text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200"
+          ? "border-success/25 bg-success-muted text-success"
+          : "border-border text-text-secondary hover:bg-bg-tertiary/60 hover:text-text-primary"
       } disabled:cursor-not-allowed disabled:opacity-60`}
     >
       {loading && <Loader2 className="h-3 w-3 animate-spin" />}
@@ -4283,10 +5315,46 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${pad(h)}:${pad(m % 60)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
 }
 
-function getIntentModeLabel(mode: InterviewIntentMode): string {
+/**
+ * Сегмент капсулы остатков в шапке: иконка + число. Тихий в обычном состоянии,
+ * желтеет на исходе (≤20%) и краснеет в ноль; число делает тот же «поп», что
+ * значение слайдера (value-pop), когда остаток меняется.
+ */
+function HeaderLimitSegment({
+  icon: Icon,
+  remaining,
+  total,
+  title,
+}: {
+  icon: typeof Scissors;
+  remaining: number;
+  total: number;
+  title: string;
+}) {
+  const tone =
+    remaining <= 0
+      ? { icon: "text-danger/70", value: "text-danger" }
+      : total > 0 && remaining / total <= 0.2
+        ? { icon: "text-warning/80", value: "text-warning" }
+        : { icon: "text-text-muted", value: "text-text-primary" };
   return (
-    INTERVIEW_INTENT_OPTIONS.find((option) => option.mode === mode)?.label ?? mode
+    <span
+      className="inline-flex h-full items-center gap-1 border-l border-border/70 px-2"
+      title={title}
+    >
+      <Icon className={`h-3.5 w-3.5 ${tone.icon}`} />
+      <span
+        key={remaining}
+        className={`value-pop font-mono text-xs font-semibold tabular-nums ${tone.value}`}
+      >
+        {remaining}
+      </span>
+    </span>
   );
+}
+
+function getIntentModeLabel(mode: InterviewIntentMode): string {
+  return INTENT_MODE_LABELS[mode] ?? mode;
 }
 
 function inferManualIntentMode(text: string): InterviewIntent {
@@ -4385,15 +5453,7 @@ function resolveRequestIntentMode(
   manualQuestion: string,
   requestText: string,
   screenshotMode: boolean,
-  overrideMode: InterviewIntentMode,
 ): InterviewIntent {
-  if (overrideMode !== "AUTO") {
-    return {
-      mode: overrideMode,
-      reason: `режим выбран вручную: ${getIntentModeLabel(overrideMode)}`,
-    };
-  }
-
   const manualIntent = inferManualIntentMode(manualQuestion);
   if (manualIntent.mode !== "AUTO") {
     return manualIntent;

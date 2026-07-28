@@ -1142,7 +1142,7 @@ fn capture_server_stt_chunk_blocking(
     app: &tauri::AppHandle,
     microphone_device_id: Option<String>,
     system_audio_device_id: Option<String>,
-    duration_seconds: u32,
+    duration_ms: u32,
 ) -> Result<CaptureAudioSampleResult, String> {
     let captured_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1179,7 +1179,10 @@ fn capture_server_stt_chunk_blocking(
         }
     }
 
-    std::thread::sleep(Duration::from_secs(duration_seconds as u64));
+    // The capture runtime keeps recording between calls, so this only decides how
+    // much audio has piled up before we drain it. Dictation drains far more often
+    // than the background stream so words reach the input field quickly.
+    std::thread::sleep(Duration::from_millis(duration_ms as u64));
 
     let cell = server_stt_live_capture_runtime_cell();
     let mut guard = cell
@@ -1210,7 +1213,7 @@ fn capture_server_stt_chunk_blocking(
 
     Ok(CaptureAudioSampleResult {
         output_dir,
-        duration_seconds,
+        duration_seconds: duration_ms / 1000,
         microphone,
         system_audio,
         captured_at_unix_ms,
@@ -2830,6 +2833,9 @@ pub async fn probe_audio_devices(
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ServerSttChunkCaptureRequest {
     pub duration_seconds: Option<u32>,
+    /// Sub-second drain interval, used by dictation. Takes precedence over
+    /// `duration_seconds` when both are present.
+    pub duration_ms: Option<u32>,
     pub microphone_device_id: Option<String>,
     pub system_audio_device_id: Option<String>,
 }
@@ -2851,6 +2857,7 @@ pub struct ServerSttChunkTrack {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerSttChunkCaptureResult {
     pub duration_seconds: u32,
+    pub duration_ms: u32,
     pub microphone: ServerSttChunkTrack,
     pub system_audio: ServerSttChunkTrack,
     pub captured_at_unix_ms: u64,
@@ -2894,7 +2901,10 @@ pub async fn capture_server_stt_chunk(
     }
 
     let request = request.unwrap_or_default();
-    let duration_seconds = request.duration_seconds.unwrap_or(2).clamp(1, 6);
+    let duration_ms = match request.duration_ms {
+        Some(ms) => ms.clamp(100, 6000),
+        None => request.duration_seconds.unwrap_or(2).clamp(1, 6) * 1000,
+    };
     let microphone_device_id = normalize_optional_device_id(request.microphone_device_id);
     let system_audio_device_id = normalize_optional_device_id(request.system_audio_device_id);
     let app_handle = app.clone();
@@ -2904,12 +2914,13 @@ pub async fn capture_server_stt_chunk(
             &app_handle,
             microphone_device_id,
             system_audio_device_id,
-            duration_seconds,
+            duration_ms,
         )
     });
 
     let capture_result = match tokio::time::timeout(
-        Duration::from_secs(duration_seconds as u64 + SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS),
+        Duration::from_millis(duration_ms as u64)
+            + Duration::from_secs(SERVER_STT_CAPTURE_TIMEOUT_GRACE_SECS),
         capture_task,
     )
     .await
@@ -2948,7 +2959,8 @@ pub async fn capture_server_stt_chunk(
     }
 
     Ok(ServerSttChunkCaptureResult {
-        duration_seconds,
+        duration_seconds: duration_ms / 1000,
+        duration_ms,
         microphone: to_server_stt_chunk_track(
             "mic",
             capture_result.microphone.requested_device_id,
@@ -3420,6 +3432,16 @@ pub async fn activate_license(
 #[tauri::command]
 pub fn clear_license(app: tauri::AppHandle) -> Result<license::LicenseStatus, String> {
     license::clear_license(&app)
+}
+
+#[tauri::command]
+pub fn get_license_access_token() -> Result<Option<String>, String> {
+    license::get_license_access_token()
+}
+
+#[tauri::command]
+pub fn get_license_key() -> Result<Option<String>, String> {
+    license::get_license_key()
 }
 
 #[derive(Debug, Clone, Deserialize)]

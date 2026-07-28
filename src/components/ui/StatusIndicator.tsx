@@ -41,8 +41,8 @@ export function StatusIndicator({
   actionDisabled,
 }: Props) {
   return (
-    <div className="group flex items-start gap-3 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-3 transition-colors hover:border-white/18">
-      <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.05]">
+    <div className="card-hover group flex items-start gap-3 rounded-2xl border border-border bg-bg-card px-3.5 py-3.5 transition-all">
+      <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-border bg-bg-tertiary">
         {icons[status]}
       </div>
       <div className="flex-1 min-w-0">
@@ -50,7 +50,7 @@ export function StatusIndicator({
           <span className="text-sm font-medium text-text-primary">
             {label}
           </span>
-          <span className="rounded-full border border-white/10 bg-white/[0.06] px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-text-muted">
+          <span className="rounded-full border border-border bg-bg-tertiary px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-text-muted">
             {statusLabels[status]}
           </span>
           {actionLabel && onAction && (
@@ -58,7 +58,7 @@ export function StatusIndicator({
               type="button"
               onClick={onAction}
               disabled={actionDisabled}
-              className="ml-auto rounded-full border border-white/12 px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary transition-colors hover:border-accent/40 hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
+              className="ml-auto rounded-full border border-border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary transition-colors hover:border-accent/40 hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {actionLabel}
             </button>

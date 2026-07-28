@@ -1,17 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "@/stores/app";
 import {
+  readDevPersistedApiKey,
   readLegacyPersistedApiKey,
+  stripLegacyPersistedApiKey,
   useSettingsStore,
 } from "@/stores/settings";
+import { useLicenseStore } from "@/stores/license";
 import { useHistoryStore } from "@/stores/history";
 import { MainLayout } from "@/components/layout/MainLayout";
 import { DiagnosticsReporter } from "@/components/app/DiagnosticsReporter";
 import { Dashboard } from "@/pages/Dashboard";
+import { ReadinessPage } from "@/pages/ReadinessPage";
+import { CabinetPage } from "@/pages/CabinetPage";
+import { SupportPage } from "@/pages/SupportPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { InterviewOverlay } from "@/pages/InterviewOverlay";
 import { isTauri } from "@/lib/tauri";
+import { warmLicenseAccessTokenCache } from "@/lib/proxy";
 import { ensureSttModelWarm } from "@/lib/sttWarmup";
 import { useReadinessMonitor } from "@/hooks/useReadinessMonitor";
 import type { PrimaryLanguage } from "@/lib/types";
@@ -120,6 +127,7 @@ export default function App() {
     cleanup();
   }, [cleanup, historyRetentionDays]);
 
+  const [apiKeyHydrated, setApiKeyHydrated] = useState(false);
   useEffect(() => {
     let cancelled = false;
 
@@ -127,14 +135,20 @@ export default function App() {
       const legacyApiKey = readLegacyPersistedApiKey().trim();
 
       if (!isTauri()) {
-        if (!cancelled && legacyApiKey) {
-          hydrateApiKey(legacyApiKey);
+        // Browser/dev: no keychain — recover the key from its localStorage slot
+        // (falling back to the legacy plaintext blob) so it survives a reload.
+        const devApiKey = readDevPersistedApiKey() || legacyApiKey;
+        if (!cancelled && devApiKey) {
+          hydrateApiKey(devApiKey);
+        }
+        if (!cancelled) {
+          setApiKeyHydrated(true);
         }
         return;
       }
 
       try {
-        const { getSecureApiKey, setSecureApiKey } = await import("@/lib/tauri");
+        const { getSecureApiKey, setSecureApiKey, getLicenseKey } = await import("@/lib/tauri");
         const secureApiKey = ((await getSecureApiKey()) ?? "").trim();
         if (cancelled) {
           return;
@@ -142,15 +156,37 @@ export default function App() {
 
         if (secureApiKey) {
           hydrateApiKey(secureApiKey);
+          // Keychain is canonical; drop any plaintext key left in the persist blob.
+          stripLegacyPersistedApiKey();
+          return;
+        }
+
+        // Recover a key stored by the cabinet activation flow (secure-store account
+        // 'license_key') and promote it to the canonical account, so the key is
+        // shown in the cabinet even if it was never written to the canonical account.
+        const activationKey = ((await getLicenseKey()) ?? "").trim();
+        if (cancelled) {
+          return;
+        }
+        if (activationKey) {
+          await setSecureApiKey(activationKey);
+          if (cancelled) {
+            return;
+          }
+          hydrateApiKey(activationKey);
+          stripLegacyPersistedApiKey();
           return;
         }
 
         if (legacyApiKey) {
+          // Close the plaintext hole: promote the legacy key into the keychain,
+          // then strip it from the persisted settings blob.
           await setSecureApiKey(legacyApiKey);
           if (cancelled) {
             return;
           }
           hydrateApiKey(legacyApiKey);
+          stripLegacyPersistedApiKey();
         }
       } catch (error) {
         if (!cancelled && legacyApiKey) {
@@ -158,6 +194,10 @@ export default function App() {
         }
         logWarn("settings.apiKey", "Failed to hydrate API key from secure storage", error);
         console.warn("Failed to hydrate API key from secure storage:", error);
+      } finally {
+        if (!cancelled) {
+          setApiKeyHydrated(true);
+        }
       }
     }
 
@@ -167,6 +207,30 @@ export default function App() {
       cancelled = true;
     };
   }, [hydrateApiKey]);
+
+  // Warm the license token cache, migrate a legacy key to a device-bound token,
+  // and run the first revalidation — main window only, once the key is hydrated.
+  const licenseBootstrappedRef = useRef(false);
+  useEffect(() => {
+    if (isOverlayWindow !== false || !isTauri() || !apiKeyHydrated) {
+      return;
+    }
+    if (licenseBootstrappedRef.current) {
+      return;
+    }
+    licenseBootstrappedRef.current = true;
+    void useLicenseStore.getState().bootstrap();
+  }, [apiKeyHydrated, isOverlayWindow]);
+
+  // Warm the token cache in every window (read-only, no persist writes) so the
+  // overlay's in-interview product calls also use the Bearer token, not just the
+  // legacy key fallback.
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+    void warmLicenseAccessTokenCache();
+  }, []);
 
   useEffect(() => {
     if (!isTauri() || isOverlayWindow !== null) return;
@@ -652,10 +716,15 @@ export default function App() {
     <>
       <DiagnosticsReporter />
       <MainLayout>
-        {view === "dashboard" && <Dashboard />}
-        {view === "settings" && <SettingsPage />}
-        {view === "history" && <HistoryPage />}
-        {view === "interview" && <InterviewOverlay mode="embedded" />}
+        <div key={view} className="page-enter h-full">
+          {view === "dashboard" && <Dashboard />}
+          {view === "readiness" && <ReadinessPage />}
+          {view === "cabinet" && <CabinetPage />}
+          {view === "support" && <SupportPage />}
+          {view === "settings" && <SettingsPage />}
+          {view === "history" && <HistoryPage />}
+          {view === "interview" && <InterviewOverlay mode="embedded" />}
+        </div>
       </MainLayout>
     </>
   );

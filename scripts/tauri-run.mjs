@@ -18,11 +18,28 @@ const commandArgs = isWindows
 
 const env = { ...process.env };
 if (isWindows) {
-  const cmakeBin = "C:\\Program Files\\CMake\\bin";
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path";
-  const currentPath = env[pathKey] ?? "";
-  if (existsSync(cmakeBin) && !currentPath.toLowerCase().includes(cmakeBin.toLowerCase())) {
-    env[pathKey] = `${cmakeBin};${currentPath}`;
+  const ensureOnPath = (dir) => {
+    const currentPath = env[pathKey] ?? "";
+    if (!currentPath.toLowerCase().includes(dir.toLowerCase())) {
+      env[pathKey] = `${dir};${currentPath}`;
+    }
+  };
+
+  const cmakeBin = "C:\\Program Files\\CMake\\bin";
+  if (existsSync(cmakeBin)) {
+    ensureOnPath(cmakeBin);
+  }
+
+  // whisper-rs-sys generates its bindings with bindgen, which needs libclang.
+  // Point LIBCLANG_PATH at a default LLVM install (and add it to PATH) so the
+  // build doesn't fail with "Unable to find libclang".
+  const llvmBin = "C:\\Program Files\\LLVM\\bin";
+  if (existsSync(`${llvmBin}\\libclang.dll`)) {
+    if (!env.LIBCLANG_PATH) {
+      env.LIBCLANG_PATH = llvmBin;
+    }
+    ensureOnPath(llvmBin);
   }
 }
 

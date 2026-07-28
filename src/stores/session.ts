@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ChatMessage, LlmResponse } from "@/lib/types";
+import { useUsageStore } from "@/stores/usage";
 
 interface SessionState {
   isActive: boolean;
@@ -16,6 +17,10 @@ interface SessionState {
   interviewerChars: number;
   userChars: number;
   isLlmLoading: boolean;
+  // Использовано за текущий собес — под клиентские лимиты тарифа (plans.ts).
+  snipsUsed: number;
+  uploadsUsed: number;
+  audioHintsUsed: number;
 
   startSession: (options?: { mode?: "live" | "safe"; safeModeReason?: string | null }) => void;
   setSafeMode: (reason: string) => void;
@@ -30,6 +35,9 @@ interface SessionState {
   flushContextBuffer: () => void;
   setLlmLoading: (v: boolean) => void;
   trimMessages: (limitBytes: number) => void;
+  noteSnipUsed: () => void;
+  noteUploadUsed: () => void;
+  noteAudioHintUsed: () => void;
 }
 
 const MESSAGE_OVERHEAD_BYTES = 256;
@@ -53,8 +61,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   interviewerChars: 0,
   userChars: 0,
   isLlmLoading: false,
+  snipsUsed: 0,
+  uploadsUsed: 0,
+  audioHintsUsed: 0,
 
-  startSession: (options) =>
+  startSession: (options) => {
+    // Локальный месячный учёт собесов (usage store) — единственная точка старта,
+    // сюда сходятся и дашборд, и self-heal оверлея. Сервер заменит это квотами.
+    useUsageStore.getState().noteInterviewStarted();
     set({
       isActive: true,
       mode: options?.mode ?? "live",
@@ -70,7 +84,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       interviewerChars: 0,
       userChars: 0,
       isLlmLoading: false,
-    }),
+      snipsUsed: 0,
+      uploadsUsed: 0,
+      audioHintsUsed: 0,
+    });
+  },
 
   setSafeMode: (reason) =>
     set({
@@ -100,6 +118,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       interviewerChars: 0,
       userChars: 0,
       isLlmLoading: false,
+      snipsUsed: 0,
+      uploadsUsed: 0,
+      audioHintsUsed: 0,
     }),
 
   tick: () => {
@@ -200,6 +221,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   flushContextBuffer: () => set({ contextBuffer: [] }),
 
   setLlmLoading: (v) => set({ isLlmLoading: v }),
+
+  noteSnipUsed: () => set((s) => ({ snipsUsed: s.snipsUsed + 1 })),
+
+  noteUploadUsed: () => set((s) => ({ uploadsUsed: s.uploadsUsed + 1 })),
+
+  noteAudioHintUsed: () => set((s) => ({ audioHintsUsed: s.audioHintsUsed + 1 })),
 
   trimMessages: (limitBytes) =>
     set((s) => {

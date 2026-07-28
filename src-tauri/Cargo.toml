@@ -1,6 +1,6 @@
 [package]
 name = "ai-interview"
-version = "0.1.22"
+version = "0.1.23"
 description = "AI Interview Desktop Assistant"
 authors = ["AI Interview Team"]
 license = "MIT"
@@ -42,8 +42,15 @@ tauri-plugin-dialog = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+# keyring 3.x ships NO credential backend by default — without an explicit
+# platform feature it silently compiles the in-memory mock store, so every
+# secret is lost when the process exits. Must stay in sync with `keyring`
+# in [dependencies]; Cargo merges the feature sets per target.
+keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSWindow"] }
 objc2-foundation = "0.3"
+# See the note above: without this the macOS build also gets the mock store.
+keyring = { version = "3", features = ["apple-native"] }

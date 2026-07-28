@@ -1,7 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 
 type Variant = "primary" | "secondary" | "ghost" | "danger";
-type Size = "sm" | "md" | "lg";
+type Size = "xs" | "sm" | "md" | "lg";
 
 interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: Variant;
@@ -10,21 +10,26 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   icon?: ReactNode;
 }
 
+// Borderless variants carry a transparent border so they keep the same box as
+// `secondary` — otherwise a bordered button sits 2px taller than its neighbour.
 const variantStyles: Record<Variant, string> = {
   primary:
-    "border border-accent/45 bg-[linear-gradient(135deg,rgba(87,208,255,0.95),rgba(118,230,255,0.92))] text-slate-950 hover:brightness-110 active:scale-[0.985] shadow-[0_14px_34px_rgba(87,208,255,0.28)]",
+    "bg-accent text-white border border-transparent hover:bg-accent-hover active:scale-[0.99] shadow-[0_1px_2px_rgba(20,22,40,0.12)]",
   secondary:
-    "bg-white/[0.05] text-text-primary border border-white/12 hover:border-accent/35 hover:bg-white/[0.09]",
+    "bg-bg-card text-text-primary border border-border hover:border-border-active hover:bg-bg-tertiary/60",
   ghost:
-    "text-text-secondary hover:text-text-primary hover:bg-white/[0.07]",
+    "text-text-secondary border border-transparent hover:text-text-primary hover:bg-black/[0.04]",
   danger:
-    "border border-danger/40 bg-danger/90 text-white hover:bg-danger-hover active:scale-[0.985]",
+    "bg-danger text-white border border-transparent hover:bg-danger-hover active:scale-[0.99] shadow-[0_1px_2px_rgba(20,22,40,0.12)]",
 };
 
 const sizeStyles: Record<Size, string> = {
-  sm: "px-3 py-2 text-xs rounded-xl gap-1.5",
-  md: "px-4 py-2.5 text-sm rounded-2xl gap-2",
-  lg: "px-6 py-3.5 text-base rounded-[18px] gap-2.5",
+  // Explicit heights keep every variant on the same row rhythm regardless of
+  // borders or how tall the label content (icons, keycaps) happens to be.
+  xs: "h-7 px-3 text-xs rounded-lg gap-1.5",
+  sm: "h-8 px-3.5 text-xs rounded-lg gap-1.5",
+  md: "px-4 py-2.5 text-sm rounded-xl gap-2",
+  lg: "px-6 py-3.5 text-[0.95rem] rounded-xl gap-2.5",
 };
 
 export function Button({
@@ -39,9 +44,10 @@ export function Button({
   return (
     <button
       className={`
-        inline-flex items-center justify-center font-medium
-        transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:ring-offset-2 focus-visible:ring-offset-bg-primary
-        disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none
+        inline-flex items-center justify-center font-semibold tracking-[-0.005em]
+        transition-colors duration-200 cursor-pointer
+        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/45 focus-visible:ring-offset-2 focus-visible:ring-offset-bg-primary
+        disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none disabled:shadow-none
         ${variantStyles[variant]}
         ${sizeStyles[size]}
         ${className}

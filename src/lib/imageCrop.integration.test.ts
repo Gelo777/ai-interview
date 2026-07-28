@@ -1,9 +1,53 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  blobToBase64Png,
+  calculateAttachedImageSize,
   calculateSourceCropRect,
   cropBase64PngByRect,
   type CropRect,
 } from "@/lib/imageCrop";
+
+function stubCanvas(payload: string) {
+  const drawImage = vi.fn();
+  const originalCreateElement = document.createElement.bind(document);
+
+  vi.spyOn(document, "createElement").mockImplementation((tagName) => {
+    if (tagName.toLowerCase() !== "canvas") {
+      return originalCreateElement(tagName);
+    }
+
+    return {
+      width: 0,
+      height: 0,
+      getContext: () => ({ drawImage }),
+      toDataURL: () => `data:image/png;base64,${payload}`,
+    } as unknown as HTMLCanvasElement;
+  });
+
+  return drawImage;
+}
+
+function stubImage(naturalWidth: number, naturalHeight: number) {
+  vi.stubGlobal(
+    "Image",
+    class {
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      naturalWidth = naturalWidth;
+      naturalHeight = naturalHeight;
+      private value = "";
+
+      get src() {
+        return this.value;
+      }
+
+      set src(next: string) {
+        this.value = next;
+        queueMicrotask(() => this.onload?.());
+      }
+    },
+  );
+}
 
 function makeImageElement({
   clientWidth,
@@ -104,6 +148,26 @@ describe("screenshot scissors crop integration", () => {
       300,
       300,
     );
+  });
+
+  it("caps an oversized clipboard image at the longest edge and keeps the aspect ratio", () => {
+    expect(calculateAttachedImageSize(3840, 2160)).toEqual({ width: 1600, height: 900 });
+    expect(calculateAttachedImageSize(2160, 3840)).toEqual({ width: 900, height: 1600 });
+  });
+
+  it("leaves an already small clipboard image untouched", () => {
+    expect(calculateAttachedImageSize(800, 600)).toEqual({ width: 800, height: 600 });
+    expect(calculateAttachedImageSize(0, 0)).toEqual({ width: 0, height: 0 });
+  });
+
+  it("re-encodes a clipboard blob into a downscaled base64 PNG", async () => {
+    const drawImage = stubCanvas("clipboard-payload");
+    stubImage(3840, 2160);
+
+    const result = await blobToBase64Png(new Blob(["fake-jpeg"], { type: "image/jpeg" }));
+
+    expect(result).toBe("clipboard-payload");
+    expect(drawImage).toHaveBeenCalledWith(expect.any(Object), 0, 0, 1600, 900);
   });
 
   it("falls back to the original screenshot when dimensions are unavailable", async () => {

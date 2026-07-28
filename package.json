@@ -1,7 +1,7 @@
 {
   "name": "ai-interview",
   "private": true,
-  "version": "0.1.22",
+  "version": "0.1.23",
   "type": "module",
   "engines": {
     "node": ">=22 <25"
@@ -22,7 +22,9 @@
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
+    "fflate": "^0.8.3",
     "lucide-react": "^0.577.0",
+    "pdfjs-dist": "^4.10.38",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.13.1",

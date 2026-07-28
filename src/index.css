@@ -1,37 +1,51 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg-primary: #060b12;
-  --color-bg-secondary: #0d1624;
-  --color-bg-tertiary: #182338;
-  --color-bg-overlay: rgba(6, 11, 18, 0.82);
-  --color-bg-card: #111a2b;
-  --color-bg-input: #0a1320;
+  /* ---- Light content surfaces with real depth ------------------------- */
+  --color-bg-primary: #eceef3;
+  --color-bg-secondary: #f7f8fb;
+  --color-bg-tertiary: #e7e9f0;
+  --color-bg-overlay: rgba(236, 238, 243, 0.85);
+  --color-bg-card: #ffffff;
+  --color-bg-input: #ffffff;
 
-  --color-accent: #57d0ff;
-  --color-accent-hover: #7addff;
-  --color-accent-muted: rgba(87, 208, 255, 0.18);
+  /* ---- One restrained accent ------------------------------------------ */
+  --color-accent: #3b5bdb;
+  --color-accent-hover: #2f49b8;
+  --color-accent-muted: rgba(59, 91, 219, 0.09);
 
-  --color-danger: #ef4444;
-  --color-danger-hover: #dc2626;
-  --color-danger-muted: rgba(239, 68, 68, 0.15);
+  /* Kept as aliases of the accent so no stray second colour appears */
+  --color-violet: #3b5bdb;
+  --color-violet-muted: rgba(59, 91, 219, 0.09);
+  --color-cyan: #3b5bdb;
+  --color-cyan-muted: rgba(59, 91, 219, 0.09);
+  --color-warm: #3b5bdb;
+  --color-warm-muted: rgba(59, 91, 219, 0.09);
 
-  --color-success: #39d0a0;
-  --color-success-muted: rgba(57, 208, 152, 0.15);
+  --color-danger: #dc2f2a;
+  --color-danger-hover: #bf221d;
+  --color-danger-muted: rgba(220, 47, 42, 0.08);
 
-  --color-warning: #f8bf65;
-  --color-warning-muted: rgba(248, 191, 101, 0.16);
+  --color-success: #12934c;
+  --color-success-muted: rgba(18, 147, 76, 0.1);
 
-  --color-text-primary: #f4f7fb;
-  --color-text-secondary: #d2dceb;
-  --color-text-muted: #8ca0b6;
+  --color-warning: #b5730a;
+  --color-warning-muted: rgba(181, 115, 10, 0.1);
 
-  --color-border: rgba(176, 198, 224, 0.14);
-  --color-border-active: rgba(196, 225, 255, 0.3);
+  --color-text-primary: #14161e;
+  --color-text-secondary: #515869;
+  --color-text-muted: #868da0;
 
-  --color-interviewer: #73b7ff;
-  --color-user-bubble: #5dd7ff;
-  --color-ai-bubble: #ffb26b;
+  --color-border: rgba(17, 19, 30, 0.09);
+  --color-border-active: rgba(59, 91, 219, 0.32);
+
+  --color-interviewer: #7aa2ff;
+  --color-user-bubble: #4d7bff;
+  --color-ai-bubble: #ff9a4d;
+
+  --font-sans: "Manrope", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-display: "Manrope", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
 }
 
 @layer base {
@@ -41,20 +55,19 @@
 
   body {
     @apply bg-bg-primary text-text-primary antialiased;
-    font-family: "Sora", "Space Grotesk", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+    font-family: var(--font-sans);
+    font-weight: 450;
     margin: 0;
     padding: 0;
     overflow: hidden;
     user-select: text;
     -webkit-user-select: text;
     min-height: 100vh;
-    background:
-      radial-gradient(circle at 12% 10%, rgba(87, 208, 255, 0.22), transparent 32%),
-      radial-gradient(circle at 88% 8%, rgba(115, 183, 255, 0.18), transparent 30%),
-      radial-gradient(circle at 50% 100%, rgba(248, 191, 101, 0.12), transparent 34%),
-      linear-gradient(180deg, #0a111d 0%, #070d16 54%, #060b12 100%);
+    color: var(--color-text-primary);
+    background-color: #eceef3;
   }
 
+  /* The stealth overlay window stays transparent and dark */
   body.overlay-window {
     background: transparent;
   }
@@ -63,30 +76,9 @@
     min-height: 100vh;
   }
 
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    background-image:
-      linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
-    background-size: 40px 40px;
-    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent 90%);
-    opacity: 0.35;
-  }
-
-  body::after {
-    content: "";
-    position: fixed;
-    inset: auto 0 0 0;
-    height: 32vh;
-    pointer-events: none;
-    background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.24));
-  }
-
   ::-webkit-scrollbar {
-    width: 8px;
+    width: 10px;
+    height: 10px;
   }
 
   ::-webkit-scrollbar-track {
@@ -94,11 +86,194 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    background: rgba(198, 216, 236, 0.16);
+    background: rgba(18, 20, 32, 0.14);
     border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    background: rgba(198, 216, 236, 0.28);
+    background: rgba(18, 20, 32, 0.24);
+    background-clip: padding-box;
+  }
+
+  ::selection {
+    background: rgba(59, 91, 219, 0.16);
+    color: var(--color-text-primary);
+  }
+}
+
+/* ====================================================================== */
+/*  Motion — one-time entrances only, nothing looping                     */
+/* ====================================================================== */
+
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-enter {
+  animation: pageEnter 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.rise-in {
+  opacity: 0;
+  animation: riseIn 0.42s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* Slider feedback: the track fill glides to its new position and the value
+   badge gives a single tiny pop when the number changes. Interaction-driven
+   one-shots only — nothing loops. --slider-fill is registered so the gradient
+   stop can transition (Chromium/WebView2). */
+@property --slider-fill {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 0%;
+}
+
+@keyframes valuePop {
+  from {
+    transform: scale(1.18);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+.slider-track {
+  transition: --slider-fill 0.16s ease-out;
+}
+
+.value-pop {
+  display: inline-block;
+  animation: valuePop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ====================================================================== */
+/*  Utilities — flat, quiet. Names kept so components need no changes.    */
+/* ====================================================================== */
+
+@layer utilities {
+  /* Ambient layers are removed in the calm theme */
+  .aurora {
+    display: none;
+  }
+
+  /* All former gradients collapse to the single flat accent */
+  .gradient-primary,
+  .gradient-primary-soft,
+  .gradient-live,
+  .gradient-warm,
+  .gradient-aurora {
+    background-image: none;
+    background-color: var(--color-accent);
+  }
+
+  /* Headline highlight = a single accent-coloured word, no shimmer */
+  .text-gradient {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--color-accent);
+  }
+
+  /* Quiet white surface with a hairline border */
+  .glass {
+    background: #ffffff;
+    border: 1px solid var(--color-border);
+    box-shadow:
+      0 1px 2px rgba(20, 22, 40, 0.04),
+      0 16px 40px -34px rgba(30, 35, 60, 0.3);
+  }
+
+  .glass-panel {
+    background: #ffffff;
+    border: 1px solid var(--color-border);
+  }
+
+  .card-elevated {
+    background: var(--color-bg-card);
+    border: 1px solid rgba(17, 19, 30, 0.055);
+    box-shadow:
+      0 1px 1px rgba(20, 22, 40, 0.03),
+      0 4px 12px -6px rgba(24, 28, 50, 0.05),
+      0 22px 48px -26px rgba(24, 28, 55, 0.16);
+    transition:
+      box-shadow 0.35s ease,
+      border-color 0.35s ease,
+      transform 0.35s ease;
+  }
+
+  .card-hover:hover {
+    border-color: rgba(59, 91, 219, 0.18);
+    box-shadow:
+      0 1px 1px rgba(20, 22, 40, 0.04),
+      0 8px 18px -8px rgba(24, 28, 50, 0.07),
+      0 28px 56px -28px rgba(24, 28, 55, 0.22);
+  }
+
+  /* No glow, no ripple, no float — kept as no-ops so classNames still resolve */
+  .glow-accent,
+  .glow-live,
+  .glow-warm {
+    box-shadow: 0 4px 12px -8px rgba(30, 35, 60, 0.35);
+  }
+
+  .pulse-ring {
+    animation: none;
+  }
+
+  .animate-glow,
+  .animate-floaty {
+    animation: none;
+  }
+
+  .eq-bar {
+    animation: none;
+  }
+}
+
+/*
+ * Dark scope for the interview surface. The overlay stays dark/translucent
+ * over the shared screen, independent of the light app theme.
+ */
+.overlay-surface {
+  --color-bg-primary: #0d1020;
+  --color-bg-secondary: #12162a;
+  --color-bg-card: #14161e;
+  --color-bg-input: #0d0f16;
+  --color-bg-tertiary: #1b1e28;
+  --color-bg-overlay: rgba(13, 16, 32, 0.85);
+  --color-text-primary: #f3f5fa;
+  --color-text-secondary: #c1c8d6;
+  --color-text-muted: #8b93a5;
+  --color-border: rgba(255, 255, 255, 0.09);
+  --color-border-active: rgba(120, 140, 220, 0.45);
+  --color-accent-muted: rgba(120, 140, 220, 0.14);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

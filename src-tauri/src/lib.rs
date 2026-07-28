@@ -168,6 +168,8 @@ pub fn run() {
             commands::get_license_status,
             commands::activate_license,
             commands::clear_license,
+            commands::get_license_access_token,
+            commands::get_license_key,
             commands::get_proxy_license_status,
             app_updates::check_app_update,
             app_updates::install_app_update,

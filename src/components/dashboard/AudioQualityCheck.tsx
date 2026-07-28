@@ -4,6 +4,7 @@ import { CheckCircle, Copy, Loader2, Mic, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { useSettingsStore } from "@/stores/settings";
+import { useT } from "@/lib/i18n";
 import { logError, logInfo } from "@/lib/diagnostics";
 import type { CaptureAudioSampleResult, CapturedAudioTrack } from "@/lib/tauri";
 
@@ -38,21 +39,22 @@ function AudioTrackResult({
   track: CapturedAudioTrack;
   testId: string;
 }) {
+  const t = useT();
   const isOk = track.available && Boolean(track.file_path);
 
   return (
     <div
-      className="rounded-2xl border border-white/10 bg-white/[0.035] p-4"
+      className="rounded-2xl border border-border bg-bg-tertiary/50 p-4"
       data-testid={testId}
     >
       <div className="flex items-center gap-2">
-        <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06]">
+        <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-bg-tertiary">
           {icon}
         </div>
         <div>
           <div className="text-sm font-semibold text-text-primary">{title}</div>
           <div className={isOk ? "text-xs text-success" : "text-xs text-warning"}>
-            {isOk ? "Записано" : "Нужно проверить"}
+            {isOk ? t("Записано") : t("Нужно проверить")}
           </div>
         </div>
       </div>
@@ -60,7 +62,7 @@ function AudioTrackResult({
         {formatTrackSummary(track)}
       </div>
       {track.file_path && (
-        <div className="mt-2 break-all rounded-xl bg-black/20 px-3 py-2 text-[11px] text-text-secondary">
+        <div className="mt-2 break-all rounded-xl bg-bg-tertiary px-3 py-2 text-[11px] text-text-secondary">
           {track.file_path}
         </div>
       )}
@@ -74,6 +76,7 @@ function AudioTrackResult({
 }
 
 export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
+  const t = useT();
   const microphoneDeviceId = useSettingsStore((state) => state.microphoneDeviceId);
   const systemAudioDeviceId = useSettingsStore((state) => state.systemAudioDeviceId);
   const [running, setRunning] = useState(false);
@@ -87,13 +90,17 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
     }
 
     return [
-      `Папка: ${result.output_dir}`,
-      result.microphone.file_path ? `Микрофон: ${result.microphone.file_path}` : null,
-      result.system_audio.file_path ? `Системный звук: ${result.system_audio.file_path}` : null,
+      t("Папка: {path}", { path: result.output_dir }),
+      result.microphone.file_path
+        ? t("Микрофон: {path}", { path: result.microphone.file_path })
+        : null,
+      result.system_audio.file_path
+        ? t("Системный звук: {path}", { path: result.system_audio.file_path })
+        : null,
     ]
       .filter((line): line is string => Boolean(line))
       .join("\n");
-  }, [result]);
+  }, [result, t]);
 
   const runAudioCheck = useCallback(async () => {
     setRunning(true);
@@ -104,7 +111,7 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
     try {
       const { captureAudioSample, isTauri } = await import("@/lib/tauri");
       if (!isTauri()) {
-        throw new Error("Проверка аудио доступна только в установленном приложении.");
+        throw new Error(t("Проверка аудио доступна только в установленном приложении."));
       }
 
       const captureResult = await captureAudioSample({
@@ -122,13 +129,13 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
       });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : "Не удалось записать тестовый звук.";
+        err instanceof Error ? err.message : t("Не удалось записать тестовый звук.");
       setError(message);
       logError("audio.quality", "Audio quality check failed", err);
     } finally {
       setRunning(false);
     }
-  }, [microphoneDeviceId, onCompleted, systemAudioDeviceId]);
+  }, [microphoneDeviceId, onCompleted, systemAudioDeviceId, t]);
 
   const copyPaths = useCallback(async () => {
     if (!resultPaths) {
@@ -146,13 +153,16 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
 
   return (
     <Card
-      title="Проверка аудио"
-      description="Запишите 10 секунд микрофона и системного звука, затем послушайте WAV-файлы."
+      title={t("Проверка аудио")}
+      description={t(
+        "Запишите 10 секунд микрофона и системного звука, затем послушайте WAV-файлы.",
+      )}
     >
       <div className="space-y-4">
-        <div className="rounded-2xl border border-white/10 bg-white/[0.035] p-4 text-sm leading-relaxed text-text-secondary">
-          Перед тестом скажите пару фраз в микрофон и включите любой звук на компьютере.
-          После записи папка с WAV откроется автоматически.
+        <div className="rounded-2xl border border-border bg-bg-tertiary/50 p-4 text-sm leading-relaxed text-text-secondary">
+          {t(
+            "Перед тестом скажите пару фраз в микрофон и включите любой звук на компьютере. После записи папка с WAV откроется автоматически.",
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -168,7 +178,7 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
               )
             }
           >
-            {running ? "Записываем 10 секунд..." : "Записать тест"}
+            {running ? t("Записываем 10 секунд...") : t("Записать тест")}
           </Button>
           {resultPaths && (
             <Button
@@ -176,7 +186,7 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
               onClick={copyPaths}
               icon={<Copy className="h-4 w-4" />}
             >
-              {copied ? "Скопировано" : "Скопировать пути"}
+              {copied ? t("Скопировано") : t("Скопировать пути")}
             </Button>
           )}
         </div>
@@ -194,13 +204,13 @@ export function AudioQualityCheck({ onCompleted }: AudioQualityCheckProps) {
           <div className="grid gap-3 md:grid-cols-2">
             <AudioTrackResult
               icon={<Mic className="h-4 w-4 text-accent" />}
-              title="Микрофон"
+              title={t("Микрофон")}
               track={result.microphone}
               testId="audio-quality-microphone-result"
             />
             <AudioTrackResult
               icon={<Volume2 className="h-4 w-4 text-interviewer" />}
-              title="Системный звук"
+              title={t("Системный звук")}
               track={result.system_audio}
               testId="audio-quality-system-result"
             />

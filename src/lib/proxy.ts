@@ -81,6 +81,99 @@ export const HARDCODED_PROXY_BASE_URL = "https://leonovcare.ru";
 export const PROXY_BASE_URL =
   import.meta.env.VITE_PROXY_BASE_URL?.trim() || HARDCODED_PROXY_BASE_URL;
 
+/**
+ * Typed error thrown by product endpoints. Carries the server error `code`
+ * and `requestId` from the `{ "error": { code, message, requestId } }` envelope
+ * so callers (overlay, cabinet store) can branch on license/auth codes.
+ * Extends `Error`, so existing call-sites reading `error.message` keep working.
+ */
+export class ProxyApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly requestId: string | null;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    requestId: string | null,
+  ) {
+    super(message);
+    this.name = "ProxyApiError";
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+/**
+ * Single source of truth for turning backend license/auth error codes into
+ * Russian user-facing text. Covers both the locked impl-contract codes
+ * (AUTH_TOKEN_*, LICENSE_*, RATE_LIMITED, ACTIVATION_FINGERPRINT_REQUIRED) and
+ * the near-term design codes (TOKEN_*, LICENSE_NOT_FOUND, PAYMENT_REQUIRED).
+ */
+export const LICENSE_ERROR_MESSAGES: Record<string, string> = {
+  AUTH_TOKEN_REQUIRED:
+    "Активация недействительна. Откройте «Кабинет» и активируйте ключ заново.",
+  AUTH_TOKEN_INVALID:
+    "Активация недействительна. Откройте «Кабинет» и активируйте ключ заново.",
+  AUTH_TOKEN_REVOKED:
+    "Активация отозвана. Откройте «Кабинет» и активируйте ключ заново.",
+  AUTH_FINGERPRINT_REQUIRED:
+    "Не удалось определить устройство. Перезапустите приложение и попробуйте снова.",
+  ACTIVATION_FINGERPRINT_REQUIRED:
+    "Не удалось определить устройство. Перезапустите приложение и попробуйте снова.",
+  LICENSE_DEVICE_FINGERPRINT_REQUIRED:
+    "Не удалось определить устройство. Перезапустите приложение и попробуйте снова.",
+  TOKEN_EXPIRED: "Сеанс устарел, обновляем активацию...",
+  TOKEN_INVALID:
+    "Активация недействительна. Откройте «Кабинет» и активируйте ключ заново.",
+  LICENSE_EXPIRED:
+    "Срок действия лицензии истёк. Продлить можно в разделе «Кабинет».",
+  LICENSE_DEVICE_MISMATCH:
+    "Ключ привязан к другому устройству. Отвяжите его там или напишите в поддержку.",
+  LICENSE_NOT_FOUND: "Ключ не найден. Проверьте ключ из бота.",
+  LICENSE_INVALID: "Ключ не найден. Проверьте ключ из бота.",
+  LICENSE_DISABLED: "Лицензия отключена. Напишите в поддержку.",
+  PAYMENT_REQUIRED:
+    "Требуется оплата или исчерпан лимит тарифа. Откройте «Кабинет».",
+  RATE_LIMITED: "Слишком много запросов. Подождите немного и повторите.",
+};
+
+/**
+ * In-memory cache of the license access token. The token lives canonically in
+ * the OS keychain (Rust `secret_store`); we warm this cache once at startup and
+ * after activation so every request does not hit the keychain. The token is
+ * NEVER placed into zustand persist.
+ */
+let cachedAccessToken: string | null = null;
+
+export function setCachedAccessToken(token: string | null): void {
+  const trimmed = token?.trim() ?? "";
+  cachedAccessToken = trimmed ? trimmed : null;
+}
+
+export function getCachedAccessToken(): string | null {
+  return cachedAccessToken;
+}
+
+/**
+ * Reads the license access token from the keychain (Tauri only) and warms the
+ * module cache. Safe to call outside Tauri (no-op) and safe to call repeatedly.
+ */
+export async function warmLicenseAccessTokenCache(): Promise<void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return;
+  }
+  try {
+    const { getLicenseAccessToken } = await import("@/lib/tauri");
+    const token = (await getLicenseAccessToken())?.trim() ?? "";
+    setCachedAccessToken(token || null);
+  } catch (error) {
+    logWarn("license.token", "Failed to warm license access token cache", error);
+  }
+}
+
 function joinBaseUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
@@ -127,6 +220,30 @@ async function getDeviceHeaders(): Promise<Record<string, string>> {
   }
 }
 
+/**
+ * Builds auth headers for product endpoints. During the transition the backend
+ * accepts either `Authorization: Bearer <token>` (new) OR `X-License-Key`
+ * (legacy). We prefer the token when the module cache has one, otherwise fall
+ * back to the license key. Device headers are always attached.
+ */
+export async function getAuthHeaders(
+  licenseKey?: string,
+): Promise<Record<string, string>> {
+  const deviceHeaders = await getDeviceHeaders();
+  const token = getCachedAccessToken();
+  if (token) {
+    return {
+      Authorization: `Bearer ${token}`,
+      ...deviceHeaders,
+    };
+  }
+  const key = (licenseKey ?? "").trim();
+  return {
+    ...(key ? { "X-License-Key": key } : {}),
+    ...deviceHeaders,
+  };
+}
+
 export async function getLicenseStatus(
   licenseKey: string,
   baseUrlPreset: LlmBaseUrlPreset,
@@ -151,16 +268,127 @@ export async function getLicenseStatus(
   }
   const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/license/status"), {
     headers: {
-      "X-License-Key": trimmedKey,
-      ...(await getDeviceHeaders()),
+      ...(await getAuthHeaders(trimmedKey)),
     },
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    throw await readApiError(response);
   }
 
   return (await response.json()) as ProxyLicenseStatus;
+}
+
+export interface LicenseUsageToday {
+  hints: number;
+  snapshots: number;
+  llmTokens: number;
+}
+
+export interface LicenseLimits {
+  maxHintsPerDay: number;
+  maxSnapshotsPerDay: number;
+  maxAudioSecondsPerHint: number;
+}
+
+export interface LicenseDeviceInfo {
+  bound: boolean;
+  name: string | null;
+  activatedAt: string | null;
+  lastSeenAt: string | null;
+}
+
+export interface LicenseStatusFull {
+  status: string;
+  plan: string | null;
+  expiresAt: string | null;
+  usageToday: LicenseUsageToday | null;
+  limits: LicenseLimits | null;
+  device: LicenseDeviceInfo | null;
+}
+
+function toNumberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function toStringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizeLicenseStatusFull(raw: Record<string, unknown>): LicenseStatusFull {
+  const usageRaw = raw.usageToday;
+  const limitsRaw = raw.limits;
+  const deviceRaw = raw.device;
+
+  const usageToday =
+    usageRaw && typeof usageRaw === "object"
+      ? {
+          hints: toNumberOrZero((usageRaw as Record<string, unknown>).hints),
+          snapshots: toNumberOrZero((usageRaw as Record<string, unknown>).snapshots),
+          llmTokens: toNumberOrZero((usageRaw as Record<string, unknown>).llmTokens),
+        }
+      : null;
+
+  const limits =
+    limitsRaw && typeof limitsRaw === "object"
+      ? {
+          maxHintsPerDay: toNumberOrZero(
+            (limitsRaw as Record<string, unknown>).maxHintsPerDay,
+          ),
+          maxSnapshotsPerDay: toNumberOrZero(
+            (limitsRaw as Record<string, unknown>).maxSnapshotsPerDay,
+          ),
+          maxAudioSecondsPerHint: toNumberOrZero(
+            (limitsRaw as Record<string, unknown>).maxAudioSecondsPerHint,
+          ),
+        }
+      : null;
+
+  const device =
+    deviceRaw && typeof deviceRaw === "object"
+      ? {
+          bound: Boolean((deviceRaw as Record<string, unknown>).bound),
+          name: toStringOrNull((deviceRaw as Record<string, unknown>).name),
+          activatedAt: toStringOrNull(
+            (deviceRaw as Record<string, unknown>).activatedAt,
+          ),
+          lastSeenAt: toStringOrNull(
+            (deviceRaw as Record<string, unknown>).lastSeenAt,
+          ),
+        }
+      : null;
+
+  return {
+    status: typeof raw.status === "string" ? raw.status : "UNKNOWN",
+    plan: toStringOrNull(raw.plan),
+    expiresAt: toStringOrNull(raw.expiresAt),
+    usageToday,
+    limits,
+    device,
+  };
+}
+
+/**
+ * GET /api/v1/license/status with typed errors and the full response body
+ * (status, plan, expiresAt, usageToday, limits, device). Used by the license
+ * store for periodic revalidation. Sends Bearer token when available, else the
+ * license key, plus device headers.
+ */
+export async function fetchLicenseStatusFull(
+  licenseKey?: string,
+): Promise<LicenseStatusFull> {
+  const response = await fetch(joinBaseUrl(PROXY_BASE_URL, "/api/v1/license/status"), {
+    headers: {
+      ...(await getAuthHeaders(licenseKey)),
+    },
+  });
+
+  if (!response.ok) {
+    throw await readApiError(response);
+  }
+
+  const raw = (await response.json()) as Record<string, unknown>;
+  return normalizeLicenseStatusFull(raw);
 }
 
 export async function validateLicenseKey(
@@ -216,6 +444,8 @@ export async function requestProxyHint(params: {
   customBaseUrl: string;
   question: string;
   language: PrimaryLanguage;
+  /** Pre-interview background: topic/stack plus text from the context files. */
+  context?: string;
   imageBase64Png?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -226,6 +456,7 @@ export async function requestProxyHint(params: {
     customBaseUrl,
     question,
     language,
+    context,
     imageBase64Png,
     timeoutMs,
     signal,
@@ -246,6 +477,11 @@ export async function requestProxyHint(params: {
   const formData = new FormData();
   formData.set("question", question.trim());
   formData.set("meta", JSON.stringify({ lang: toProxyLanguage(language) }));
+
+  const trimmedContext = context?.trim();
+  if (trimmedContext) {
+    formData.set("context", trimmedContext);
+  }
 
   if (imageBase64Png) {
     formData.set("image", base64ToBlob(imageBase64Png, "image/png"), "screenshot.png");
@@ -282,8 +518,7 @@ export async function requestProxyHint(params: {
     response = await fetch(joinBaseUrl(baseUrl, "/api/v1/hint"), {
       method: "POST",
       headers: {
-        "X-License-Key": trimmedKey,
-        ...(await getDeviceHeaders()),
+        ...(await getAuthHeaders(trimmedKey)),
       },
       body: formData,
       signal: requestController.signal,
@@ -309,12 +544,13 @@ export async function requestProxyHint(params: {
   }
 
   if (!response.ok) {
-    const detail = await readErrorMessage(response);
+    const apiError = await readApiError(response);
     logWarn("service.hint", "Assistant request failed with HTTP status", {
       status: response.status,
-      detail,
+      detail: apiError.message,
+      code: apiError.code,
     });
-    throw new Error(detail);
+    throw apiError;
   }
 
   logInfo("service.hint", "Assistant request completed successfully", {
@@ -368,8 +604,7 @@ export async function requestLiveSttTranscribeLatest(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-License-Key": trimmedKey,
-      ...(await getDeviceHeaders()),
+      ...(await getAuthHeaders(trimmedKey)),
     },
     body: JSON.stringify({
       streamId,
@@ -387,7 +622,7 @@ export async function requestLiveSttTranscribeLatest(params: {
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    throw await readApiError(response);
   }
 
   return (await response.json()) as LiveSttTranscribeLatestResponse;
@@ -411,8 +646,7 @@ export async function submitSupportReport(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-License-Key": trimmedKey,
-      ...(await getDeviceHeaders()),
+      ...(await getAuthHeaders(trimmedKey)),
     },
     body: JSON.stringify({
       appVersion: params.appVersion,
@@ -422,7 +656,7 @@ export async function submitSupportReport(params: {
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    throw await readApiError(response);
   }
 
   return (await response.json()) as SupportReportResponse;
@@ -449,8 +683,7 @@ export async function submitAiFeedback(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-License-Key": trimmedKey,
-      ...(await getDeviceHeaders()),
+      ...(await getAuthHeaders(trimmedKey)),
     },
     body: JSON.stringify({
       hintId: params.hintId ?? null,
@@ -466,7 +699,7 @@ export async function submitAiFeedback(params: {
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    throw await readApiError(response);
   }
 
   return (await response.json()) as AiFeedbackResponse;
@@ -504,8 +737,7 @@ export async function submitTelemetryEvent(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(trimmedKey ? { "X-License-Key": trimmedKey } : {}),
-      ...(await getDeviceHeaders()),
+      ...(await getAuthHeaders(trimmedKey)),
     },
     body: JSON.stringify({
       eventType: params.eventType,
@@ -519,7 +751,7 @@ export async function submitTelemetryEvent(params: {
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    throw await readApiError(response);
   }
 
   return (await response.json()) as TelemetryEventResponse;
@@ -605,6 +837,87 @@ function base64ToBlob(base64: string, mimeType: string): Blob {
   }
 
   return new Blob([bytes], { type: mimeType });
+}
+
+interface ApiErrorEnvelope {
+  message?: unknown;
+  code?: unknown;
+  error?:
+    | string
+    | {
+        code?: unknown;
+        message?: unknown;
+        requestId?: unknown;
+      };
+}
+
+/**
+ * Parses the `{ "error": { code, message, requestId } }` envelope (and legacy
+ * shapes) into a typed `ProxyApiError`. The message is resolved to friendly
+ * Russian text via the code map / OpenAI special cases when possible.
+ */
+export async function readApiError(response: Response): Promise<ProxyApiError> {
+  const raw = await response.text();
+  const status = response.status;
+  let code: string | null = null;
+  let requestId: string | null = null;
+  let serverMessage = "";
+
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as ApiErrorEnvelope;
+      const errorField = parsed.error;
+      if (errorField && typeof errorField === "object") {
+        if (typeof errorField.code === "string") {
+          code = errorField.code;
+        }
+        if (typeof errorField.requestId === "string") {
+          requestId = errorField.requestId;
+        }
+        if (typeof errorField.message === "string") {
+          serverMessage = errorField.message;
+        }
+      } else if (typeof errorField === "string") {
+        serverMessage = errorField;
+      }
+      if (!serverMessage && typeof parsed.message === "string") {
+        serverMessage = parsed.message;
+      }
+      if (!code && typeof parsed.code === "string") {
+        code = parsed.code;
+      }
+    } catch {
+      serverMessage = raw;
+    }
+  }
+
+  const message = resolveFriendlyErrorMessage(code, serverMessage, status);
+  return new ProxyApiError(message, status, code, requestId);
+}
+
+function resolveFriendlyErrorMessage(
+  code: string | null,
+  serverMessage: string,
+  status: number,
+): string {
+  const normalizedCode = code?.trim().toUpperCase() ?? "";
+  if (normalizedCode && LICENSE_ERROR_MESSAGES[normalizedCode]) {
+    return LICENSE_ERROR_MESSAGES[normalizedCode];
+  }
+  if (status === 402) {
+    return LICENSE_ERROR_MESSAGES.PAYMENT_REQUIRED;
+  }
+  const openAiFriendly = toFriendlyProxyError(
+    { error: { code: normalizedCode, message: serverMessage } },
+    status,
+  );
+  if (openAiFriendly) {
+    return openAiFriendly;
+  }
+  if (serverMessage.trim()) {
+    return serverMessage.trim();
+  }
+  return `Ошибка сервера (${status})`;
 }
 
 async function readErrorMessage(response: Response): Promise<string> {
