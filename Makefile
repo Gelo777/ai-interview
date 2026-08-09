@@ -15,10 +15,10 @@ install:
 run: dev
 
 dev: install
-	npx tauri dev
+	npm run tauri -- dev
 
 build: install
-	npx tauri build
+	npm run tauri -- build
 
 check:
 	npx tsc --noEmit

@@ -620,7 +620,7 @@ impl SttSession {
                 }
 
                 match spawn_recognition_worker(
-                    app,
+                    app.clone(),
                     running.clone(),
                     model_path.clone(),
                     language.clone(),
@@ -1461,6 +1461,24 @@ fn run_worker(
         )?;
     }
 
+    if !audio_window.is_empty() {
+        let flush_tail_samples = flush_tail_samples_for_model(&active_slot.model_path);
+        let flush_tail_start = audio_window.len().saturating_sub(flush_tail_samples);
+        decode_audio_window(
+            &app,
+            &running,
+            source,
+            &mut active_slot,
+            &active_language,
+            &audio_window[flush_tail_start..],
+            total_samples_seen,
+            &mut last_emitted_final_end_ms,
+            &mut last_emitted_text,
+            &mut last_progress_emit_audio_ms,
+            true,
+        )?;
+    }
+
     log::info!("STT worker '{}' finished cleanly", source);
 
     Ok(())
@@ -1671,7 +1689,7 @@ fn decode_audio_window(
     last_progress_emit_audio_ms: &mut i64,
     flush_tail: bool,
 ) -> Result<(), String> {
-    if !running.load(Ordering::Relaxed) {
+    if !flush_tail && !running.load(Ordering::Relaxed) {
         return Ok(());
     }
     if audio_window.is_empty() {
@@ -1709,7 +1727,7 @@ fn decode_audio_window(
         .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
     // Skip decoding near-silence chunks in streaming mode; otherwise we waste
     // CPU and can starve real speech updates.
-    if !flush_tail && peak < 0.001 {
+    if peak < 0.0001 || (!flush_tail && peak < 0.001) {
         return Ok(());
     }
     // Boost low-level signals before decoding so Whisper does not classify

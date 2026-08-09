@@ -1260,8 +1260,8 @@ fn build_pcm16_mono_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod audio_recording_tests {
     use super::{
-        audio_has_productive_signal, audio_peak_abs_i16, audio_rms_i16,
-        build_pcm16_mono_wav_bytes, condition_server_stt_mic_chunk,
+        audio_has_productive_signal, audio_peak_abs_i16, audio_rms_i16, build_pcm16_mono_wav_bytes,
+        condition_server_stt_mic_chunk,
     };
 
     const DRIVE_VIDEO_AUDIO_FIXTURES: &[(&str, &[u8])] = &[
@@ -1322,7 +1322,11 @@ mod audio_recording_tests {
                 b"fmt " => {
                     assert!(chunk_len >= 16, "fmt chunk is too short");
                     assert_eq!(read_u16_le(bytes, payload_offset), 1, "expected PCM wav");
-                    assert_eq!(read_u16_le(bytes, payload_offset + 2), 1, "expected mono wav");
+                    assert_eq!(
+                        read_u16_le(bytes, payload_offset + 2),
+                        1,
+                        "expected mono wav"
+                    );
                     sample_rate = Some(read_u32_le(bytes, payload_offset + 4));
                     assert_eq!(
                         read_u16_le(bytes, payload_offset + 14),
@@ -3901,7 +3905,8 @@ pub fn list_whisper_models(app: tauri::AppHandle) -> Result<Vec<WhisperModelOpti
 #[tauri::command]
 pub fn set_active_whisper_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = whisper_models_base_dir(&app)?;
-    let normalized = model_id.trim();
+    let normalized = validate_model_id(&model_id)?;
+    whisper_model_file_name(normalized)?;
     let model_path = whisper_model_path(&base_dir, normalized);
     if !model_path.is_file() {
         return Err(format!(
@@ -3922,7 +3927,8 @@ pub fn set_active_whisper_model(app: tauri::AppHandle, model_id: String) -> Resu
 #[tauri::command]
 pub fn remove_whisper_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = whisper_models_base_dir(&app)?;
-    let normalized = model_id.trim();
+    let normalized = validate_model_id(&model_id)?;
+    whisper_model_file_name(normalized)?;
     let model_path = whisper_model_path(&base_dir, normalized);
     if !model_path.is_file() {
         return Err(format!("Whisper model '{}' is not installed.", normalized));
@@ -4820,7 +4826,8 @@ pub async fn preload_stt_model(app: tauri::AppHandle, model_id: String) -> Resul
     let app_clone = app.clone();
     let preload_handle = tauri::async_runtime::spawn_blocking(move || {
         let base_dir = whisper_models_base_dir(&app_clone)?;
-        let normalized = model_id.trim();
+        let normalized = validate_model_id(&model_id)?;
+        whisper_model_file_name(normalized)?;
         let model_path = whisper_model_path(&base_dir, normalized);
         if !model_path.is_file() {
             return Err(format!(
@@ -4846,13 +4853,15 @@ pub async fn preload_stt_model(app: tauri::AppHandle, model_id: String) -> Resul
 #[tauri::command]
 pub fn remove_vosk_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = models_base_dir(&app)?;
-    let target_dir = base_dir.join(model_id.trim());
+    let normalized = validate_model_id(&model_id)?;
+    let target_dir = base_dir.join(normalized);
     if !target_dir.is_dir() {
-        return Err(format!("Профиль '{}' не установлен.", model_id.trim()));
+        return Err(format!("Профиль '{}' не установлен.", normalized));
     }
+    let target_dir = canonical_existing_child_dir(&base_dir, &target_dir)?;
     std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove model: {}", e))?;
 
-    if read_active_model_id(&base_dir).as_deref() == Some(model_id.trim()) {
+    if read_active_model_id(&base_dir).as_deref() == Some(normalized) {
         let remaining = installed_model_ids(&base_dir);
         if let Some(next_model) = remaining.first() {
             write_active_model_id(&base_dir, next_model)?;
@@ -4887,6 +4896,8 @@ pub async fn download_whisper_model(
     model_id: String,
 ) -> Result<String, String> {
     install_control::reset_cancel();
+    let normalized_model_id = validate_model_id(&model_id)?.to_string();
+    whisper_model_file_name(&normalized_model_id)?;
     let client = reqwest::Client::builder()
         .user_agent("ai-interview-desktop/0.1")
         .connect_timeout(Duration::from_secs(NETWORK_CONNECT_TIMEOUT_SECS))
@@ -4908,8 +4919,8 @@ pub async fn download_whisper_model(
 
     let total = response.content_length();
     let base_dir = whisper_models_base_dir(&app)?;
-    let temp_path = base_dir.join(format!("{}.download", model_id.trim()));
-    let target_path = whisper_model_path(&base_dir, model_id.trim());
+    let temp_path = base_dir.join(format!("{}.download", normalized_model_id));
+    let target_path = whisper_model_path(&base_dir, &normalized_model_id);
     let mut file = std::fs::File::create(&temp_path)
         .map_err(|e| format!("Failed to create Whisper model file: {}", e))?;
 
@@ -4948,7 +4959,7 @@ pub async fn download_whisper_model(
         .map_err(|e| format!("Failed to finalize Whisper model file: {}", e))?;
 
     if read_active_whisper_model_id(&app).is_none() {
-        let _ = write_active_whisper_model_id(&app, model_id.trim());
+        let _ = write_active_whisper_model_id(&app, &normalized_model_id);
     }
 
     target_path
@@ -5192,10 +5203,7 @@ fn install_vosk_model_archive(
     archive_size: Option<u64>,
     extracting_start_percent: f32,
 ) -> Result<String, String> {
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        return Err("Не выбран профиль распознавания.".to_string());
-    }
+    let model_id = validate_model_id(model_id)?;
     let progress_bytes = archive_size.unwrap_or(0);
     if emit_progress {
         emit_vosk_model_progress(
@@ -5473,6 +5481,31 @@ fn whisper_models_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(models_dir)
 }
 
+fn validate_model_id(model_id: &str) -> Result<&str, String> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(format!("Некорректный идентификатор модели: '{}'", model_id));
+    }
+    Ok(trimmed)
+}
+
+fn canonical_existing_child_dir(base_dir: &Path, target_dir: &Path) -> Result<PathBuf, String> {
+    let canonical_base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate models directory: {}", e))?;
+    let canonical_target = target_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate model directory: {}", e))?;
+    if !canonical_target.starts_with(&canonical_base) || canonical_target == canonical_base {
+        return Err("Путь модели находится вне каталога моделей.".to_string());
+    }
+    Ok(canonical_target)
+}
+
 fn whisper_model_file_name(model_id: &str) -> Result<&'static str, String> {
     match model_id.trim() {
         "whisper-small" => Ok("ggml-small.bin"),
@@ -5661,15 +5694,61 @@ fn cleanup_selected_models(
     model_ids: &[String],
     keep_model_id: &str,
 ) -> Result<(), String> {
-    for model_id in model_ids {
+    let keep_model_id = validate_model_id(keep_model_id)?;
+    let validated_model_ids = model_ids
+        .iter()
+        .map(|model_id| validate_model_id(model_id))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for model_id in validated_model_ids {
         if model_id == keep_model_id {
             continue;
         }
         let target_dir = models_dir.join(model_id);
         if target_dir.is_dir() {
+            let target_dir = canonical_existing_child_dir(models_dir, &target_dir)?;
             std::fs::remove_dir_all(&target_dir)
                 .map_err(|e| format!("Failed to remove old model '{}': {}", model_id, e))?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_path_security_tests {
+    use super::{cleanup_selected_models, validate_model_id};
+
+    #[test]
+    fn rejects_model_id_path_traversal() {
+        for model_id in ["../../etc", "../Documents", "nested/model", r"nested\model"] {
+            assert!(validate_model_id(model_id).is_err(), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn cleanup_rejects_traversal_before_touching_filesystem() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "ai-interview-model-security-{}",
+            std::process::id()
+        ));
+        let outside_dir = models_dir.with_extension("outside");
+        std::fs::create_dir_all(&models_dir).expect("create models test directory");
+        std::fs::create_dir_all(&outside_dir).expect("create outside test directory");
+        std::fs::write(outside_dir.join("keep.txt"), b"safe").expect("create sentinel");
+
+        let result = cleanup_selected_models(
+            &models_dir,
+            &[format!(
+                "../{}",
+                outside_dir.file_name().unwrap().to_string_lossy()
+            )],
+            "current-model",
+        );
+
+        assert!(result.is_err());
+        assert!(outside_dir.join("keep.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(models_dir);
+        let _ = std::fs::remove_dir_all(outside_dir);
+    }
 }

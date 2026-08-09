@@ -3,5 +3,10 @@
   "build": {
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev -- --host 127.0.0.1"
+  },
+  "bundle": {
+    "resources": [
+      "resources/**/*"
+    ]
   }
 }

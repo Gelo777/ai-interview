@@ -674,33 +674,48 @@ export default function App() {
     };
   }, [isOverlayWindow, setAppUpdate]);
 
-  const unlistenInterviewEndedRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     if (!isTauri() || isOverlayWindow !== false) return;
-    import("@tauri-apps/api/event").then(({ listen }) => {
-      listen("interview_ended", async () => {
-        logInfo("window.main", "Received interview_ended event");
-        useAppStore.getState().setInterviewActive(false);
-        useAppStore.getState().setView("dashboard");
-        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-        const mainWindow = getCurrentWebviewWindow();
-        await mainWindow.setSkipTaskbar(false).catch(() => {
-          // Not supported on every platform/window manager.
-        });
-        await mainWindow.show();
-        await mainWindow.unminimize().catch(() => {
-          // Window may already be restored.
-        });
-        await mainWindow.setFocus().catch(() => {
-          // Focus changes may be blocked by the OS.
-        });
-      }).then((fn) => {
-        unlistenInterviewEndedRef.current = fn;
+
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("interview_ended", async () => {
+          logInfo("window.main", "Received interview_ended event");
+          useAppStore.getState().setInterviewActive(false);
+          useAppStore.getState().setView("dashboard");
+          const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+          const mainWindow = getCurrentWebviewWindow();
+          await mainWindow.setSkipTaskbar(false).catch(() => {
+            // Not supported on every platform/window manager.
+          });
+          await mainWindow.show();
+          await mainWindow.unminimize().catch(() => {
+            // Window may already be restored.
+          });
+          await mainWindow.setFocus().catch(() => {
+            // Focus changes may be blocked by the OS.
+          });
+        }),
+      )
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          logWarn("window.main", "Failed to subscribe to interview_ended event", error);
+        }
       });
-    });
+
     return () => {
-      unlistenInterviewEndedRef.current?.();
-      unlistenInterviewEndedRef.current = null;
+      cancelled = true;
+      unlisten?.();
     };
   }, [isOverlayWindow]);
 

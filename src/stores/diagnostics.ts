@@ -40,7 +40,11 @@ export const useDiagnosticsStore = create<DiagnosticsState>()(
     {
       name: "ai-interview-diagnostics",
       storage: appPersistStorage,
-      partialize: (state) => ({ entries: state.entries }),
+      // Keep useful event metadata across restarts, but never persist arbitrary
+      // error details because they can contain request headers or credentials.
+      partialize: (state) => ({
+        entries: state.entries.map((entry) => ({ ...entry, details: null })),
+      }),
     },
   ),
 );

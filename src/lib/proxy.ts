@@ -559,15 +559,56 @@ export async function requestProxyHint(params: {
   return (await response.json()) as ProxyHintResponse;
 }
 
-export function buildLiveSttWebSocketUrl(params: {
+export interface LiveSttWebSocketTicket {
+  ticket: string;
+  expiresAt: string;
+}
+
+export async function requestLiveSttWebSocketTicket(params: {
   licenseKey: string;
+  baseUrl?: string;
+}): Promise<LiveSttWebSocketTicket> {
+  const licenseKey = params.licenseKey.trim();
+  if (!licenseKey) {
+    throw new Error("Введите лицензионный ключ.");
+  }
+
+  const baseUrl = params.baseUrl?.trim() || PROXY_BASE_URL;
+  const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/stt/live/ticket"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(await getAuthHeaders(licenseKey)),
+    },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    throw await readApiError(response);
+  }
+
+  const payload = (await response.json()) as Partial<LiveSttWebSocketTicket>;
+  if (!payload.ticket?.trim() || !payload.expiresAt?.trim()) {
+    throw new Error("Сервис вернул некорректный билет для live STT.");
+  }
+  return {
+    ticket: payload.ticket.trim(),
+    expiresAt: payload.expiresAt.trim(),
+  };
+}
+
+export function buildLiveSttWebSocketUrl(params: {
+  ticket: string;
   lang: string;
   deviceFingerprint?: string;
   deviceName?: string;
   baseUrl?: string;
 }): string {
   const wsUrl = toLiveSttWebSocketUrl(params.baseUrl?.trim() || PROXY_BASE_URL);
-  wsUrl.searchParams.set("licenseKey", params.licenseKey.trim());
+  const ticket = params.ticket.trim();
+  if (!ticket) {
+    throw new Error("Билет для live STT отсутствует.");
+  }
+  wsUrl.searchParams.set("ticket", ticket);
   wsUrl.searchParams.set("lang", (params.lang || "ru").trim().toLowerCase());
   if (params.deviceFingerprint?.trim()) {
     wsUrl.searchParams.set("deviceFingerprint", params.deviceFingerprint.trim());

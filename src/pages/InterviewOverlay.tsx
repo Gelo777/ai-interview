@@ -31,6 +31,7 @@ import {
   formatProxyHintResponse,
   ProxyApiError,
   PROXY_BASE_URL,
+  requestLiveSttWebSocketTicket,
   requestLiveSttTranscribeLatest,
   requestProxyHint,
   submitAiFeedback,
@@ -2411,9 +2412,15 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           const effectiveProxyBaseUrl =
             currentSettings.customBaseUrl.trim() || PROXY_BASE_URL;
           const lang = resolveLanguageTag(currentSettings.primaryLanguage || "ru-RU");
-          const identity = await getDeviceIdentity().catch(() => null);
+          const [identity, liveTicket] = await Promise.all([
+            getDeviceIdentity().catch(() => null),
+            requestLiveSttWebSocketTicket({
+              licenseKey: liveLicenseKey,
+              baseUrl: effectiveProxyBaseUrl,
+            }),
+          ]);
           const wsUrl = buildLiveSttWebSocketUrl({
-            licenseKey: liveLicenseKey,
+            ticket: liveTicket.ticket,
             lang,
             deviceFingerprint: identity?.fingerprint,
             deviceName: identity?.name,

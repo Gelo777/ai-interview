@@ -101,13 +101,19 @@ pub fn run() {
                     );
 
                     tauri::async_runtime::spawn_blocking(move || {
-                        if let Err(err) = stt_runtime::stop_global_session() {
-                            log::warn!(
-                                "Overlay destroy STT cleanup did not finish immediately: {}",
-                                err
-                            );
-                        } else {
-                            log::info!("Overlay destroy STT cleanup finished");
+                        for (engine, result) in [
+                            ("Vosk", stt_runtime::stop_global_session()),
+                            ("Whisper", whisper_stt_runtime::stop_global_session()),
+                        ] {
+                            if let Err(err) = result {
+                                log::warn!(
+                                    "Overlay destroy {} STT cleanup did not finish immediately: {}",
+                                    engine,
+                                    err
+                                );
+                            } else {
+                                log::info!("Overlay destroy {} STT cleanup finished", engine);
+                            }
                         }
                     });
 
