@@ -1,6 +1,6 @@
 /**
- * Whisper was trained on subtitle corpora, so on silence or background noise it tends
- * to emit the credits and filler that ended those files — "Субтитры в Киеве",
+ * Speech models trained on subtitle corpora tend, on silence or background noise, to
+ * emit the credits and filler that ended those files — "Субтитры в Киеве",
  * "Продолжение следует", "Thanks for watching". None of it was ever spoken, and in an
  * interview transcript it reads as if the candidate said it.
  *

@@ -69,7 +69,6 @@ import type {
   ServerSttChunkTrack,
   SttDiagnosticEvent,
   SttResultEvent,
-  WhisperModelOption,
 } from "@/lib/tauri";
 
 type PersistStoreLike = {
@@ -98,9 +97,9 @@ const SETTINGS_HYDRATION_WATCHDOG_MS = 2500;
 const STT_AUTOSTART_ENABLED = true;
 const STT_STRICT_AUDIO_MODE = true;
 /**
- * Recognition runs locally on Whisper: audio never leaves the machine, mixed-language
- * speech works without swapping models, and the request to the backend carries text
- * instead of a WAV — which is what used to trip the 1 MB limit on the upstream proxy.
+ * Recognition runs locally on Vosk: audio never leaves the machine, and the request
+ * to the backend carries text instead of a WAV — which is what used to trip the 1 MB
+ * limit on the upstream proxy.
  *
  * Kept as a constant rather than deleted so the server path stays reachable if the
  * local engine has to be bypassed.
@@ -1070,7 +1069,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       language?: PrimaryLanguage;
     }) => {
       const resolvedSelection = await resolveConcreteAudioSelection(request);
-      const { startSttSession } = await import("@/lib/tauri");
+      const { startVoskSttSession } = await import("@/lib/tauri");
       logInfo("speech.session", "Starting speech session", {
         microphoneDeviceId: resolvedSelection.microphoneDeviceId || "(default)",
         microphoneLabel: resolvedSelection.microphoneLabel,
@@ -1099,7 +1098,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       );
       try {
         await withTimeout(
-          startSttSession({
+          startVoskSttSession({
             microphoneDeviceId: resolvedSelection.microphoneDeviceId,
             systemAudioDeviceId: resolvedSelection.systemAudioDeviceId,
             language: request?.language,
@@ -1148,7 +1147,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
       }
 
       const stopPromise = (async () => {
-        const { isTauri, stopSttSession, stopVoskSttSession } = await import("@/lib/tauri");
+        const { isTauri, stopVoskSttSession } = await import("@/lib/tauri");
         if (!isTauri()) {
           return;
         }
@@ -1167,9 +1166,6 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           setIsDictating(false);
           setDictationHint("Распознавание остановлено — диктовка прервана.");
         }
-        await stopSttSession().catch(() => {
-          // Best effort cleanup for the older live path.
-        });
 
         const deadline = Date.now() + STT_STOP_SETTLE_TIMEOUT_MS;
         let attempt = 0;
@@ -1486,12 +1482,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   const ensureActiveSttLanguage = useCallback(
     async (language: PrimaryLanguage, restartSession: boolean): Promise<boolean> => {
-      const {
-        isTauri,
-        isSttSessionRunning,
-        listWhisperModels,
-        setActiveWhisperModel,
-      } = await import("@/lib/tauri");
+      const { isTauri, isVoskSttSessionRunning, getVoskSttStatus } = await import("@/lib/tauri");
       if (!isTauri()) {
         logInfo("speech.language", "Skipping speech profile switch in non-desktop mode", {
           language,
@@ -1505,21 +1496,19 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         restartSession,
       });
 
-      // Whisper models are multilingual — one installed model serves every language,
-      // so there is nothing to match by language. That is also what makes mixed-language
-      // speech work without swapping models mid-interview.
-      const models = await withTimeout(
-        listWhisperModels(),
+      // The local Vosk profile (Russian) is resolved by the backend, so there is
+      // nothing to select here — just confirm a usable profile is installed.
+      const status = await withTimeout(
+        getVoskSttStatus(),
         STT_MODEL_LOOKUP_TIMEOUT_MS,
-        "Не удалось быстро получить список моделей. Проверьте настройки распознавания.",
+        "Не удалось быстро проверить профиль распознавания. Проверьте настройки распознавания.",
       );
-      const selectedModel =
-        models.find((model: WhisperModelOption) => model.installed && model.active) ??
-        models.find((model: WhisperModelOption) => model.installed) ??
-        null;
 
-      if (!selectedModel) {
-        logWarn("speech.language", "No installed speech model was found", { language });
+      if (!status.available) {
+        logWarn("speech.language", "No installed speech model was found", {
+          language,
+          detail: status.detail,
+        });
         addMessage({
           id: crypto.randomUUID(),
           timestamp: Date.now(),
@@ -1530,28 +1519,20 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         return false;
       }
 
-      if (!selectedModel.active) {
-        setSttStatusText("Активируем модель распознавания. Первый старт может быть дольше обычного...");
-        await setActiveWhisperModel(selectedModel.id);
-      }
-
       if (restartSession) {
-        const running = await isSttSessionRunning().catch(() => false);
+        const running = await isVoskSttSessionRunning().catch(() => false);
         if (running) {
           await stopSttSessionGracefully("language_switch");
         }
         await startSttSessionWithRecovery(language);
         logInfo("speech.language", "Restarted speech capture with selected profile", {
           language,
-          modelId: selectedModel.id,
         });
       }
 
       setActiveSttLanguage(language);
       logInfo("speech.language", "Speech profile is active", {
         language,
-        modelId: selectedModel.id,
-        profile: selectedModel.profile,
       });
       return true;
     },
@@ -2063,8 +2044,8 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
 
   // Push-to-talk audio hint. Toggle: first press starts recording, second press
   // drains the recorded audio on the server and sends it to Gemini as one clip.
-  // No local Whisper, no transcript text — the interviewer's voice goes to the
-  // model directly, which is what keeps stray words out of the buffer.
+  // No local transcription, no transcript text — the interviewer's voice goes to
+  // the model directly, which is what keeps stray words out of the buffer.
   const toggleAudioHint = useCallback(() => {
     const live = serverSttLiveRef.current;
     if (!live.socket || live.socket.readyState !== WebSocket.OPEN || !live.streamId) {
@@ -3001,7 +2982,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
         microphoneDeviceId: activeSettings.microphoneDeviceId || "(default)",
         systemAudioDeviceId: activeSettings.systemAudioDeviceId || "(default)",
       });
-      const { isTauri, isSttSessionRunning } = await import("@/lib/tauri");
+      const { isTauri, isVoskSttSessionRunning } = await import("@/lib/tauri");
       if (disposed) {
         return;
       }
@@ -3041,7 +3022,7 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
           return;
         }
         setSttStatusText("Запускаем захват микрофона и системного звука...");
-        const alreadyRunning = await isSttSessionRunning().catch(() => false);
+        const alreadyRunning = await isVoskSttSessionRunning().catch(() => false);
         if (disposed) {
           return;
         }

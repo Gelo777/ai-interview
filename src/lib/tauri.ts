@@ -92,31 +92,6 @@ export interface CaptureAudioSampleResult {
   captured_at_unix_ms: number;
 }
 
-export interface TranscribeCapturedAudioRequest {
-  captureDir?: string;
-  language?: string;
-}
-
-export interface TranscribedAudioTrack {
-  source: string;
-  file_path: string | null;
-  sample_rate: number | null;
-  sample_count: number;
-  duration_ms: number;
-  text: string;
-  available: boolean;
-  detail: string;
-}
-
-export interface TranscribeCapturedAudioResult {
-  capture_dir: string;
-  model_path: string;
-  language: string;
-  microphone: TranscribedAudioTrack;
-  system_audio: TranscribedAudioTrack;
-  transcribed_at_unix_ms: number;
-}
-
 export interface ServerSttChunkCaptureRequest extends AudioDeviceSelectionRequest {
   durationSeconds?: number;
   /** Sub-second drain interval for dictation; wins over durationSeconds. */
@@ -482,17 +457,6 @@ export async function captureAudioSample(
   });
 }
 
-export async function transcribeCapturedAudio(
-  request?: TranscribeCapturedAudioRequest,
-): Promise<TranscribeCapturedAudioResult> {
-  return invoke("transcribe_captured_audio", {
-    request: {
-      capture_dir: request?.captureDir?.trim() || undefined,
-      language: request?.language?.trim() || undefined,
-    },
-  });
-}
-
 export async function probeAudioDevices(
   request?: AudioAutoProbeRequest,
 ): Promise<AudioAutoProbeResult> {
@@ -554,31 +518,8 @@ export async function stopServerSttLiveCapture(): Promise<void> {
   return invoke("stop_server_stt_live_capture");
 }
 
-export async function getSttStatus(): Promise<SttStatus> {
-  return invoke("get_stt_status");
-}
-
 export async function getVoskSttStatus(): Promise<SttStatus> {
   return invoke("get_vosk_stt_status");
-}
-
-export async function startSttSession(
-  request?: StartSttSessionRequest,
-): Promise<void> {
-  return invoke("start_stt_session", {
-    request: {
-      ...normalizeAudioDeviceSelection(request),
-      language: request?.language?.trim() || undefined,
-    },
-  });
-}
-
-export async function stopSttSession(): Promise<void> {
-  return invoke("stop_stt_session");
-}
-
-export async function isSttSessionRunning(): Promise<boolean> {
-  return invoke("is_stt_session_running");
 }
 
 export async function startVoskSttSession(
@@ -598,10 +539,6 @@ export async function stopVoskSttSession(): Promise<void> {
 
 export async function isVoskSttSessionRunning(): Promise<boolean> {
   return invoke("is_vosk_stt_session_running");
-}
-
-export async function switchSttLanguage(language: string): Promise<void> {
-  return invoke("switch_stt_language", { language });
 }
 
 export async function listVoskRuntimeVersions(): Promise<VoskRuntimeVersion[]> {
@@ -672,13 +609,6 @@ export interface VoskModelDownloadProgress {
   phase: string;
 }
 
-export interface WhisperModelDownloadProgress {
-  bytes_downloaded: number;
-  content_length: number | null;
-  percent: number;
-  phase: string;
-}
-
 export interface VoskModelOption {
   id: string;
   name: string;
@@ -691,16 +621,6 @@ export interface VoskModelOption {
   update_available: boolean;
   installed_versions: string[];
   default_baseline: boolean;
-}
-
-export interface WhisperModelOption {
-  id: string;
-  name: string;
-  profile: string;
-  size_mb: number;
-  download_url: string;
-  installed: boolean;
-  active: boolean;
 }
 
 export async function downloadVoskModel(
@@ -774,40 +694,6 @@ export async function switchSttModel(modelId: string): Promise<void> {
 
 export async function preloadSttModel(modelId: string): Promise<void> {
   return invoke("preload_stt_model", { modelId });
-}
-
-export async function listWhisperModels(): Promise<WhisperModelOption[]> {
-  return invoke("list_whisper_models");
-}
-
-export async function setActiveWhisperModel(modelId: string): Promise<void> {
-  return invoke("set_active_whisper_model", { modelId });
-}
-
-export async function removeWhisperModel(modelId: string): Promise<void> {
-  return invoke("remove_whisper_model", { modelId });
-}
-
-export async function downloadWhisperModel(
-  url: string,
-  modelId: string,
-  onProgress?: (p: WhisperModelDownloadProgress) => void,
-): Promise<string> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  const { listen } = await import("@tauri-apps/api/event");
-  const unlisten = onProgress
-    ? await listen<WhisperModelDownloadProgress>("whisper_model_download_progress", (e) =>
-        onProgress(e.payload),
-      )
-    : undefined;
-  try {
-    return await invoke<string>("download_whisper_model", {
-      url,
-      modelId,
-    });
-  } finally {
-    unlisten?.();
-  }
 }
 
 export async function removeVoskModel(modelId: string): Promise<void> {

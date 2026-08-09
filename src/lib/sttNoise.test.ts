@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { isKnownSubtitleCreditNoise } from "@/lib/sttNoise";
 
-describe("whisper hallucination filter", () => {
-  it("drops the subtitle credits Whisper emits on silence", () => {
+describe("subtitle-credit hallucination filter", () => {
+  it("drops the subtitle credits speech models emit on silence", () => {
     // The exact phrase that reached a live transcript and started this fix.
     expect(isKnownSubtitleCreditNoise("Субтитры в Киеве")).toBe(true);
     expect(isKnownSubtitleCreditNoise("Субтитры сделал DimaTorzok")).toBe(true);

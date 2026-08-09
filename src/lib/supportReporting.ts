@@ -198,7 +198,6 @@ function sanitizeReportText(value: string): string {
     .replace(/\bVosk\s+runtime\b/gi, "speech module")
     .replace(/\bVosk model\b/gi, "speech profile")
     .replace(/\bVosk\b/g, "speech")
-    .replace(/\bWhisper\b/g, "speech service")
     .replace(/\bOpenAI\b/g, "service")
     .replace(/\bproxy\b/gi, "service")
     .replace(/\bruntime\b/gi, "module")

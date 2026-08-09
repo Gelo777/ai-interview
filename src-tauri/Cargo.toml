@@ -37,7 +37,6 @@ zip = "2.2"
 libloading = "0.8"
 base64 = "0.22"
 keyring = "3"
-whisper-rs = "0.16"
 tauri-plugin-dialog = "2"
 
 [target.'cfg(windows)'.dependencies]

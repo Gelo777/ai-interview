@@ -30,17 +30,6 @@ if (isWindows) {
   if (existsSync(cmakeBin)) {
     ensureOnPath(cmakeBin);
   }
-
-  // whisper-rs-sys generates its bindings with bindgen, which needs libclang.
-  // Point LIBCLANG_PATH at a default LLVM install (and add it to PATH) so the
-  // build doesn't fail with "Unable to find libclang".
-  const llvmBin = "C:\\Program Files\\LLVM\\bin";
-  if (existsSync(`${llvmBin}\\libclang.dll`)) {
-    if (!env.LIBCLANG_PATH) {
-      env.LIBCLANG_PATH = llvmBin;
-    }
-    ensureOnPath(llvmBin);
-  }
 }
 
 const child = spawn(commandName, commandArgs, {
