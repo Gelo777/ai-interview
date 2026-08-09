@@ -113,7 +113,7 @@ export function SupportReportCard() {
     } finally {
       setSending(false);
     }
-  }, [apiKey, report]);
+  }, [apiKey, report, t]);
 
   return (
     <Card

@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback } from "react";
 import {
   Play,
   AlertTriangle,
@@ -32,11 +32,9 @@ import { logError, logInfo, logWarn } from "@/lib/diagnostics";
 import { applyCaptureProtectionPreference } from "@/lib/captureProtection";
 import { getServiceStatus } from "@/lib/proxy";
 import { submitCriticalSupportReport } from "@/lib/supportReporting";
-import type { CaptureAudioSampleResult } from "@/lib/tauri";
 import { useT } from "@/lib/i18n";
 
 const START_READINESS_TIMEOUT_MS = 8000;
-const AUDIO_TEST_COMPLETED_KEY = "ai-interview-audio-test-completed-v1";
 const CLIENT_STT_MODEL_INSTALL_ENABLED = false;
 
 async function withTimeout<T>(
@@ -105,20 +103,9 @@ export function Dashboard() {
   const [applyingCaptureProtection, setApplyingCaptureProtection] = useState(false);
   const [captureProtectionError, setCaptureProtectionError] = useState<string | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
-  const [runningSystemCheck, setRunningSystemCheck] = useState(false);
-  const [lastSystemCheckAt, setLastSystemCheckAt] = useState<number | null>(null);
-  const [systemCheckError, setSystemCheckError] = useState<string | null>(null);
-  const [proxyStatusDetail, setProxyStatusDetail] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [startReportStatus, setStartReportStatus] = useState<string | null>(null);
   const [sendingStartReport, setSendingStartReport] = useState(false);
-  const [audioTestCompleted, setAudioTestCompleted] = useState(() => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-    return window.localStorage.getItem(AUDIO_TEST_COMPLETED_KEY) === "1";
-  });
-  const audioCheckRef = useRef<HTMLDivElement | null>(null);
 
   const lastSession = sessions[0] ?? null;
 
@@ -255,33 +242,11 @@ export function Dashboard() {
     t,
   ]);
 
-  const scrollToAudioCheck = useCallback(() => {
-    audioCheckRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
-
-  const handleAudioCheckCompleted = useCallback((result: CaptureAudioSampleResult) => {
-    const microphoneOk = result.microphone.available && Boolean(result.microphone.file_path);
-    const systemAudioOk =
-      result.system_audio.available && Boolean(result.system_audio.file_path);
-
-    if (!microphoneOk || !systemAudioOk) {
-      return;
-    }
-
-    setAudioTestCompleted(true);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(AUDIO_TEST_COMPLETED_KEY, "1");
-    }
-  }, []);
-
   const handleRunSystemCheck = useCallback(async () => {
-    setRunningSystemCheck(true);
-    setSystemCheckError(null);
-    setProxyStatusDetail(null);
     logInfo("system.check", "Manual readiness check started");
 
     try {
-      const [, , proxyStatus] = await withTimeout(
+      await withTimeout(
         Promise.all([
           refreshLocalReadinessNow(),
           refreshCloudReadinessNow(),
@@ -293,24 +258,9 @@ export function Dashboard() {
         START_READINESS_TIMEOUT_MS,
         t("Истекло время ожидания проверки готовности."),
       );
-      if (proxyStatus) {
-        setProxyStatusDetail(
-          proxyStatus.openAiConfigured
-            ? t("Сервис доступен.")
-            : t("Сервис доступен, но обработка ответов временно не настроена."),
-        );
-      }
-      setLastSystemCheckAt(Date.now());
       logInfo("system.check", "Manual readiness check finished");
     } catch (error) {
-      const detail =
-        error instanceof Error
-          ? error.message
-          : t("Не удалось выполнить проверку готовности.");
-      setSystemCheckError(detail);
       logError("system.check", "Manual readiness check failed", error);
-    } finally {
-      setRunningSystemCheck(false);
     }
   }, [t]);
 
@@ -365,13 +315,6 @@ export function Dashboard() {
     primarySttVariant,
     secondarySttVariant,
   );
-  const currentAppVersion = appUpdate.currentVersion?.trim() || __APP_VERSION__ || t("неизвестно");
-  const availableAppVersion = appUpdate.version?.trim() || null;
-  const hasPendingUpdate =
-    appUpdate.available &&
-    availableAppVersion !== null &&
-    availableAppVersion !== currentAppVersion;
-
   const readinessItems = [
     {
       key: "api",
@@ -467,13 +410,6 @@ export function Dashboard() {
       setInstallingUpdate(false);
     }
   }, [setAppUpdate, t]);
-
-  const lastCheckLabel = lastSystemCheckAt
-    ? new Date(lastSystemCheckAt).toLocaleTimeString("ru-RU", {
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : null;
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-8 sm:px-8">
@@ -774,21 +710,6 @@ export function Dashboard() {
   );
 }
 
-function LiveWave() {
-  const bars = [40, 100, 65, 90, 50];
-  return (
-    <span className="flex h-3 items-end gap-[2px]" aria-hidden="true">
-      {bars.map((h, i) => (
-        <span
-          key={i}
-          className="eq-bar w-[2px] rounded-full gradient-live"
-          style={{ height: `${h}%`, animationDelay: `${i * 130}ms` }}
-        />
-      ))}
-    </span>
-  );
-}
-
 function ChecklistItem({
   icon: Icon,
   label,
@@ -874,62 +795,6 @@ function MetaRow({
       <span className={`truncate text-[13px] font-semibold ${toneClass}`} title={value}>
         {value}
       </span>
-    </div>
-  );
-}
-
-function ReadinessRow({
-  status,
-  label,
-  description,
-  actionLabel,
-  onAction,
-}: {
-  status: string;
-  label: string;
-  description?: string;
-  actionLabel?: string;
-  onAction?: () => void;
-}) {
-  const t = useT();
-  const ready = status === "granted" || status === "supported";
-  const bad = status === "denied" || status === "not_supported";
-  const checking = status === "checking";
-  const dot = ready
-    ? "bg-success"
-    : bad
-      ? "bg-danger"
-      : checking
-        ? "bg-text-muted animate-pulse"
-        : "bg-warning";
-  const stateLabel = ready ? t("Готово") : bad ? t("Недоступно") : checking ? t("Проверка") : t("Внимание");
-  const stateColor = ready
-    ? "text-success"
-    : bad
-      ? "text-danger"
-      : checking
-        ? "text-text-muted"
-        : "text-warning";
-
-  return (
-    <div className="flex items-center gap-4 px-6 py-3.5 transition-colors hover:bg-bg-tertiary/40">
-      <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-text-primary">{label}</span>
-          <span className={`text-[11px] ${stateColor}`}>· {stateLabel}</span>
-        </div>
-        {description && <p className="mt-0.5 truncate text-xs text-text-muted">{description}</p>}
-      </div>
-      {actionLabel && onAction && (
-        <button
-          type="button"
-          onClick={onAction}
-          className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-accent/40 hover:text-text-primary"
-        >
-          {actionLabel}
-        </button>
-      )}
     </div>
   );
 }

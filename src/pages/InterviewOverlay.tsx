@@ -85,7 +85,6 @@ const STT_STOP_TIMEOUT_MS = 12000;
 const STT_STOP_SETTLE_TIMEOUT_MS = 90000;
 const STT_STOP_POLL_INTERVAL_MS = 250;
 const END_INTERVIEW_STT_STOP_BUDGET_MS = 5000;
-const LARGE_MODEL_WARMUP_TIMEOUT_MS = 240000;
 const LARGE_MODEL_WARMUP_ESTIMATE_MS = 150000;
 const LIVE_MODEL_LOADING_ESTIMATE_MS = 180000;
 const STT_NO_SIGNAL_TIMEOUT_MS = 6000;
@@ -595,15 +594,10 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     isActive,
     mode: sessionMode,
     safeModeReason,
-    startedAt,
     elapsedMs,
     messages,
     contextBuffer,
     lastLlmResponse,
-    llmRequestCount,
-    llmLatencies,
-    interviewerChars,
-    userChars,
     isLlmLoading,
     snipsUsed,
     uploadsUsed,
@@ -1960,42 +1954,6 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   );
 
   /**
-   * Dictation reuses the recognition session that is already running for the
-   * interview: nothing is started or negotiated, the microphone results are simply
-   * routed into the input field while this is active (see handleSttResult).
-   */
-  const startDictation = useCallback(() => {
-    if (dictationRecordingRef.current) {
-      return;
-    }
-    if (!sttAcceptingResultsRef.current) {
-      // The button is deliberately live while recognition loads, so this hint is the
-      // only place the user learns whether to wait or to go fix something.
-      setDictationHint(
-        sttStartupInProgressRef.current
-          ? "Распознавание ещё загружается — диктовка включится, как только оно будет готово."
-          : "Распознавание не запущено. Нажмите «Перезапуск аудио» в шапке или проверьте устройства в настройках.",
-      );
-      return;
-    }
-
-    const dictationId = crypto.randomUUID();
-    dictationRef.current = {
-      id: dictationId,
-      baseText: manualQuestionRef.current,
-      lastText: "",
-      settledText: "",
-      lastUtteranceAt: Date.now(),
-      finalResolvers: [],
-    };
-    dictationActiveRef.current = true;
-    dictationRecordingRef.current = true;
-    setIsDictating(true);
-    setDictationHint(null);
-    logInfo("speech.dictation", "Dictation started", { dictationId });
-  }, []);
-
-  /**
    * Stops routing and waits briefly for the tail of the phrase, so the last words
    * still land in the input before the user hits send.
    */
@@ -2033,14 +1991,6 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     dictationRef.current.settledText = "";
     dictationProducedTextRef.current = false;
   }, []);
-
-  const toggleDictation = useCallback(() => {
-    if (dictationActiveRef.current) {
-      void stopDictation();
-      return;
-    }
-    startDictation();
-  }, [startDictation, stopDictation]);
 
   // Push-to-talk audio hint. Toggle: first press starts recording, second press
   // drains the recorded audio on the server and sends it to Gemini as one clip.
@@ -4260,9 +4210,6 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
   const endHkLabel = formatHotkey(
     settings.hotkeys.find((h) => h.action === "end_interview")?.keys ?? [],
   );
-  const switchLanguageHkLabel = formatHotkey(
-    settings.hotkeys.find((h) => h.action === "switch_stt_language")?.keys ?? [],
-  );
   // Once recognition is running, sending is always allowed: the transcript may fill
   // in between the click and the request, and blocking the button until something has
   // already been recognised just makes the app look frozen.
@@ -4271,21 +4218,12 @@ export function InterviewOverlay({ mode = "detached" }: InterviewOverlayProps) {
     manualQuestion.trim().length > 0 ||
     Boolean(pastedImageBase64) ||
     isRecognitionReady;
-  const dictationTrigger = settings.dictationTrigger;
   const dictationSourceHint =
     settings.dictationSource === "system"
       ? t("Слушаем звук компьютера...")
       : settings.dictationSource === "both"
         ? t("Слушаем микрофон и звук компьютера...")
         : t("Слушаем микрофон...");
-  // The button captures whoever the "Что слушать" setting points at, so calling it
-  // "record your question by voice" was wrong for two of the three modes.
-  const dictationLabel =
-    settings.dictationSource === "mic"
-      ? t("Записать вопрос голосом")
-      : settings.dictationSource === "system"
-        ? t("Поймать вопрос собеседника")
-        : t("Поймать вопрос: микрофон и звук компьютера");
   const visibleMessages = selectVisibleMessages(messages, { showFullTranscript });
   const hiddenPhraseCount = countHiddenPhrases(messages, visibleMessages);
   const приложениеRootClassName = isEmbeddedMode
@@ -5462,80 +5400,6 @@ function resolveRequestIntentMode(
   }
 
   return inferTextOnlyIntentMode(requestText);
-}
-
-function buildInterviewPrompt({
-  transcript,
-  interviewContext,
-  screenshotMode = false,
-  manualQuestion = "",
-  forcedIntent,
-}: {
-  transcript: string;
-  interviewContext: string;
-  screenshotMode?: boolean;
-  manualQuestion?: string;
-  forcedIntent?: InterviewIntent;
-}): string {
-  const normalizedContext = interviewContext.trim();
-  const contextBlock = normalizedContext
-    ? `Контекст интервью:\n${normalizedContext}\n\n`
-    : "";
-  const manualIntent = inferManualIntentMode(manualQuestion);
-  const manualBlock = manualQuestion.trim()
-    ? `Ручная просьба:\n${manualQuestion.trim()}\n\nПредварительный routing по ручной просьбе: ${manualIntent.mode} (${manualIntent.reason}). Если это не AUTO, считай его приоритетнее OCR и изображения.\n\n`
-    : "";
-  const forcedIntentBlock =
-    forcedIntent && forcedIntent.mode !== "AUTO"
-      ? `Режим уже определен приложением: ${forcedIntent.mode} (${forcedIntent.reason}). Это жесткое указание. Не меняй режим на другой, даже если вокруг есть слова про routing, патч или ревью.\n\n`
-      : "";
-
-  const intentRules = `Routing перед ответом:
-1. Сначала выбери ровно один режим: LIVE_CODING, DEBUG, CODE_REVIEW или THEORY.
-2. Приоритет источников: ручная просьба > явная формулировка на скриншоте/OCR > ошибка/stack trace > просто видимый код > общий разговор.
-3. LIVE_CODING: пользователь просит написать, дописать, implement, complete, solve, fix, реализовать метод, добавить фрагмент, решить алгоритмическую задачу. В этом режиме не делай ревью, сразу дай решение.
-4. DEBUG: виден stack trace, exception, failing test, compiler/runtime error, "почему не работает", "падает", "разберись с ошибкой". Дай причину и конкретную правку.
-5. CODE_REVIEW: пользователь просит ревью/проверку/найти баги или на скриншоте только код без явной задачи и без ошибки. Дай риски и минимальный патч.
-6. THEORY: вопрос без кода: концепция, архитектура, технология, trade-offs, устная формулировка. Если запрос текстовый и в нем нет кода/stack trace/скриншота, это THEORY, а не CODE_REVIEW.
-7. Если на скриншоте есть код и слова "implement/complete/solve/fix/дописать/написать функцию", это LIVE_CODING даже если код выглядит как кандидат для ревью.
-8. Если ручная просьба противоречит скриншоту, выполняй ручную просьбу.
-
-Примеры routing:
-- "допиши функцию twoSum" + код => LIVE_CODING.
-- "почему падает этот тест?" + stack trace => DEBUG.
-- "проверь этот код" + код => CODE_REVIEW.
-- только код без задачи => CODE_REVIEW.
-- "что такое этот подход?" => THEORY.
-- "какие бывают режимы работы?" => THEORY.
-- "объясни разницу между двумя подходами" => THEORY.`;
-
-  const screenshotBlock = screenshotMode
-    ? `Режим скриншота:
-- Используй изображение/OCR как главный источник задачи.
-- Не делай code review, если на скриншоте или в ручном вопросе просят дописать, исправить или решить.
-- Если OCR и изображение расходятся, доверься смыслу видимого интерфейса и формулировке на экране.
-- Если задача неоднозначна, назови выбранный режим в первой строке и дай самое полезное действие.\n\n`
-    : "";
-  const finalIntentReminder =
-    forcedIntent && forcedIntent.mode !== "AUTO"
-      ? `\n\nФинальное обязательное решение routing для этого запроса: ${forcedIntent.mode}. Ответь именно в этом режиме. Не выводи одно только название режима; дай полезный ответ по сути.`
-      : !screenshotMode
-        ? "\n\nФинальное правило для текстового запроса: если в транскрипте нет кода, stack trace или явной просьбы о ревью, выбери THEORY и дай устный ответ по теме."
-        : "";
-
-  return `${contextBlock}${manualBlock}${forcedIntentBlock}Важно:
-- в расшифровке могут быть ошибки STT, особенно в названиях языков, библиотек, технологий и терминов;
-- если слово распознано неточно, интерпретируй его в пользу технического смысла и контекста разговора;
-- не пиши академические определения и длинные теоретические абзацы;
-- ответ должен быть прикладным и пригодным для устного ответа на собеседовании;
-- отвечай кратко, но с конкретикой: код, причина, патч или готовая формулировка.\n\n${intentRules}\n\n${screenshotBlock}Формат ответа строго:
-1) Режим: LIVE_CODING / DEBUG / CODE_REVIEW / THEORY.
-2) Суть: 1-2 короткие фразы.
-3) Что сказать вслух: готовая формулировка до 2 предложений.
-4) Если LIVE_CODING: минимальное решение или недостающий фрагмент кода.
-5) Если DEBUG: причина ошибки и конкретная правка.
-6) Если CODE_REVIEW: баги/риски и минимальный патч.
-7) Если THEORY: короткое объяснение и практический пример. Не предлагай патч, code review или "следующие шаги".\n\nТранскрипт интервью:\n${transcript}${finalIntentReminder}\n\nДай ответ по выбранному режиму.`;
 }
 
 async function captureScreenshotAsBase64Png(): Promise<string> {

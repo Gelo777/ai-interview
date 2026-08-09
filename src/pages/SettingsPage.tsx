@@ -8,16 +8,9 @@ import {
   Copy,
   Loader2,
   RotateCcw,
-  Trash2,
-  Info,
-  Eye,
-  EyeOff,
-  CheckCircle,
-  AlertTriangle,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
-import { Toggle } from "@/components/ui/Toggle";
 import { Select } from "@/components/ui/Select";
 import { Slider } from "@/components/ui/Slider";
 import { Badge } from "@/components/ui/Badge";
@@ -29,13 +22,7 @@ import {
   useSettingsStore,
 } from "@/stores/settings";
 import { useAppStore } from "@/stores/app";
-import { useHistoryStore } from "@/stores/history";
-import { useDiagnosticsStore } from "@/stores/diagnostics";
-import { PROXY_BASE_URL, validateLicenseKeyDetailed } from "@/lib/proxy";
-import {
-  refreshCloudReadinessNow,
-  refreshLocalReadinessNow,
-} from "@/hooks/useReadinessMonitor";
+import { refreshLocalReadinessNow } from "@/hooks/useReadinessMonitor";
 import {
   createTransferProgressTracker,
   formatTransferDiagnostics,
@@ -44,22 +31,10 @@ import {
 import { APP_LANGUAGE_OPTIONS, getLanguageLabel } from "@/lib/languages";
 import { useT } from "@/lib/i18n";
 import {
-  buildDiagnosticsReport,
-  copyDiagnosticsReportToClipboard,
   logInfo,
   logWarn,
 } from "@/lib/diagnostics";
-import {
-  formatHotkey,
-  HOTKEY_MAX_KEYS,
-  normalizeHotkeyKeys,
-  normalizeHotkeyToken,
-} from "@/lib/hotkeys";
-import {
-  DEFAULT_HISTORY_RETENTION_DAYS,
-  formatHistoryRetentionLabel,
-  normalizeHistoryRetentionDays,
-} from "@/lib/historyRetention";
+import { formatHotkey } from "@/lib/hotkeys";
 import {
   compareRuntimeVersions,
   extractRuntimeVersionFromPath,
@@ -74,7 +49,6 @@ import {
 import type {
   DictationSource,
   DictationTrigger,
-  HotkeyAction,
   PrimaryLanguage,
   SettingsFocusTarget,
   SettingsTab,
@@ -82,8 +56,6 @@ import type {
   SttModelVariant,
 } from "@/lib/types";
 import type {
-  AudioDebugEndpoint,
-  AudioDebugSnapshot,
   AudioDeviceInfo,
   VoskModelDownloadProgress,
   VoskModelOption,
@@ -106,16 +78,6 @@ function markManualSttProfileOverride(): void {
 }
 
 
-const SIMPLE_HOTKEY_PRESET: ReadonlyArray<{
-  action: HotkeyAction;
-  keys: string[];
-}> = [
-  { action: "send_to_llm", keys: ["F8"] },
-  { action: "send_with_screenshot", keys: ["F9"] },
-  { action: "end_interview", keys: ["F10"] },
-  { action: "switch_stt_language", keys: ["F11"] },
-];
-
 function getFocusSectionClass(isFocused: boolean): string {
   if (!isFocused) {
     return "";
@@ -133,30 +95,25 @@ export function SettingsPage() {
     clearSettingsFocus,
   } = useAppStore();
   const t = useT();
-  const [tab, setTab] = useState<SettingsTab>(settingsTab);
-  const [activeFocus, setActiveFocus] = useState<SettingsFocusTarget | null>(null);
+  const tab: SettingsTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "audio";
+  const activeFocus = settingsFocus;
   const appVersionLabel = __APP_VERSION__?.trim() ? __APP_VERSION__.trim() : t("неизвестно");
 
   useEffect(() => {
-    const availableTab = TABS.some((item) => item.id === settingsTab) ? settingsTab : "audio";
-    setTab(availableTab);
-    if (availableTab !== settingsTab) {
-      setSettingsTab(availableTab);
+    if (tab !== settingsTab) {
+      setSettingsTab(tab);
     }
-  }, [setSettingsTab, settingsTab]);
+  }, [setSettingsTab, settingsTab, tab]);
 
   useEffect(() => {
     if (!settingsFocus) {
       return;
     }
-    setActiveFocus(settingsFocus);
-    const target = settingsFocus;
     const timeoutId = window.setTimeout(() => {
-      setActiveFocus((current) => (current === target ? null : current));
       clearSettingsFocus();
     }, 2600);
 
-    const element = document.getElementById(target);
+    const element = document.getElementById(settingsFocus);
     if (element) {
       element.scrollIntoView({ behavior: "smooth", block: "center" });
     }
@@ -218,7 +175,6 @@ export function SettingsPage() {
               key={id}
               data-tab={id}
               onClick={() => {
-                setTab(id);
                 setSettingsTab(id);
               }}
               className={`relative z-10 flex shrink-0 cursor-pointer items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors duration-200 ${
@@ -381,130 +337,6 @@ function ServerSpeechSettings() {
   );
 }
 
-function DiagnosticsSettings({ disabled }: { disabled: boolean }) {
-  const entries = useDiagnosticsStore((state) => state.entries);
-  const clearEntries = useDiagnosticsStore((state) => state.clearEntries);
-  const t = useT();
-  const [copied, setCopied] = useState(false);
-
-  const stats = useMemo(() => {
-    let info = 0;
-    let warn = 0;
-    let error = 0;
-    for (const entry of entries) {
-      if (entry.level === "error") {
-        error += 1;
-      } else if (entry.level === "warn") {
-        warn += 1;
-      } else {
-        info += 1;
-      }
-    }
-    return { info, warn, error };
-  }, [entries]);
-
-  const reportText = useMemo(() => buildDiagnosticsReport(entries), [entries]);
-  const visibleEntries = useMemo(() => entries.slice(0, 120), [entries]);
-
-  const handleCopyReport = useCallback(async () => {
-    const ok = await copyDiagnosticsReportToClipboard(reportText);
-    if (!ok) {
-      return;
-    }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
-  }, [reportText]);
-
-  return (
-    <div className="space-y-5">
-      <Card
-        title={t("Журнал приложения")}
-        description={t("Служебные события приложения для разбора ошибок запуска, аудио и обращений к сервису.")}
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="muted">{t("Событий: {count}", { count: entries.length })}</Badge>
-          <Badge variant="danger">{t("Ошибки: {count}", { count: stats.error })}</Badge>
-          <Badge variant="warning">{t("Предупреждения: {count}", { count: stats.warn })}</Badge>
-          <Badge variant="muted">{t("Инфо: {count}", { count: stats.info })}</Badge>
-        </div>
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              void handleCopyReport();
-            }}
-            icon={<Copy className="w-3.5 h-3.5" />}
-          >
-            {copied ? t("Сообщение скопировано") : t("Копировать отчет")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => clearEntries()}
-            icon={<Trash2 className="w-3.5 h-3.5" />}
-            disabled={disabled || entries.length === 0}
-          >
-            {t("Очистить журнал")}
-          </Button>
-        </div>
-
-        <p className="mt-4 text-xs text-text-muted leading-relaxed">
-          {t('После воспроизведения проблемы откройте эту вкладку, нажмите "Копировать отчет" и отправьте текст. Так проще найти точный этап сбоя и не гадать по симптомам.')}
-        </p>
-
-        <div className="mt-4 max-h-[420px] space-y-2 overflow-y-auto rounded-xl border border-border bg-bg-tertiary/40 p-2">
-          {visibleEntries.length === 0 && (
-            <div className="rounded-lg border border-dashed border-border p-3 text-xs text-text-muted">
-              {t("Логов пока нет. Выполните действие (например, старт интервью или отправка подсказки) и откройте вкладку снова.")}
-            </div>
-          )}
-
-          {visibleEntries.map((entry) => (
-            <div
-              key={entry.id}
-              className="rounded-lg border border-border bg-bg-card p-3"
-            >
-              <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs">
-                <Badge
-                  variant={
-                    entry.level === "error"
-                      ? "danger"
-                      : entry.level === "warn"
-                        ? "warning"
-                        : "muted"
-                  }
-                >
-                  {entry.level.toUpperCase()}
-                </Badge>
-                <span className="text-text-muted">
-                  {new Date(entry.timestamp).toLocaleString("ru-RU")}
-                </span>
-                <span className="rounded bg-black/[0.05] px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
-                  {entry.scope}
-                </span>
-              </div>
-              <p className="text-sm text-text-primary">{entry.message}</p>
-              {entry.details && (
-                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-[11px] leading-relaxed text-text-muted">
-                  {entry.details}
-                </pre>
-              )}
-            </div>
-          ))}
-        </div>
-
-        {entries.length > visibleEntries.length && (
-          <p className="mt-3 text-xs text-text-muted">
-            {t("Показаны последние {shown} записей из {total}.", { shown: visibleEntries.length, total: entries.length })}
-          </p>
-        )}
-      </Card>
-    </div>
-  );
-}
-
 function ProgressBar({ label, percent }: { label: string; percent: number | null }) {
   const normalizedPercent =
     percent === null ? null : Math.max(0, Math.min(100, percent));
@@ -535,10 +367,6 @@ function getModelByVariant(
       (model) => model.language === language && model.variant === variant,
     ) ?? null
   );
-}
-
-function getVariantDisplayName(variant: SttModelVariant): string {
-  return "точный";
 }
 
 function isTimeoutLikeError(error: unknown): boolean {
@@ -575,11 +403,6 @@ function hasInstalledModel(model: VoskModelOption | null): boolean {
   return model.installed || model.installed_versions.length > 0;
 }
 
-type ModelOperation = {
-  language: PrimaryLanguage;
-  variant: SttModelVariant;
-  action: "install" | "remove";
-};
 
 type InstallModelOptions = {
   skipRuntimeInstall?: boolean;
@@ -639,19 +462,10 @@ function buildAudioDeviceOptions(
   ];
 }
 
-function normalizeDeviceNameForMatch(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^\p{L}0-9\s\-]/gu, " ")
-    .replace(/[^a-zа-яё0-9\s\-]/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function normalizeDeviceNameForLookup(value: string): string {
   return value
     .toLowerCase()
-    .replace(/[^\p{L}0-9\s\-]/gu, " ")
+    .replace(/[^\p{L}0-9\s-]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -721,23 +535,6 @@ function toAudioTestErrorMessage(error: unknown): string {
   }
 
   return message;
-}
-
-interface MicTestDebugInfo {
-  requestedDeviceName: string | null;
-  preferredBrowserDeviceId: string | null;
-  trackLabel: string | null;
-  trackSettings: MediaTrackSettings | null;
-  resolutionStage: string;
-  selectionMatched: boolean;
-}
-
-interface SpeakerTestDebugInfo {
-  requestedOutputName: string | null;
-  preferredSinkId: string | null;
-  activeSinkId: string | null;
-  setSinkIdSupported: boolean;
-  routedToPreferredSink: boolean;
 }
 
 function buildMicrophoneTestConstraints(
@@ -887,174 +684,6 @@ async function openPreferredMicrophoneTestStream(
   };
 }
 
-function formatAudioDebugDevice(device: AudioDeviceInfo | null | undefined): string {
-  if (!device) {
-    return "не найдено";
-  }
-
-  const defaultLabel = device.is_default ? ", по умолчанию Windows" : "";
-  return `${device.name} [${device.id}] (${device.sample_rate} Hz, ${device.channels} ch${defaultLabel})`;
-}
-
-function formatAudioDebugSelection(endpoint: AudioDebugEndpoint): string {
-  if (endpoint.selected_device) {
-    return formatAudioDebugDevice(endpoint.selected_device);
-  }
-  if (endpoint.selected_device_id) {
-    return `не найдено (${endpoint.selected_device_id})`;
-  }
-  return "режим Windows по умолчанию";
-}
-
-function buildAudioRouteSummary(params: {
-  endpoint: AudioDebugEndpoint;
-  usesWindowsDefault: boolean;
-}): { title: string; detail: string; auxiliary: string | null } {
-  const { endpoint, usesWindowsDefault } = params;
-
-  if (!usesWindowsDefault) {
-    return {
-      title: `Выбран: ${formatAudioDebugSelection(endpoint)}`,
-      detail: endpoint.detail,
-      auxiliary: endpoint.available ? null : "Выбранное устройство сейчас недоступно.",
-    };
-  }
-
-  return {
-    title: "Режим: Windows по умолчанию",
-    detail: endpoint.detail,
-    auxiliary: endpoint.default_device
-      ? `Текущее устройство по умолчанию: ${formatAudioDebugDevice(endpoint.default_device)}`
-      : "Устройство Windows по умолчанию не найдено.",
-  };
-}
-
-function appendAudioDeviceList(
-  lines: string[],
-  title: string,
-  devices: AudioDeviceInfo[],
-): void {
-  lines.push(title);
-  if (devices.length === 0) {
-    lines.push("- нет");
-    return;
-  }
-
-  for (const device of devices) {
-    lines.push(`- ${formatAudioDebugDevice(device)}`);
-  }
-}
-
-function buildAudioDebugReport(params: {
-  snapshot: AudioDebugSnapshot | null;
-  fetchedAt: number | null;
-  micLevel: number;
-  micPeakLevel: number;
-  micAverageLevel: number;
-  micSilentDurationMs: number;
-  micTestActive: boolean;
-  micTestMessage: string | null;
-  micTestDebugInfo: MicTestDebugInfo | null;
-  speakerTestRunning: boolean;
-  speakerTestMessage: string | null;
-  speakerTestDebugInfo: SpeakerTestDebugInfo | null;
-}): string {
-  const {
-    snapshot,
-    fetchedAt,
-    micLevel,
-    micPeakLevel,
-    micAverageLevel,
-    micSilentDurationMs,
-    micTestActive,
-    micTestMessage,
-    micTestDebugInfo,
-    speakerTestRunning,
-    speakerTestMessage,
-    speakerTestDebugInfo,
-  } = params;
-  const lines = [
-    "Отчет аудио",
-    "================================",
-    `Сформировано: ${new Date().toISOString()}`,
-    `Часовой пояс: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
-    `Снимок аудио: ${fetchedAt ? new Date(fetchedAt).toISOString() : "еще не собран"}`,
-    "",
-  ];
-
-  if (!snapshot) {
-    lines.push("Снимок аудио пока недоступен.");
-  } else {
-    lines.push("Снимок");
-    lines.push(`- Микрофон выбран: ${formatAudioDebugSelection(snapshot.microphone)}`);
-    lines.push(`- Микрофон используется: ${formatAudioDebugDevice(snapshot.microphone.effective_device)}`);
-    lines.push(`- Микрофон по умолчанию: ${formatAudioDebugDevice(snapshot.microphone.default_device)}`);
-    lines.push(`- Микрофон: ${snapshot.microphone.detail}`);
-    lines.push(`- Вывод выбран: ${formatAudioDebugSelection(snapshot.system_audio)}`);
-    lines.push(`- Вывод используется: ${formatAudioDebugDevice(snapshot.system_audio.effective_device)}`);
-    lines.push(`- Вывод по умолчанию: ${formatAudioDebugDevice(snapshot.system_audio.default_device)}`);
-    lines.push(`- Вывод: ${snapshot.system_audio.detail}`);
-    lines.push(
-      `- Захват системного звука: ${
-        snapshot.system_audio_status.available
-          ? "доступно"
-          : snapshot.system_audio_status.supported
-            ? "недоступно"
-            : "не поддерживается"
-      }`,
-    );
-    lines.push(`- Системный звук: ${snapshot.system_audio_status.detail}`);
-    lines.push("");
-    appendAudioDeviceList(lines, "Устройства ввода", snapshot.input_devices);
-    lines.push("");
-    appendAudioDeviceList(lines, "Устройства вывода", snapshot.output_devices);
-    if (snapshot.notes.length > 0) {
-      lines.push("");
-      lines.push("Заметки");
-      for (const note of snapshot.notes) {
-        lines.push(`- ${note}`);
-      }
-    }
-  }
-
-  lines.push("");
-  lines.push("Проверка микрофона");
-  lines.push(`- Активна: ${micTestActive ? "да" : "нет"}`);
-  lines.push(`- Текущий уровень: ${Math.round(micLevel * 100)}%`);
-  lines.push(`- Пик: ${Math.round(micPeakLevel * 100)}%`);
-  lines.push(`- Средний уровень: ${Math.round(micAverageLevel * 100)}%`);
-  lines.push(`- Тишина: ${Math.round(micSilentDurationMs / 100) / 10}s`);
-  lines.push(`- Сообщение: ${micTestMessage ?? "нет"}`);
-  if (micTestDebugInfo) {
-    lines.push(`- Запрошенное устройство: ${micTestDebugInfo.requestedDeviceName ?? "по умолчанию Windows"}`);
-    lines.push(`- Устройство в окне: ${micTestDebugInfo.preferredBrowserDeviceId ?? "не определено"}`);
-    lines.push(`- Активная дорожка: ${micTestDebugInfo.trackLabel ?? "неизвестно"}`);
-    lines.push(`- Этап выбора: ${micTestDebugInfo.resolutionStage}`);
-    lines.push(`- Выбор совпал: ${micTestDebugInfo.selectionMatched ? "да" : "нет"}`);
-    lines.push(
-      `- Параметры дорожки: ${
-        micTestDebugInfo.trackSettings
-          ? JSON.stringify(micTestDebugInfo.trackSettings)
-          : "недоступно"
-      }`,
-    );
-  }
-
-  lines.push("");
-  lines.push("Проверка динамика");
-  lines.push(`- Активна: ${speakerTestRunning ? "да" : "нет"}`);
-  lines.push(`- Message: ${speakerTestMessage ?? "none"}`);
-  if (speakerTestDebugInfo) {
-    lines.push(`- Запрошенный вывод: ${speakerTestDebugInfo.requestedOutputName ?? "по умолчанию Windows"}`);
-    lines.push(`- Устройство вывода в окне: ${speakerTestDebugInfo.preferredSinkId ?? "не определено"}`);
-    lines.push(`- Выбор динамика поддерживается: ${speakerTestDebugInfo.setSinkIdSupported ? "да" : "нет"}`);
-    lines.push(`- Сигнал направлен в выбранный динамик: ${speakerTestDebugInfo.routedToPreferredSink ? "да" : "нет"}`);
-    lines.push(`- Активный вывод: ${speakerTestDebugInfo.activeSinkId ?? "неизвестно"}`);
-  }
-
-  return lines.join("\n");
-}
-
 function describeAudioPermission(status: string): { dot: string; text: string; chip: string } {
   switch (status) {
     case "granted":
@@ -1092,16 +721,8 @@ function AudioSettings({
   const [micAverageLevel, setMicAverageLevel] = useState(0);
   const [micSilentDurationMs, setMicSilentDurationMs] = useState(0);
   const [micTestMessage, setMicTestMessage] = useState<string | null>(null);
-  const [micTestDebugInfo, setMicTestDebugInfo] = useState<MicTestDebugInfo | null>(null);
   const [speakerTestRunning, setSpeakerTestRunning] = useState(false);
   const [speakerTestMessage, setSpeakerTestMessage] = useState<string | null>(null);
-  const [speakerTestDebugInfo, setSpeakerTestDebugInfo] =
-    useState<SpeakerTestDebugInfo | null>(null);
-  const [audioDebugSnapshot, setAudioDebugSnapshot] = useState<AudioDebugSnapshot | null>(null);
-  const [audioDebugLoading, setAudioDebugLoading] = useState(false);
-  const [audioDebugMessage, setAudioDebugMessage] = useState<string | null>(null);
-  const [audioDebugFetchedAt, setAudioDebugFetchedAt] = useState<number | null>(null);
-  const [audioDebugCopied, setAudioDebugCopied] = useState(false);
   const [autoProbeRunning, setAutoProbeRunning] = useState(false);
   const [autoProbeMessage, setAutoProbeMessage] = useState<string | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -1141,7 +762,7 @@ function AudioSettings({
     } finally {
       setLoadingDevices(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void refreshAudioDevices();
@@ -1189,28 +810,20 @@ function AudioSettings({
       return null;
     }
     return t("Сигнал почти нулевой уже несколько секунд. Проверьте нужный микрофон, mute и уровень входа в Windows.");
-  }, [micSilentDurationMs, micTestActive]);
+  }, [micSilentDurationMs, micTestActive, t]);
 
   const refreshAudioDebugSnapshot = useCallback(
     async (reason: "auto" | "manual" = "auto") => {
       const { isTauri, getAudioDebugSnapshot } = await import("@/lib/tauri");
       if (!isTauri()) {
-        setAudioDebugSnapshot(null);
-        setAudioDebugMessage(null);
-        setAudioDebugFetchedAt(null);
         return;
       }
 
-      setAudioDebugLoading(true);
       try {
         const snapshot = await getAudioDebugSnapshot({
           microphoneDeviceId,
           systemAudioDeviceId,
         });
-        setAudioDebugSnapshot(snapshot);
-        setAudioDebugFetchedAt(Date.now());
-        setAudioDebugMessage(null);
-
         if (reason === "manual") {
           logInfo("audio.debug", "Снимок аудио-диагностики обновлен", {
             microphone: snapshot.microphone,
@@ -1220,68 +833,11 @@ function AudioSettings({
           });
         }
       } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Не удалось собрать аудио-диагностику.";
-        setAudioDebugMessage(message);
         logWarn("audio.debug", "Не удалось собрать аудио-диагностику", error);
-      } finally {
-        setAudioDebugLoading(false);
       }
     },
     [microphoneDeviceId, systemAudioDeviceId],
   );
-
-  useEffect(() => {
-    if (loadingDevices) {
-      return;
-    }
-    void refreshAudioDebugSnapshot();
-  }, [loadingDevices, refreshAudioDebugSnapshot]);
-
-  const audioDebugReport = useMemo(
-    () =>
-      buildAudioDebugReport({
-        snapshot: audioDebugSnapshot,
-        fetchedAt: audioDebugFetchedAt,
-        micLevel,
-        micPeakLevel,
-        micAverageLevel,
-        micSilentDurationMs,
-        micTestActive,
-        micTestMessage,
-        micTestDebugInfo,
-        speakerTestRunning,
-        speakerTestMessage,
-        speakerTestDebugInfo,
-      }),
-    [
-      audioDebugFetchedAt,
-      audioDebugSnapshot,
-      micAverageLevel,
-      micLevel,
-      micPeakLevel,
-      micSilentDurationMs,
-      micTestActive,
-      micTestDebugInfo,
-      micTestMessage,
-      speakerTestDebugInfo,
-      speakerTestMessage,
-      speakerTestRunning,
-    ],
-  );
-
-  const handleCopyAudioDebugReport = useCallback(async () => {
-    const ok = await copyDiagnosticsReportToClipboard(audioDebugReport);
-    if (!ok) {
-      setAudioDebugMessage("Не удалось скопировать аудио-отчет.");
-      return;
-    }
-    setAudioDebugCopied(true);
-    setAudioDebugMessage("Аудио-отчет скопирован в буфер обмена.");
-    window.setTimeout(() => setAudioDebugCopied(false), 1400);
-  }, [audioDebugReport]);
 
   const handleAutoProbeAudio = useCallback(async () => {
     if (controlsDisabled || autoProbeRunning) {
@@ -1369,16 +925,7 @@ function AudioSettings({
     } finally {
       setAutoProbeRunning(false);
     }
-  }, [
-    autoProbeRunning,
-    controlsDisabled,
-    microphoneDeviceId,
-    refreshAudioDebugSnapshot,
-    refreshAudioDevices,
-    setMicrophoneDeviceId,
-    setSystemAudioDeviceId,
-    systemAudioDeviceId,
-  ]);
+  }, [autoProbeRunning, controlsDisabled, microphoneDeviceId, refreshAudioDebugSnapshot, refreshAudioDevices, setMicrophoneDeviceId, setSystemAudioDeviceId, systemAudioDeviceId, t]);
 
   const stopMicTest = useCallback(() => {
     if (micRafRef.current !== null) {
@@ -1449,13 +996,12 @@ function AudioSettings({
       stopMicTest();
       logInfo("audio.micTest", "Выбор микрофона изменился, тест остановлен");
     }
-    setMicTestDebugInfo(null);
     setMicPeakLevel(0);
     setMicAverageLevel(0);
     setMicSilentDurationMs(0);
     setMicLevel(0);
     setMicTestMessage(t("Выбрано другое устройство. Запустите проверку микрофона снова."));
-  }, [microphoneDeviceId, micTestActive, stopMicTest]);
+  }, [microphoneDeviceId, micTestActive, stopMicTest, t]);
 
   useEffect(() => {
     const currentSelection = systemAudioDeviceId ?? null;
@@ -1473,9 +1019,8 @@ function AudioSettings({
       stopSpeakerTest();
       logInfo("audio.speakerTest", "Выбор устройства вывода изменился, тест остановлен");
     }
-    setSpeakerTestDebugInfo(null);
     setSpeakerTestMessage(t("Выбрано другое устройство. Запустите проверку динамика снова."));
-  }, [speakerTestRunning, stopSpeakerTest, systemAudioDeviceId]);
+  }, [speakerTestRunning, stopSpeakerTest, systemAudioDeviceId, t]);
 
   const startMicTest = useCallback(async () => {
     if (controlsDisabled) {
@@ -1491,7 +1036,6 @@ function AudioSettings({
     setMicAverageLevel(0);
     setMicSilentDurationMs(0);
     setMicTestMessage(t("Запрашиваем доступ к микрофону..."));
-    setMicTestDebugInfo(null);
 
     try {
       if (
@@ -1574,14 +1118,6 @@ function AudioSettings({
       micAudioSourceRef.current = source;
       micRafRef.current = window.requestAnimationFrame(updateLevel);
       setMicTestActive(true);
-      setMicTestDebugInfo({
-        requestedDeviceName: selectedMicrophone,
-        preferredBrowserDeviceId,
-        trackLabel: track?.label ?? null,
-        trackSettings,
-        resolutionStage,
-        selectionMatched,
-      });
       logInfo("audio.micTest", "Проверка микрофона запущена", {
         requestedDeviceName: selectedMicrophone,
         preferredBrowserDeviceId,
@@ -1616,13 +1152,7 @@ function AudioSettings({
       setMicTestMessage(t("Ошибка проверки микрофона: {error}", { error: toAudioTestErrorMessage(error) }));
       logWarn("audio.micTest", "Проверка микрофона завершилась ошибкой", error);
     }
-  }, [
-    controlsDisabled,
-    defaultMicrophone?.name,
-    microphoneUsesWindowsDefault,
-    selectedMicrophoneDevice?.name,
-    stopMicTest,
-  ]);
+  }, [controlsDisabled, defaultMicrophone?.name, microphoneUsesWindowsDefault, selectedMicrophoneDevice, stopMicTest, t]);
 
   const runSpeakerTest = useCallback(async () => {
     if (controlsDisabled) {
@@ -1631,7 +1161,6 @@ function AudioSettings({
     stopSpeakerTest();
     setSpeakerTestRunning(true);
     setSpeakerTestMessage(t("Воспроизводим тестовый звук..."));
-    setSpeakerTestDebugInfo(null);
 
     try {
       const AudioContextCtor =
@@ -1701,14 +1230,6 @@ function AudioSettings({
 
       speakerAudioContextRef.current = context;
       speakerAudioRef.current = audioElement;
-      setSpeakerTestDebugInfo({
-        requestedOutputName: selectedOutputName,
-        preferredSinkId,
-        activeSinkId,
-        setSinkIdSupported,
-        routedToPreferredSink:
-          systemAudioUsesWindowsDefault || Boolean(preferredSinkId && activeSinkId === preferredSinkId),
-      });
       logInfo("audio.speakerTest", "Проверка динамика запущена", {
         requestedOutputName: selectedOutputName,
         preferredSinkId,
@@ -1728,13 +1249,7 @@ function AudioSettings({
       setSpeakerTestMessage(t("Ошибка проверки динамика: {error}", { error: toAudioTestErrorMessage(error) }));
       logWarn("audio.speakerTest", "Проверка динамика завершилась ошибкой", error);
     }
-  }, [
-    controlsDisabled,
-    defaultSystemAudio?.name,
-    selectedSystemAudioDevice?.name,
-    systemAudioUsesWindowsDefault,
-    stopSpeakerTest,
-  ]);
+  }, [controlsDisabled, defaultSystemAudio?.name, selectedSystemAudioDevice, systemAudioUsesWindowsDefault, stopSpeakerTest, t]);
 
   const micStatus = describeAudioPermission(permissions.microphone);
   const sysStatus = describeAudioPermission(permissions.systemAudio);
@@ -1956,7 +1471,6 @@ function LanguageSettings({
   const [runtimeInstalling, setRuntimeInstalling] = useState(false);
   const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<number | null>(null);
   const [runtimeNetworkHint, setRuntimeNetworkHint] = useState<string | null>(null);
-  const [activeModelOperation, setActiveModelOperation] = useState<ModelOperation | null>(null);
   const [copiedModelDownloadUrl, setCopiedModelDownloadUrl] = useState<string | null>(null);
   const [cancelingInstall, setОтменаingInstall] = useState(false);
   const [bootstrapInstalling, setBootstrapInstalling] = useState(false);
@@ -2009,7 +1523,7 @@ function LanguageSettings({
 
     await refreshLocalReadinessNow().catch(() => null);
     setLoading(false);
-  }, [setReadiness]);
+  }, [setReadiness, t]);
 
   useEffect(() => {
     void refresh();
@@ -2095,7 +1609,7 @@ function LanguageSettings({
       clearSttInstall();
       await refresh();
     }
-  }, [clearSttInstall, refresh, setSttInstall]);
+  }, [clearSttInstall, refresh, setSttInstall, t]);
 
   const installModelVariant = useCallback(
     async (
@@ -2151,8 +1665,6 @@ function LanguageSettings({
       ) {
         return true;
       }
-
-      setActiveModelOperation({ language, variant, action: "install" });
       setError(null);
       setSuccess(null);
       const modelProgressTracker = createTransferProgressTracker();
@@ -2230,7 +1742,6 @@ function LanguageSettings({
         );
         return false;
       } finally {
-        setActiveModelOperation(null);
         clearSttInstall();
         await refresh();
       }
@@ -2242,6 +1753,7 @@ function LanguageSettings({
       readiness.voskRuntimeLoaded,
       refresh,
       setSttInstall,
+      t,
     ],
   );
 
@@ -2290,8 +1802,6 @@ function LanguageSettings({
       if (!archivePath) {
         return false;
       }
-
-      setActiveModelOperation({ language, variant, action: "install" });
       setError(null);
       setSuccess(null);
       const zipProgressTracker = createTransferProgressTracker();
@@ -2354,7 +1864,6 @@ function LanguageSettings({
         );
         return false;
       } finally {
-        setActiveModelOperation(null);
         clearSttInstall();
         await refresh();
       }
@@ -2366,6 +1875,7 @@ function LanguageSettings({
       readiness.voskRuntimeLoaded,
       refresh,
       setSttInstall,
+      t,
     ],
   );
 
@@ -2388,7 +1898,7 @@ function LanguageSettings({
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("Не удалось открыть ссылку: {url}", { url }));
     }
-  }, []);
+  }, [t]);
 
   const copyModelDownloadUrl = useCallback(async (url: string) => {
     setError(null);
@@ -2405,46 +1915,8 @@ function LanguageSettings({
           : t("Не удалось скопировать ссылку на ZIP."),
       );
     }
-  }, []);
+  }, [t]);
 
-  const removeLargeModel = useCallback(
-    async (language: PrimaryLanguage) => {
-      const { isTauri, removeVoskModel } = await import("@/lib/tauri");
-      if (!isTauri()) {
-        return;
-      }
-
-      const largeModel = getModelByVariant(models, language, "large");
-      if (!largeModel || largeModel.installed_versions.length === 0) {
-        return;
-      }
-
-      setActiveModelOperation({ language, variant: "large", action: "remove" });
-      setError(null);
-      setSuccess(null);
-      try {
-        for (const versionId of largeModel.installed_versions) {
-          await removeVoskModel(versionId);
-        }
-        if (language === primaryLanguage) {
-          setPrimarySttVariant("large");
-        } else if (language === secondaryLanguage) {
-          setSecondarySttVariant("large");
-        }
-        setSuccess(t("Точный профиль удален для языка {lang}.", { lang: getLanguageLabel(language) }));
-      } catch (err: unknown) {
-        setError(
-          err instanceof Error
-            ? err.message
-            : t("Не удалось удалить точный профиль для языка {lang}.", { lang: getLanguageLabel(language) }),
-        );
-      } finally {
-        setActiveModelOperation(null);
-        await refresh();
-      }
-    },
-    [models, primaryLanguage, refresh, secondaryLanguage, setPrimarySttVariant, setSecondarySttVariant],
-  );
 
   const setPreferredVariantForLanguage = useCallback(
     (language: PrimaryLanguage, variant: SttModelVariant) => {
@@ -2514,6 +1986,7 @@ function LanguageSettings({
       sttInstall.phase,
       sttInstall.variant,
       sttInstallQueue,
+      t,
     ],
   );
 
@@ -2538,13 +2011,7 @@ function LanguageSettings({
         queueWorkerBusyRef.current = false;
       }
     })();
-  }, [
-    installModelVariant,
-    runtimeInstalling,
-    shiftSttInstallQueue,
-    sttInstall.active,
-    sttInstallQueue,
-  ]);
+  }, [installModelVariant, runtimeInstalling, shiftSttInstallQueue, sttInstall.active, sttInstallQueue, t]);
 
   const handleОтменаInstall = useCallback(async () => {
     clearSttInstallQueue();
@@ -2573,40 +2040,8 @@ function LanguageSettings({
     } finally {
       setОтменаingInstall(false);
     }
-  }, [clearSttInstallQueue, sttInstall.active, setSttInstall]);
+  }, [clearSttInstallQueue, sttInstall.active, setSttInstall, t]);
 
-  const handleVariantChange = useCallback(
-    async (
-      language: PrimaryLanguage,
-      variant: SttModelVariant,
-      setVariant: (v: SttModelVariant) => void,
-    ) => {
-      const model = getModelByVariant(models, language, variant);
-      if (!model) {
-        setError(
-          t("Точный профиль недоступен для языка {lang}.", { lang: getLanguageLabel(language) }),
-        );
-        return;
-      }
-
-      if (!hasInstalledModel(model)) {
-        const accepted = await requestModelInstall(language, variant);
-        if (!accepted) {
-          return;
-        }
-      }
-
-      markManualSttProfileOverride();
-      setVariant(variant);
-      setSuccess(
-        t("Профиль для языка {lang}: {quality}.", {
-          lang: getLanguageLabel(language),
-          quality: variant === "large" ? t("точный") : t("быстрый"),
-        }),
-      );
-    },
-    [models, requestModelInstall],
-  );
 
   const handleInstallVosk = useCallback(async () => {
     if (bootstrapInstalling || runtimeInstalling || sttInstall.active) {
@@ -2659,19 +2094,7 @@ function LanguageSettings({
       setBootstrapInstalling(false);
       clearSttInstall();
     }
-  }, [
-    bootstrapInstalling,
-    clearSttInstall,
-    installLatestRuntime,
-    primaryLanguage,
-    installModelVariant,
-    readiness.voskRuntimeLoaded,
-    refresh,
-    runtimeInstalling,
-    secondaryLanguage,
-    setSttInstall,
-    sttInstall.active,
-  ]);
+  }, [bootstrapInstalling, clearSttInstall, installLatestRuntime, primaryLanguage, installModelVariant, readiness.voskRuntimeLoaded, refresh, runtimeInstalling, secondaryLanguage, setSttInstall, sttInstall.active, t]);
 
   const handlePrimaryLanguageChange = useCallback(
     async (value: string) => {
@@ -2692,6 +2115,7 @@ function LanguageSettings({
       setPrimaryLanguage,
       setSecondaryLanguage,
       setPrimarySttVariant,
+      t,
     ],
   );
 
@@ -2713,22 +2137,13 @@ function LanguageSettings({
       setSecondarySttVariant("large");
       setSuccess(t("Точный профиль для языка {lang} будет установлен автоматически.", { lang: getLanguageLabel(value) }));
     },
-    [secondaryLanguage, setSecondaryLanguage, setSecondarySttVariant],
+    [secondaryLanguage, setSecondaryLanguage, setSecondarySttVariant, t],
   );
 
   const primaryModel = useMemo(
     () => getModelByVariant(models, primaryLanguage, "large"),
     [models, primaryLanguage],
   );
-
-  const secondaryPrimaryLanguage =
-    secondaryLanguage === "none" ? null : secondaryLanguage;
-  const secondaryModel = useMemo(() => {
-    if (!secondaryPrimaryLanguage) {
-      return null;
-    }
-    return getModelByVariant(models, secondaryPrimaryLanguage, "large");
-  }, [models, secondaryPrimaryLanguage]);
 
   const queuedTaskKeys = useMemo(
     () => new Set(sttInstallQueue.map((task) => `${task.language}:${task.variant}`)),
@@ -2762,7 +2177,6 @@ function LanguageSettings({
     runtimeLatestVersion !== null &&
     compareRuntimeVersions(runtimeCurrentVersion, runtimeLatestVersion) < 0;
 
-  const secondaryModelInstalled = hasInstalledModel(secondaryModel);
 
   const voskReady = readiness.vosk === "granted";
   const selectedPrimaryModelInstalling =
@@ -3268,400 +2682,6 @@ function LanguageSettings({
 
       {success && <p className="text-xs text-success">{success}</p>}
       {error && <p className="text-xs text-danger">{error}</p>}
-    </div>
-  );
-}
-
-function ImageSettings({ disabled }: { disabled: boolean }) {
-  const { apiKey, imageHandlingMode, setImageHandlingMode } = useSettingsStore();
-  const t = useT();
-
-  const aiLocked = disabled || apiKey.trim().length === 0;
-
-  return (
-    <div className="space-y-5">
-      {apiKey.trim().length === 0 && (
-        <div className="flex items-start gap-2.5 p-3 bg-warning-muted rounded-lg border border-warning/30">
-          <AlertTriangle className="w-4 h-4 text-warning mt-0.5 shrink-0" />
-          <p className="text-xs text-warning leading-relaxed">
-            {t("Настройки скриншотов доступны после ввода лицензионного ключа.")}
-          </p>
-        </div>
-      )}
-
-      <Card
-        title={t("Скриншоты")}
-        description={t("Как обрабатывать скриншоты перед отправкой.")}
-      >
-        <div
-          className={`space-y-3 transition-opacity ${aiLocked ? "opacity-50 pointer-events-none" : "opacity-100"}`}
-        >
-          <label className={`flex items-center gap-3 p-3 rounded-lg border border-border transition-colors ${aiLocked ? "cursor-not-allowed" : "hover:border-border-active cursor-pointer"}`}>
-            <input
-              type="radio"
-              name="img"
-              checked={imageHandlingMode === "ocr_text"}
-              onChange={() => setImageHandlingMode("ocr_text")}
-              disabled={aiLocked}
-              className="accent-accent"
-            />
-            <div>
-              <div className="text-sm font-medium">{t("OCR - только текст")}</div>
-              <div className="text-xs text-text-muted">{t("Локальное извлечение текста перед отправкой.")}</div>
-            </div>
-          </label>
-          <label className={`flex items-center gap-3 p-3 rounded-lg border border-border transition-colors ${aiLocked ? "cursor-not-allowed" : "hover:border-border-active cursor-pointer"}`}>
-            <input
-              type="radio"
-              name="img"
-              checked={imageHandlingMode === "send_image"}
-              onChange={() => setImageHandlingMode("send_image")}
-              disabled={aiLocked}
-              className="accent-accent"
-            />
-            <div>
-              <div className="text-sm font-medium">{t("Отправлять изображение")}</div>
-              <div className="text-xs text-text-muted">{t("Лучше для схем и кода, когда текста недостаточно.")}</div>
-            </div>
-          </label>
-        </div>
-      </Card>
-    </div>
-  );
-}
-
-function PrivacySettings({ disabled }: { disabled: boolean }) {
-  const { protectOverlay, setProtectOverlay } = useSettingsStore();
-  const t = useT();
-
-  return (
-    <div className="space-y-5">
-      <Card
-        title={t("Видимость при шаринге")}
-        description={t("Скрывать окно из демонстрации экрана и записи.")}
-      >
-        <Toggle
-          checked={protectOverlay}
-          onChange={setProtectOverlay}
-          disabled={disabled}
-          label={t("Скрывать окно при захвате экрана")}
-          description={t("Использует системную защиту окна. Перед интервью лучше проверить режим в тестовом звонке.")}
-        />
-
-        <div className="mt-4 space-y-2">
-          <div className="text-xs font-medium text-text-muted uppercase tracking-wider">
-            {t("Статус платформы")}
-          </div>
-          <StatusIndicator
-            status="supported"
-            label={t("macOS Видимость при шаринге")}
-            description={t("Скрытие окна активно.")}
-          />
-        </div>
-      </Card>
-
-      <div className="flex items-start gap-2.5 p-3 bg-bg-secondary border border-border rounded-lg">
-        <Info className="w-4 h-4 text-text-muted mt-0.5 shrink-0" />
-        <p className="text-xs text-text-muted leading-relaxed">
-          On macOS 15+ and in browser-based screen sharing (WebRTC), capture
-          protection may not work in all scenarios. Verify your setup in a test call before a live interview.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function StorageSettings({
-  disabled,
-  focusTarget,
-}: {
-  disabled: boolean;
-  focusTarget: SettingsFocusTarget | null;
-}) {
-  const {
-    chatMemoryLimitMb,
-    setChatMemoryLimitMb,
-    historyRetentionDays,
-    setHistoryRetentionDays,
-  } = useSettingsStore();
-  const cleanupHistory = useHistoryStore((s) => s.cleanup);
-  const [retentionDraft, setRetentionDraft] = useState<string>(() =>
-    historyRetentionDays === null
-      ? DEFAULT_HISTORY_RETENTION_DAYS.toString()
-      : historyRetentionDays.toString(),
-  );
-  const keepHistoryForever = historyRetentionDays === null;
-
-  const applyRetentionDraft = useCallback(() => {
-    const normalized = normalizeHistoryRetentionDays(retentionDraft);
-    if (normalized === null) {
-      setRetentionDraft(
-        historyRetentionDays === null
-          ? DEFAULT_HISTORY_RETENTION_DAYS.toString()
-          : historyRetentionDays.toString(),
-      );
-      return;
-    }
-    setHistoryRetentionDays(normalized);
-    cleanupHistory();
-    setRetentionDraft(normalized.toString());
-  }, [cleanupHistory, historyRetentionDays, retentionDraft, setHistoryRetentionDays]);
-
-  return (
-    <div className="space-y-5">
-      <Card
-        title="Chat History Buffer"
-        description="Controls how much chat history is kept in the overlay during an interview."
-      >
-        <Slider
-          label="Memory Limit"
-          value={chatMemoryLimitMb}
-          min={1}
-          max={256}
-          step={1}
-          onChange={setChatMemoryLimitMb}
-          unit="MB"
-          disabled={disabled}
-        />
-        <p className="text-xs text-text-muted mt-3 leading-relaxed">
-          This only affects the visible chat buffer in the overlay. The full
-          history page stores interview metrics and optional final report only.
-        </p>
-      </Card>
-
-      <div
-        id="storage-history-retention"
-        className={getFocusSectionClass(focusTarget === "storage-history-retention")}
-      >
-        <Card
-          title="History Retention"
-          description="Choose how long interview history stays on this device."
-        >
-          <div className="space-y-4">
-            <Toggle
-              checked={keepHistoryForever}
-              onChange={(nextValue) => {
-                if (nextValue) {
-                  setHistoryRetentionDays(null);
-                  cleanupHistory();
-                  return;
-                }
-                const fallbackDays =
-                  normalizeHistoryRetentionDays(retentionDraft) ??
-                  DEFAULT_HISTORY_RETENTION_DAYS;
-                setHistoryRetentionDays(fallbackDays);
-                cleanupHistory();
-                setRetentionDraft(fallbackDays.toString());
-              }}
-              disabled={disabled}
-              label="Keep history forever"
-              description="Disable auto-deletion and keep interview records indefinitely."
-            />
-
-            {!keepHistoryForever && (
-              <div className="space-y-2">
-                <label htmlFor="history-retention-days" className="text-xs text-text-muted uppercase tracking-wider">
-                  Retention Period
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="history-retention-days"
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={retentionDraft}
-                    onChange={(e) => setRetentionDraft(e.target.value)}
-                    onBlur={applyRetentionDraft}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        applyRetentionDraft();
-                      }
-                    }}
-                    disabled={disabled}
-                    className="w-32 bg-bg-input border border-border rounded-lg px-3 py-2 text-sm text-text-primary
-                    focus:border-accent focus:outline-none transition-colors disabled:opacity-50"
-                  />
-                  <span className="text-xs text-text-muted">days</span>
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center gap-2">
-              <Badge variant="muted">{formatHistoryRetentionLabel(historyRetentionDays)}</Badge>
-              <span className="text-xs text-text-muted">
-                {historyRetentionDays === null
-                  ? "Interview history never expires."
-                  : `Sessions older than ${historyRetentionDays} days are automatically deleted.`}
-              </span>
-            </div>
-          </div>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
-function HotkeySettings({
-  disabled,
-  focusTarget,
-}: {
-  disabled: boolean;
-  focusTarget: SettingsFocusTarget | null;
-}) {
-  const { hotkeys, setHotkey, resetHotkeys } = useSettingsStore();
-  const t = useT();
-  const [recording, setRecording] = useState<HotkeyAction | null>(null);
-  const [recordingPreview, setRecordingPreview] = useState<string[]>([]);
-  const recordingPreviewRef = useRef<string[]>([]);
-  const pressedKeysRef = useRef<Set<string>>(new Set());
-
-  function resetRecordingState() {
-    pressedKeysRef.current.clear();
-    recordingPreviewRef.current = [];
-    setRecording(null);
-    setRecordingPreview([]);
-  }
-
-  function applySimplePreset() {
-    resetRecordingState();
-    for (const binding of SIMPLE_HOTKEY_PRESET) {
-      setHotkey(binding.action, binding.keys);
-    }
-  }
-
-  function updateRecordingPreview(event: React.KeyboardEvent<HTMLInputElement>): string[] {
-    const pressedKeys = pressedKeysRef.current;
-    const normalized = normalizeHotkeyToken(event.key);
-    if (normalized) {
-      pressedKeys.add(normalized);
-    }
-    if (event.altKey) pressedKeys.add("Alt");
-    if (event.ctrlKey) pressedKeys.add("Ctrl");
-    if (event.shiftKey) pressedKeys.add("Shift");
-    if (event.metaKey) pressedKeys.add("Meta");
-
-    const preview = normalizeHotkeyKeys(Array.from(pressedKeys)).slice(0, HOTKEY_MAX_KEYS);
-    recordingPreviewRef.current = preview;
-    setRecordingPreview(preview);
-    return preview;
-  }
-
-  function commitRecording(action: HotkeyAction) {
-    const normalized = normalizeHotkeyKeys(recordingPreviewRef.current).slice(0, HOTKEY_MAX_KEYS);
-    if (normalized.length > 0) {
-      setHotkey(action, normalized);
-    }
-    resetRecordingState();
-  }
-
-  function handleKeyDown(action: HotkeyAction, e: React.KeyboardEvent<HTMLInputElement>) {
-    e.preventDefault();
-    if (e.key === "Escape") {
-      resetRecordingState();
-      return;
-    }
-    updateRecordingPreview(e);
-  }
-
-  function handleKeyUp(action: HotkeyAction, e: React.KeyboardEvent<HTMLInputElement>) {
-    const key = normalizeHotkeyToken(e.key);
-    if (key) {
-      pressedKeysRef.current.delete(key);
-    }
-    if (!e.altKey) pressedKeysRef.current.delete("Alt");
-    if (!e.ctrlKey) pressedKeysRef.current.delete("Ctrl");
-    if (!e.shiftKey) pressedKeysRef.current.delete("Shift");
-    if (!e.metaKey) pressedKeysRef.current.delete("Meta");
-
-    if (pressedKeysRef.current.size === 0 && recordingPreviewRef.current.length > 0) {
-      commitRecording(action);
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <div
-        id="hotkeys-bindings"
-        className={getFocusSectionClass(focusTarget === "hotkeys-bindings")}
-      >
-        <Card
-          title={t("Горячие клавиши")}
-          description={t("Эти сочетания работают во время интервью. Нажмите на кнопку справа, чтобы назначить свое сочетание.")}
-        >
-          <div className="mb-4 rounded-lg border border-border bg-bg-secondary p-3 text-xs leading-relaxed text-text-muted">
-            {t("Для простого старта рекомендуем одиночные клавиши")}{" "}
-            <span className="font-medium text-text-secondary">{t("F8, F9, F10 и F11")}</span>.{" "}
-            {t("Они стабильнее работают в Windows, чем системные комбинации вроде")}{" "}
-            <span className="font-medium text-text-secondary">Alt + Space</span>.
-          </div>
-          <div className="space-y-2">
-            {hotkeys.map((hk) => (
-              <div
-                key={hk.action}
-                className="flex items-center justify-between p-3 rounded-lg border border-border"
-              >
-                <span className="text-sm text-text-secondary">{t(hk.label)}</span>
-                {recording === hk.action ? (
-                  <input
-                    autoFocus
-                    readOnly
-                    placeholder={t("Нажмите до {n} клавиш...", { n: HOTKEY_MAX_KEYS })}
-                    value={formatHotkey(recordingPreview)}
-                    className="px-3 py-1.5 bg-accent/10 border border-accent rounded-md text-xs font-mono text-accent w-52 text-center focus:outline-none"
-                    onKeyDown={(e) => handleKeyDown(hk.action, e)}
-                    onKeyUp={(e) => handleKeyUp(hk.action, e)}
-                    onBlur={resetRecordingState}
-                  />
-                ) : (
-                  <button
-                    onClick={() => {
-                      if (disabled) {
-                        return;
-                      }
-                      pressedKeysRef.current.clear();
-                      recordingPreviewRef.current = [];
-                      setRecordingPreview([]);
-                      setRecording(hk.action);
-                    }}
-                    disabled={disabled}
-                    className="px-3 py-1.5 bg-bg-tertiary border border-border rounded-md text-xs font-mono text-text-primary
-                    hover:border-border-active transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {formatHotkey(hk.keys)}
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-          <p className="mt-3 text-xs text-text-muted">
-            {t("Можно использовать до {n} клавиш в одном сочетании.", { n: HOTKEY_MAX_KEYS })}
-          </p>
-          <div className="mt-4">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={applySimplePreset}
-              disabled={disabled}
-              className="mr-2"
-            >
-              {t("Простой набор (F8-F11)")}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                resetRecordingState();
-                resetHotkeys();
-              }}
-              disabled={disabled}
-              icon={<RotateCcw className="w-3.5 h-3.5" />}
-            >
-              {t("Сбросить по умолчанию")}
-            </Button>
-          </div>
-        </Card>
-      </div>
     </div>
   );
 }
