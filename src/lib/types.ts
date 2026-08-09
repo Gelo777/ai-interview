@@ -1,11 +1,9 @@
 export type Provider =
   | "gemini"
-  | "openai"
   | "claude"
   | "neuroapi"
   | "custom";
 export type LlmBaseUrlPreset = Provider;
-export type LlmApiDialect = "gemini" | "openai" | "anthropic";
 
 export type CacheSupport = "supported" | "not_supported" | "unknown";
 export type MultimodalSupport = "supported" | "not_supported";

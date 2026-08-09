@@ -895,7 +895,7 @@ interface ApiErrorEnvelope {
 /**
  * Parses the `{ "error": { code, message, requestId } }` envelope (and legacy
  * shapes) into a typed `ProxyApiError`. The message is resolved to friendly
- * Russian text via the code map / OpenAI special cases when possible.
+ * Russian text via the known error-code map when possible.
  */
 export async function readApiError(response: Response): Promise<ProxyApiError> {
   const raw = await response.text();
@@ -948,13 +948,6 @@ function resolveFriendlyErrorMessage(
   if (status === 402) {
     return LICENSE_ERROR_MESSAGES.PAYMENT_REQUIRED;
   }
-  const openAiFriendly = toFriendlyProxyError(
-    { error: { code: normalizedCode, message: serverMessage } },
-    status,
-  );
-  if (openAiFriendly) {
-    return openAiFriendly;
-  }
   if (serverMessage.trim()) {
     return serverMessage.trim();
   }
@@ -974,10 +967,6 @@ async function readErrorMessage(response: Response): Promise<string> {
       message?: string;
       error?: string | { message?: string; code?: string };
     };
-    const friendly = toFriendlyProxyError(parsed, response.status);
-    if (friendly) {
-      return friendly;
-    }
     if (typeof parsed.message === "string" && parsed.message.trim()) {
       return parsed.message;
     }
@@ -997,31 +986,6 @@ async function readErrorMessage(response: Response): Promise<string> {
   }
 
   return fallback;
-}
-
-function toFriendlyProxyError(
-  parsed: {
-    message?: string;
-    error?: string | { message?: string; code?: string };
-  },
-  status: number,
-): string | null {
-  const code = typeof parsed.error === "object" ? parsed.error.code ?? "" : "";
-  const message =
-    typeof parsed.message === "string"
-      ? parsed.message
-      : typeof parsed.error === "string"
-        ? parsed.error
-        : parsed.error?.message ?? "";
-  const normalized = `${code} ${message}`.toLowerCase();
-
-  if (normalized.includes("http 401 from openai") || normalized.includes("invalid_api_key")) {
-    return "Сервис временно недоступен: обработка ответов не настроена.";
-  }
-  if (status === 502 && normalized.includes("openai")) {
-    return "Сервис временно недоступен: не удалось получить ответ.";
-  }
-  return null;
 }
 
 function normalizeValidationError(error: unknown): string {
