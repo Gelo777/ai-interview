@@ -609,7 +609,7 @@ impl SttSession {
                 }
 
                 match spawn_recognition_worker(
-                    app,
+                    app.clone(),
                     running.clone(),
                     runtime_library_path.clone(),
                     model_path.clone(),

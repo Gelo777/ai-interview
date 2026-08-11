@@ -8,7 +8,7 @@ import type { ContextFile } from "@/lib/types";
  * instead of letting one long résumé push the others out.
  */
 
-/** Kept in sync with `app.openai.hintContextMaxChars` on the backend. */
+/** Kept in sync with the proxy's hint-context limit. */
 export const ASSISTANT_CONTEXT_MAX_CHARS = 6000;
 const MIN_FILE_EXCERPT_CHARS = 400;
 const TRUNCATION_MARK = "\n[...обрезано]";

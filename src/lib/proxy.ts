@@ -559,15 +559,56 @@ export async function requestProxyHint(params: {
   return (await response.json()) as ProxyHintResponse;
 }
 
-export function buildLiveSttWebSocketUrl(params: {
+export interface LiveSttWebSocketTicket {
+  ticket: string;
+  expiresAt: string;
+}
+
+export async function requestLiveSttWebSocketTicket(params: {
   licenseKey: string;
+  baseUrl?: string;
+}): Promise<LiveSttWebSocketTicket> {
+  const licenseKey = params.licenseKey.trim();
+  if (!licenseKey) {
+    throw new Error("Введите лицензионный ключ.");
+  }
+
+  const baseUrl = params.baseUrl?.trim() || PROXY_BASE_URL;
+  const response = await fetch(joinBaseUrl(baseUrl, "/api/v1/stt/live/ticket"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(await getAuthHeaders(licenseKey)),
+    },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    throw await readApiError(response);
+  }
+
+  const payload = (await response.json()) as Partial<LiveSttWebSocketTicket>;
+  if (!payload.ticket?.trim() || !payload.expiresAt?.trim()) {
+    throw new Error("Сервис вернул некорректный билет для live STT.");
+  }
+  return {
+    ticket: payload.ticket.trim(),
+    expiresAt: payload.expiresAt.trim(),
+  };
+}
+
+export function buildLiveSttWebSocketUrl(params: {
+  ticket: string;
   lang: string;
   deviceFingerprint?: string;
   deviceName?: string;
   baseUrl?: string;
 }): string {
   const wsUrl = toLiveSttWebSocketUrl(params.baseUrl?.trim() || PROXY_BASE_URL);
-  wsUrl.searchParams.set("licenseKey", params.licenseKey.trim());
+  const ticket = params.ticket.trim();
+  if (!ticket) {
+    throw new Error("Билет для live STT отсутствует.");
+  }
+  wsUrl.searchParams.set("ticket", ticket);
   wsUrl.searchParams.set("lang", (params.lang || "ru").trim().toLowerCase());
   if (params.deviceFingerprint?.trim()) {
     wsUrl.searchParams.set("deviceFingerprint", params.deviceFingerprint.trim());
@@ -854,7 +895,7 @@ interface ApiErrorEnvelope {
 /**
  * Parses the `{ "error": { code, message, requestId } }` envelope (and legacy
  * shapes) into a typed `ProxyApiError`. The message is resolved to friendly
- * Russian text via the code map / OpenAI special cases when possible.
+ * Russian text via the known error-code map when possible.
  */
 export async function readApiError(response: Response): Promise<ProxyApiError> {
   const raw = await response.text();
@@ -907,13 +948,6 @@ function resolveFriendlyErrorMessage(
   if (status === 402) {
     return LICENSE_ERROR_MESSAGES.PAYMENT_REQUIRED;
   }
-  const openAiFriendly = toFriendlyProxyError(
-    { error: { code: normalizedCode, message: serverMessage } },
-    status,
-  );
-  if (openAiFriendly) {
-    return openAiFriendly;
-  }
   if (serverMessage.trim()) {
     return serverMessage.trim();
   }
@@ -933,10 +967,6 @@ async function readErrorMessage(response: Response): Promise<string> {
       message?: string;
       error?: string | { message?: string; code?: string };
     };
-    const friendly = toFriendlyProxyError(parsed, response.status);
-    if (friendly) {
-      return friendly;
-    }
     if (typeof parsed.message === "string" && parsed.message.trim()) {
       return parsed.message;
     }
@@ -956,31 +986,6 @@ async function readErrorMessage(response: Response): Promise<string> {
   }
 
   return fallback;
-}
-
-function toFriendlyProxyError(
-  parsed: {
-    message?: string;
-    error?: string | { message?: string; code?: string };
-  },
-  status: number,
-): string | null {
-  const code = typeof parsed.error === "object" ? parsed.error.code ?? "" : "";
-  const message =
-    typeof parsed.message === "string"
-      ? parsed.message
-      : typeof parsed.error === "string"
-        ? parsed.error
-        : parsed.error?.message ?? "";
-  const normalized = `${code} ${message}`.toLowerCase();
-
-  if (normalized.includes("http 401 from openai") || normalized.includes("invalid_api_key")) {
-    return "Сервис временно недоступен: обработка ответов не настроена.";
-  }
-  if (status === 502 && normalized.includes("openai")) {
-    return "Сервис временно недоступен: не удалось получить ответ.";
-  }
-  return null;
 }
 
 function normalizeValidationError(error: unknown): string {

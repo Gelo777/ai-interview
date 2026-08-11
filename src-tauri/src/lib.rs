@@ -12,8 +12,6 @@ mod stt_runtime;
 mod system_audio;
 mod vosk_installer;
 mod vosk_runtime;
-mod whisper_stt_runtime;
-
 use tauri::{Emitter, Manager};
 
 fn app_window_url(_app: &tauri::AppHandle) -> tauri::WebviewUrl {
@@ -69,10 +67,6 @@ pub fn run() {
         .manage(commands::InterviewWindowLock::default())
         .manage(app_updates::PendingUpdate::default())
         .setup(|app| {
-            // Redirect whisper.cpp / ggml native logs away from raw stdout traces.
-            // Without log backend features this effectively silences low-level decode spam.
-            whisper_rs::install_logging_hooks();
-
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
@@ -152,7 +146,6 @@ pub fn run() {
             commands::list_audio_devices,
             commands::get_audio_debug_snapshot,
             commands::capture_audio_sample,
-            commands::transcribe_captured_audio,
             commands::probe_audio_devices,
             commands::capture_server_stt_chunk,
             commands::stop_server_stt_live_capture,
@@ -176,7 +169,6 @@ pub fn run() {
             commands::read_app_state,
             commands::write_app_state,
             commands::remove_app_state,
-            commands::get_stt_status,
             commands::get_vosk_stt_status,
             commands::create_overlay_window,
             commands::close_main_window,
@@ -187,18 +179,11 @@ pub fn run() {
             commands::set_active_vosk_model,
             commands::switch_stt_model,
             commands::preload_stt_model,
-            commands::list_whisper_models,
-            commands::set_active_whisper_model,
-            commands::remove_whisper_model,
-            commands::download_whisper_model,
             commands::remove_vosk_model,
             commands::ensure_default_stt_assets,
             commands::list_vosk_runtime_versions,
             commands::install_vosk_runtime,
             commands::cancel_vosk_install,
-            commands::start_stt_session,
-            commands::stop_stt_session,
-            commands::is_stt_session_running,
             commands::start_vosk_stt_session,
             commands::stop_vosk_stt_session,
             commands::is_vosk_stt_session_running,

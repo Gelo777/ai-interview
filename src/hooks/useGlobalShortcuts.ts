@@ -8,6 +8,7 @@ type ShortcutCallback = (action: string) => void;
 
 let globalShortcutsBlockedByAcl = false;
 let globalShortcutsAclLogShown = false;
+let globalShortcutOperation: Promise<void> = Promise.resolve();
 
 function isAclDeniedError(error: unknown): boolean {
   const text =
@@ -106,7 +107,8 @@ export function useGlobalShortcuts(
       return;
     }
 
-    let cleanup: (() => void) | null = null;
+    let cancelled = false;
+    let localCleanup: (() => void) | null = null;
 
     async function register() {
       try {
@@ -114,9 +116,15 @@ export function useGlobalShortcuts(
           "@tauri-apps/plugin-global-shortcut"
         );
 
+        if (cancelled) {
+          return;
+        }
         await unregisterAll().catch(() => {
           // Ignore cleanup failures from stale registrations.
         });
+        if (cancelled) {
+          return;
+        }
         logInfo("shortcuts.global", "Starting global shortcut registration");
 
         const registeredShortcuts: string[] = [];
@@ -126,10 +134,19 @@ export function useGlobalShortcuts(
           const fallbackCandidates = keysToAccelerators(hk.default);
           const tryRegister = async (
             candidates: string[],
-          ): Promise<{ ok: boolean; used: string | null; error: unknown }> => {
+          ): Promise<{
+            ok: boolean;
+            used: string | null;
+            error: unknown;
+            cancelled: boolean;
+          }> => {
             const unique = [...new Set(candidates.map((value) => value.trim()).filter(Boolean))];
             let lastError: unknown = null;
             for (const accelerator of unique) {
+              if (cancelled) {
+                await unregisterAll().catch(() => {});
+                return { ok: false, used: null, error: null, cancelled: true };
+              }
               try {
                 await register(accelerator, (event) => {
                   if (event.state !== "Pressed") {
@@ -137,19 +154,26 @@ export function useGlobalShortcuts(
                   }
                   onActionRef.current(hk.action);
                 });
+                if (cancelled) {
+                  await unregisterAll().catch(() => {});
+                  return { ok: false, used: null, error: null, cancelled: true };
+                }
                 registeredShortcuts.push(accelerator);
-                return { ok: true, used: accelerator, error: null };
+                return { ok: true, used: accelerator, error: null, cancelled: false };
               } catch (err) {
                 if (isAclDeniedError(err)) {
-                  return { ok: false, used: null, error: err };
+                  return { ok: false, used: null, error: err, cancelled: false };
                 }
                 lastError = err;
               }
             }
-            return { ok: false, used: null, error: lastError };
+            return { ok: false, used: null, error: lastError, cancelled: false };
           };
 
           const customResult = await tryRegister(customCandidates);
+          if (customResult.cancelled) {
+            return;
+          }
           if (isAclDeniedError(customResult.error)) {
             globalShortcutsBlockedByAcl = true;
             globalShortcutsAclLogShown = true;
@@ -168,6 +192,9 @@ export function useGlobalShortcuts(
           }
 
           const fallbackResult = await tryRegister(fallbackCandidates);
+          if (fallbackResult.cancelled) {
+            return;
+          }
           if (isAclDeniedError(fallbackResult.error)) {
             globalShortcutsBlockedByAcl = true;
             globalShortcutsAclLogShown = true;
@@ -206,20 +233,31 @@ export function useGlobalShortcuts(
           );
         }
 
+        if (cancelled) {
+          await unregisterAll().catch(() => {});
+          return;
+        }
+
         if (registeredShortcuts.length === 0) {
           logWarn(
             "shortcuts.global",
             "No global shortcuts were registered",
           );
-          cleanup = () => {
-            unregisterAll().catch((error: unknown) => {
-              logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+          localCleanup = () => {
+            globalShortcutOperation = globalShortcutOperation.then(async () => {
+              await unregisterAll().catch((error: unknown) => {
+                logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+              });
             });
           };
           return;
         }
 
         for (const shortcut of registeredShortcuts) {
+          if (cancelled) {
+            await unregisterAll().catch(() => {});
+            return;
+          }
           const registered = await isRegistered(shortcut).catch(() => false);
           if (!registered) {
             logWarn("shortcuts.global", `Shortcut '${shortcut}' is not active after registration`);
@@ -229,9 +267,16 @@ export function useGlobalShortcuts(
           shortcuts: registeredShortcuts,
         });
 
-        cleanup = () => {
-          unregisterAll().catch((error: unknown) => {
-            logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+        if (cancelled) {
+          await unregisterAll().catch(() => {});
+          return;
+        }
+
+        localCleanup = () => {
+          globalShortcutOperation = globalShortcutOperation.then(async () => {
+            await unregisterAll().catch((error: unknown) => {
+              logWarn("shortcuts.global", "Failed to cleanup global shortcuts", error);
+            });
           });
         };
       } catch (err) {
@@ -239,10 +284,11 @@ export function useGlobalShortcuts(
       }
     }
 
-    register();
+    globalShortcutOperation = globalShortcutOperation.then(register, register);
 
     return () => {
-      cleanup?.();
+      cancelled = true;
+      localCleanup?.();
     };
   }, [hotkeys, enabled]);
 }

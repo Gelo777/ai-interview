@@ -8,7 +8,14 @@ on:
 
 jobs:
   rust-check:
-    runs-on: windows-latest
+    name: Rust Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: src-tauri

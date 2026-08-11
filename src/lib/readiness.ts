@@ -1,4 +1,3 @@
-import { resolveLlmEndpointConfig } from "@/lib/llm";
 import { getCachedAccessToken, validateLicenseKeyDetailed } from "@/lib/proxy";
 import type { LlmBaseUrlPreset, ModelInfo, PermissionStatus } from "@/lib/types";
 import { useSettingsStore } from "@/stores/settings";
@@ -179,8 +178,7 @@ export async function checkCloudReadiness(
   baseUrlPreset: LlmBaseUrlPreset,
   customBaseUrl: string,
 ): Promise<CloudReadiness> {
-  const endpoint = resolveLlmEndpointConfig(baseUrlPreset, customBaseUrl);
-  if (!endpoint.baseUrl) {
+  if (!customBaseUrl.trim()) {
     return buildCloudReadiness(
       "denied",
       "Сервис временно недоступен",

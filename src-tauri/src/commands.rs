@@ -4,12 +4,11 @@ use crate::install_control;
 use crate::license;
 use crate::ocr;
 use crate::secret_store;
-use crate::stt::{SttConfig, SttDiagnostic, SttStatus};
+use crate::stt::SttStatus;
 use crate::stt_runtime as vosk_stt_runtime;
 use crate::system_audio;
 use crate::vosk_installer;
 use crate::vosk_runtime;
-use crate::whisper_stt_runtime as stt_runtime;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -25,7 +24,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::WebviewUrl;
 use tauri::{Emitter, Manager};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 #[cfg(target_os = "windows")]
 use std::process::Command;
@@ -34,13 +32,8 @@ const APP_STATE_DIR_NAME: &str = "state";
 const NETWORK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const MODEL_INDEX_REQUEST_TIMEOUT_SECS: u64 = 4;
 const MODEL_DOWNLOAD_REQUEST_TIMEOUT_SECS: u64 = 7_200;
-const STT_STARTUP_COMMAND_TIMEOUT_SECS: u64 = 90;
 const VOSK_STT_STARTUP_COMMAND_TIMEOUT_SECS: u64 = 360;
 const STT_STOP_COMMAND_TIMEOUT_SECS: u64 = 70;
-const WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD: f32 = 0.010;
-const WHISPER_CHUNK_SILENCE_RMS_THRESHOLD: f32 = 0.0035;
-const WHISPER_CHUNK_TARGET_PEAK: f32 = 0.060;
-const WHISPER_CHUNK_MAX_GAIN: f32 = 6.0;
 const PROXY_LICENSE_TIMEOUT_SECS: u64 = 20;
 const PROXY_STT_CONNECT_TIMEOUT_SECS: u64 = 5;
 const PROXY_STT_TIMEOUT_SECS: u64 = 20;
@@ -1260,8 +1253,8 @@ fn build_pcm16_mono_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod audio_recording_tests {
     use super::{
-        audio_has_productive_signal, audio_peak_abs_i16, audio_rms_i16,
-        build_pcm16_mono_wav_bytes, condition_server_stt_mic_chunk,
+        audio_has_productive_signal, audio_peak_abs_i16, audio_rms_i16, build_pcm16_mono_wav_bytes,
+        condition_server_stt_mic_chunk,
     };
 
     const DRIVE_VIDEO_AUDIO_FIXTURES: &[(&str, &[u8])] = &[
@@ -1322,7 +1315,11 @@ mod audio_recording_tests {
                 b"fmt " => {
                     assert!(chunk_len >= 16, "fmt chunk is too short");
                     assert_eq!(read_u16_le(bytes, payload_offset), 1, "expected PCM wav");
-                    assert_eq!(read_u16_le(bytes, payload_offset + 2), 1, "expected mono wav");
+                    assert_eq!(
+                        read_u16_le(bytes, payload_offset + 2),
+                        1,
+                        "expected mono wav"
+                    );
                     sample_rate = Some(read_u32_le(bytes, payload_offset + 4));
                     assert_eq!(
                         read_u16_le(bytes, payload_offset + 14),
@@ -2035,7 +2032,7 @@ pub async fn capture_audio_sample(
     app: tauri::AppHandle,
     request: Option<CaptureAudioSampleRequest>,
 ) -> Result<CaptureAudioSampleResult, String> {
-    if stt_runtime::is_global_session_running() {
+    if vosk_stt_runtime::is_global_session_running() {
         return Err("Сначала завершите активное интервью, затем запустите тест аудио.".to_string());
     }
 
@@ -2069,242 +2066,6 @@ pub async fn capture_audio_sample(
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct TranscribeCapturedAudioRequest {
-    pub capture_dir: Option<String>,
-    pub language: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TranscribedAudioTrack {
-    pub source: String,
-    pub file_path: Option<String>,
-    pub sample_rate: Option<u32>,
-    pub sample_count: usize,
-    pub duration_ms: u64,
-    pub text: String,
-    pub available: bool,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TranscribeCapturedAudioResult {
-    pub capture_dir: String,
-    pub model_path: String,
-    pub language: String,
-    pub microphone: TranscribedAudioTrack,
-    pub system_audio: TranscribedAudioTrack,
-    pub transcribed_at_unix_ms: u64,
-}
-
-fn normalize_whisper_language_code(language: &str) -> String {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "en" | "en-us" => "en".to_string(),
-        "ru" | "ru-ru" => "ru".to_string(),
-        "es" | "es-es" => "es".to_string(),
-        "de" | "de-de" => "de".to_string(),
-        "fr" | "fr-fr" => "fr".to_string(),
-        "it" | "it-it" => "it".to_string(),
-        "pt" | "pt-br" => "pt".to_string(),
-        "zh" | "zh-cn" => "zh".to_string(),
-        "ja" | "ja-jp" => "ja".to_string(),
-        "ko" | "ko-kr" => "ko".to_string(),
-        other if !other.is_empty() => other.to_string(),
-        _ => "en".to_string(),
-    }
-}
-
-fn read_wav_pcm16_mono(path: &Path) -> Result<(u32, Vec<i16>), String> {
-    let bytes = std::fs::read(path)
-        .map_err(|err| format!("Failed to read WAV file '{}': {}", path.display(), err))?;
-    if bytes.len() < 44 {
-        return Err(format!(
-            "Invalid WAV file '{}': header is too short",
-            path.display()
-        ));
-    }
-    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(format!(
-            "Invalid WAV file '{}': missing RIFF/WAVE header",
-            path.display()
-        ));
-    }
-
-    let mut cursor = 12usize;
-    let mut sample_rate: Option<u32> = None;
-    let mut channels: Option<u16> = None;
-    let mut bits_per_sample: Option<u16> = None;
-    let mut audio_format: Option<u16> = None;
-    let mut data_chunk: Option<&[u8]> = None;
-
-    while cursor + 8 <= bytes.len() {
-        let chunk_id = &bytes[cursor..cursor + 4];
-        let chunk_size = u32::from_le_bytes([
-            bytes[cursor + 4],
-            bytes[cursor + 5],
-            bytes[cursor + 6],
-            bytes[cursor + 7],
-        ]) as usize;
-        let chunk_data_start = cursor + 8;
-        let chunk_data_end = chunk_data_start.saturating_add(chunk_size);
-        if chunk_data_end > bytes.len() {
-            break;
-        }
-
-        if chunk_id == b"fmt " {
-            if chunk_size < 16 {
-                return Err(format!(
-                    "Invalid WAV file '{}': fmt chunk is too short",
-                    path.display()
-                ));
-            }
-            audio_format = Some(u16::from_le_bytes([
-                bytes[chunk_data_start],
-                bytes[chunk_data_start + 1],
-            ]));
-            channels = Some(u16::from_le_bytes([
-                bytes[chunk_data_start + 2],
-                bytes[chunk_data_start + 3],
-            ]));
-            sample_rate = Some(u32::from_le_bytes([
-                bytes[chunk_data_start + 4],
-                bytes[chunk_data_start + 5],
-                bytes[chunk_data_start + 6],
-                bytes[chunk_data_start + 7],
-            ]));
-            bits_per_sample = Some(u16::from_le_bytes([
-                bytes[chunk_data_start + 14],
-                bytes[chunk_data_start + 15],
-            ]));
-        } else if chunk_id == b"data" {
-            data_chunk = Some(&bytes[chunk_data_start..chunk_data_end]);
-        }
-
-        let padded_size = if chunk_size % 2 == 0 {
-            chunk_size
-        } else {
-            chunk_size + 1
-        };
-        cursor = chunk_data_start.saturating_add(padded_size);
-    }
-
-    let sample_rate = sample_rate.ok_or_else(|| {
-        format!(
-            "Invalid WAV file '{}': missing fmt chunk with sample rate",
-            path.display()
-        )
-    })?;
-    let channels = channels.ok_or_else(|| {
-        format!(
-            "Invalid WAV file '{}': missing fmt chunk with channels",
-            path.display()
-        )
-    })?;
-    let bits_per_sample = bits_per_sample.ok_or_else(|| {
-        format!(
-            "Invalid WAV file '{}': missing fmt chunk with bit depth",
-            path.display()
-        )
-    })?;
-    let audio_format = audio_format.ok_or_else(|| {
-        format!(
-            "Invalid WAV file '{}': missing fmt chunk with audio format",
-            path.display()
-        )
-    })?;
-    let data_chunk = data_chunk
-        .ok_or_else(|| format!("Invalid WAV file '{}': missing data chunk", path.display()))?;
-
-    if audio_format != 1 {
-        return Err(format!(
-            "Unsupported WAV audio format in '{}': {} (only PCM is supported)",
-            path.display(),
-            audio_format
-        ));
-    }
-    if bits_per_sample != 16 {
-        return Err(format!(
-            "Unsupported WAV bit depth in '{}': {} (only 16-bit PCM is supported)",
-            path.display(),
-            bits_per_sample
-        ));
-    }
-    if data_chunk.len() % 2 != 0 {
-        return Err(format!(
-            "Invalid WAV data chunk size in '{}': {}",
-            path.display(),
-            data_chunk.len()
-        ));
-    }
-
-    let raw_samples = data_chunk
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-        .collect::<Vec<_>>();
-
-    let mono_samples = if channels <= 1 {
-        raw_samples
-    } else {
-        raw_samples
-            .chunks(channels as usize)
-            .map(|frame| {
-                let sum = frame.iter().map(|sample| *sample as i32).sum::<i32>();
-                (sum / channels as i32) as i16
-            })
-            .collect()
-    };
-
-    Ok((sample_rate, mono_samples))
-}
-
-fn resample_mono_i16_linear(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16> {
-    if samples.is_empty() || input_rate == 0 || output_rate == 0 || input_rate == output_rate {
-        return samples.to_vec();
-    }
-
-    let ratio = output_rate as f64 / input_rate as f64;
-    let output_len = ((samples.len() as f64) * ratio).round() as usize;
-    if output_len == 0 {
-        return Vec::new();
-    }
-
-    let mut output = Vec::with_capacity(output_len);
-    for output_index in 0..output_len {
-        let source_pos = output_index as f64 / ratio;
-        let left_index = source_pos.floor() as usize;
-        let right_index = left_index.saturating_add(1);
-        let frac = (source_pos - left_index as f64) as f32;
-        let left = *samples
-            .get(left_index)
-            .unwrap_or_else(|| samples.last().unwrap_or(&0)) as f32;
-        let right = *samples
-            .get(right_index)
-            .unwrap_or_else(|| samples.last().unwrap_or(&0)) as f32;
-        output.push((left + (right - left) * frac).round() as i16);
-    }
-    output
-}
-
-fn audio_peak_and_rms_f32(samples: &[i16]) -> (f32, f32) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-
-    let mut peak = 0.0_f32;
-    let mut squared_sum = 0.0_f64;
-    for sample in samples {
-        let value = (*sample as f32) / (i16::MAX as f32);
-        let abs_value = value.abs();
-        if abs_value > peak {
-            peak = abs_value;
-        }
-        squared_sum += (value as f64) * (value as f64);
-    }
-
-    let rms = (squared_sum / samples.len() as f64).sqrt() as f32;
-    (peak, rms)
-}
-
 fn apply_gain_i16_in_place(samples: &mut [i16], gain: f32) {
     if gain <= 1.0 {
         return;
@@ -2313,260 +2074,6 @@ fn apply_gain_i16_in_place(samples: &mut [i16], gain: f32) {
         let scaled = (*sample as f32) * gain;
         let clamped = scaled.clamp(i16::MIN as f32, i16::MAX as f32);
         *sample = clamped.round() as i16;
-    }
-}
-
-fn looks_like_subtitle_credit_hallucination(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("редактор субтитр")
-        || (lower.contains("субтитр") && lower.contains("корректор"))
-        || (lower.contains("subtitles") && lower.contains("editor"))
-}
-
-fn transcribe_wav_with_whisper(
-    context: &WhisperContext,
-    file_path: &Path,
-    language: &str,
-) -> Result<TranscribedAudioTrack, String> {
-    let (input_sample_rate, mono_samples) = read_wav_pcm16_mono(file_path)?;
-    let mut mono_samples_16k = resample_mono_i16_linear(&mono_samples, input_sample_rate, 16000);
-    let source = if file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .contains("system")
-    {
-        "system".to_string()
-    } else {
-        "mic".to_string()
-    };
-
-    let (raw_peak, _raw_rms) = audio_peak_and_rms_f32(&mono_samples_16k);
-    if raw_peak > 0.0 && raw_peak < WHISPER_CHUNK_TARGET_PEAK {
-        let gain = (WHISPER_CHUNK_TARGET_PEAK / raw_peak).min(WHISPER_CHUNK_MAX_GAIN);
-        apply_gain_i16_in_place(&mut mono_samples_16k, gain);
-    }
-
-    let (peak, rms) = audio_peak_and_rms_f32(&mono_samples_16k);
-    if peak < WHISPER_CHUNK_SILENCE_PEAK_THRESHOLD && rms < WHISPER_CHUNK_SILENCE_RMS_THRESHOLD {
-        let duration_ms = if input_sample_rate == 0 {
-            0
-        } else {
-            ((mono_samples.len() as f64 / input_sample_rate as f64) * 1000.0) as u64
-        };
-        return Ok(TranscribedAudioTrack {
-            source,
-            file_path: Some(file_path.to_string_lossy().to_string()),
-            sample_rate: Some(input_sample_rate),
-            sample_count: mono_samples.len(),
-            duration_ms,
-            text: String::new(),
-            available: true,
-            detail: format!(
-                "Skipped near-silence chunk (peak={:.4}, rms={:.4}).",
-                peak, rms
-            ),
-        });
-    }
-
-    let mut audio_f32 = Vec::with_capacity(mono_samples_16k.len());
-    for sample in &mono_samples_16k {
-        audio_f32.push((*sample as f32) / (i16::MAX as f32));
-    }
-
-    let mut state = context
-        .create_state()
-        .map_err(|err| format!("Failed to create Whisper state: {}", err))?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some(language));
-    params.set_translate(false);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_no_timestamps(true);
-    params.set_single_segment(false);
-    params.set_no_context(true);
-    params.set_suppress_nst(true);
-    params.set_logprob_thold(-1.0);
-    params.set_no_speech_thold(0.50);
-    params.set_n_threads(4);
-
-    state
-        .full(params, &audio_f32)
-        .map_err(|err| format!("Whisper failed for '{}': {}", file_path.display(), err))?;
-
-    let mut text = state
-        .as_iter()
-        .map(|segment| segment.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut detail = "Transcription completed.".to_string();
-    if looks_like_subtitle_credit_hallucination(&text) {
-        text.clear();
-        detail = "Filtered probable Whisper subtitle-credit hallucination.".to_string();
-    }
-
-    let duration_ms = if input_sample_rate == 0 {
-        0
-    } else {
-        ((mono_samples.len() as f64 / input_sample_rate as f64) * 1000.0) as u64
-    };
-
-    Ok(TranscribedAudioTrack {
-        source,
-        file_path: Some(file_path.to_string_lossy().to_string()),
-        sample_rate: Some(input_sample_rate),
-        sample_count: mono_samples.len(),
-        duration_ms,
-        text,
-        available: true,
-        detail,
-    })
-}
-
-fn find_latest_capture_dir(base_dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(base_dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((path, modified))
-        })
-        .max_by_key(|(_, modified)| *modified)
-        .map(|(path, _)| path)
-}
-
-fn transcribe_captured_audio_blocking(
-    app: tauri::AppHandle,
-    request: Option<TranscribeCapturedAudioRequest>,
-) -> Result<TranscribeCapturedAudioResult, String> {
-    if stt_runtime::is_global_session_running() {
-        return Err(
-            "Сначала завершите активное интервью, затем запустите проверку WAV.".to_string(),
-        );
-    }
-
-    let request = request.unwrap_or_default();
-    let app_data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
-    let capture_root = app_data_dir.join("diagnostics").join("audio-capture");
-    let capture_dir = if let Some(raw_dir) = request.capture_dir {
-        PathBuf::from(raw_dir)
-    } else {
-        find_latest_capture_dir(&capture_root).ok_or_else(|| {
-            format!(
-                "Папка с тестовой записью не найдена: '{}'. Сначала запишите тест аудио.",
-                capture_root.display()
-            )
-        })?
-    };
-
-    if !capture_dir.is_dir() {
-        return Err(format!(
-            "Capture folder '{}' does not exist.",
-            capture_dir.display()
-        ));
-    }
-
-    let model_path = resolve_stt_model_path(&app).ok_or_else(|| {
-        "Whisper model is not installed. Install a model in Speech settings first.".to_string()
-    })?;
-    let model_path_str = model_path.to_string_lossy().to_string();
-    let requested_language = request
-        .language
-        .as_deref()
-        .map(normalize_primary_language)
-        .unwrap_or_else(|| "ru-RU".to_string());
-    let whisper_language = normalize_whisper_language_code(&requested_language);
-
-    let context = WhisperContext::new_with_params(
-        model_path
-            .to_str()
-            .ok_or_else(|| "Model path contains invalid UTF-8".to_string())?,
-        WhisperContextParameters::default(),
-    )
-    .map_err(|err| {
-        format!(
-            "Failed to load Whisper model '{}': {}",
-            model_path.display(),
-            err
-        )
-    })?;
-
-    let mic_path = capture_dir.join("mic.wav");
-    let mut microphone = if mic_path.is_file() {
-        transcribe_wav_with_whisper(&context, &mic_path, &whisper_language)?
-    } else {
-        TranscribedAudioTrack {
-            source: "mic".to_string(),
-            file_path: Some(mic_path.to_string_lossy().to_string()),
-            sample_rate: None,
-            sample_count: 0,
-            duration_ms: 0,
-            text: String::new(),
-            available: false,
-            detail: "mic.wav not found in capture folder.".to_string(),
-        }
-    };
-
-    let system_path = capture_dir.join("system.wav");
-    let mut system_audio = if system_path.is_file() {
-        transcribe_wav_with_whisper(&context, &system_path, &whisper_language)?
-    } else {
-        TranscribedAudioTrack {
-            source: "system".to_string(),
-            file_path: Some(system_path.to_string_lossy().to_string()),
-            sample_rate: None,
-            sample_count: 0,
-            duration_ms: 0,
-            text: String::new(),
-            available: false,
-            detail: "system.wav not found in capture folder.".to_string(),
-        }
-    };
-
-    if microphone.text.is_empty() && microphone.available {
-        microphone.detail = "Transcription produced empty text.".to_string();
-    }
-    if system_audio.text.is_empty() && system_audio.available {
-        system_audio.detail = "Transcription produced empty text.".to_string();
-    }
-
-    Ok(TranscribeCapturedAudioResult {
-        capture_dir: capture_dir.to_string_lossy().to_string(),
-        model_path: model_path_str,
-        language: whisper_language,
-        microphone,
-        system_audio,
-        transcribed_at_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0),
-    })
-}
-
-#[tauri::command]
-pub async fn transcribe_captured_audio(
-    app: tauri::AppHandle,
-    request: Option<TranscribeCapturedAudioRequest>,
-) -> Result<TranscribeCapturedAudioResult, String> {
-    let app_handle = app.clone();
-    let task = tauri::async_runtime::spawn_blocking(move || {
-        transcribe_captured_audio_blocking(app_handle, request)
-    });
-
-    match tokio::time::timeout(Duration::from_secs(180), task).await {
-        Ok(join_result) => join_result
-            .map_err(|join_err| format!("Failed to join WAV transcription task: {}", join_err))?,
-        Err(_) => Err("WAV transcription timed out. Try a shorter capture.".to_string()),
     }
 }
 
@@ -2894,7 +2401,7 @@ pub async fn capture_server_stt_chunk(
     app: tauri::AppHandle,
     request: Option<ServerSttChunkCaptureRequest>,
 ) -> Result<ServerSttChunkCaptureResult, String> {
-    if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
+    if vosk_stt_runtime::is_global_session_running() {
         return Err(
             "Stop active local speech session before server audio streaming capture.".to_string(),
         );
@@ -3078,7 +2585,7 @@ pub async fn capture_and_transcribe_server_stt(
     app: tauri::AppHandle,
     request: Option<ServerSttCaptureRequest>,
 ) -> Result<ServerSttCaptureResult, String> {
-    if stt_runtime::is_global_session_running() || vosk_stt_runtime::is_global_session_running() {
+    if vosk_stt_runtime::is_global_session_running() {
         return Err(
             "Stop active local speech session before server transcription capture.".to_string(),
         );
@@ -3656,85 +3163,6 @@ pub fn set_capture_protection_for_window(
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_stt_status(app: tauri::AppHandle) -> SttStatus {
-    let model_path = resolve_stt_model_path(&app).and_then(|p| p.to_str().map(String::from));
-    let active_model_id = read_active_whisper_model_id(&app)
-        .or_else(|| resolve_installed_whisper_model_ids(&app).into_iter().next());
-
-    SttStatus {
-        available: model_path.is_some(),
-        model_loaded: model_path.is_some(),
-        model_path,
-        language: active_model_id.unwrap_or_else(|| "unknown".to_string()),
-        runtime_library_loaded: true,
-        runtime_library_path: Some("built-in whisper.cpp (whisper-rs)".to_string()),
-        detail: if let Some(active_model_id) = read_active_whisper_model_id(&app) {
-            format!("Whisper.cpp is ready. Active model: {}.", active_model_id)
-        } else {
-            "Whisper model is not installed yet. Open Speech settings and download a profile."
-                .to_string()
-        },
-    }
-}
-
-#[tauri::command]
-pub async fn start_stt_session(
-    app: tauri::AppHandle,
-    request: Option<StartSttSessionRequest>,
-) -> Result<(), String> {
-    let request = request.unwrap_or_default();
-    let (config, startup_diagnostic) = resolve_stt_config(&app, &request)?;
-    if let Some(diagnostic) = startup_diagnostic {
-        let _ = app.emit("stt_diagnostic", diagnostic);
-    }
-    let startup_config = stt_runtime::SttRuntimeConfig {
-        model_path: PathBuf::from(config.model_path),
-        language: normalize_primary_language(request.language.as_deref().unwrap_or("en-US")),
-        microphone_device_id: normalize_optional_device_id(request.microphone_device_id),
-        system_audio_device_id: normalize_optional_device_id(request.system_audio_device_id),
-    };
-
-    let app_clone = app.clone();
-    let startup_handle = tauri::async_runtime::spawn_blocking(move || {
-        stt_runtime::start_global_session(app_clone, startup_config)
-    });
-
-    match tokio::time::timeout(
-        Duration::from_secs(STT_STARTUP_COMMAND_TIMEOUT_SECS),
-        startup_handle,
-    )
-    .await
-    {
-        Ok(join_result) => join_result
-            .map_err(|join_err| format!("Failed to join STT startup task: {}", join_err))?,
-        Err(_) => Err(
-            "Запуск распознавания занял слишком много времени. Проверьте аудиоустройства и перезапустите приложение."
-                .to_string(),
-        ),
-    }
-}
-
-#[tauri::command]
-pub async fn stop_stt_session() -> Result<(), String> {
-    let stop_handle = tauri::async_runtime::spawn_blocking(stt_runtime::stop_global_session);
-    match tokio::time::timeout(
-        Duration::from_secs(STT_STOP_COMMAND_TIMEOUT_SECS),
-        stop_handle,
-    )
-    .await
-    {
-        Ok(join_result) => {
-            join_result.map_err(|join_err| format!("Failed to join STT stop task: {}", join_err))?
-        }
-        Err(_) => Err("Остановка распознавания заняла слишком много времени.".to_string()),
-    }
-}
-
-#[tauri::command]
-pub fn is_stt_session_running() -> bool {
-    stt_runtime::is_global_session_running()
-}
 
 #[tauri::command]
 pub fn get_vosk_stt_status(app: tauri::AppHandle) -> SttStatus {
@@ -3870,78 +3298,6 @@ pub fn is_vosk_stt_session_running() -> bool {
     vosk_stt_runtime::is_global_session_running()
 }
 
-#[tauri::command]
-pub fn switch_stt_language(language: String) -> Result<(), String> {
-    stt_runtime::switch_global_language(normalize_primary_language(&language))
-}
-
-#[tauri::command]
-pub fn list_whisper_models(app: tauri::AppHandle) -> Result<Vec<WhisperModelOption>, String> {
-    let base_dir = whisper_models_base_dir(&app)?;
-    let active_model_id = read_active_whisper_model_id(&app);
-
-    Ok(WHISPER_MODEL_CATALOG
-        .iter()
-        .map(|entry| {
-            let installed = whisper_model_path(&base_dir, entry.id).is_file();
-            let active = active_model_id.as_deref() == Some(entry.id) && installed;
-            WhisperModelOption {
-                id: entry.id.to_string(),
-                name: entry.name.to_string(),
-                profile: entry.profile.to_string(),
-                size_mb: entry.size_mb,
-                download_url: entry.download_url.to_string(),
-                installed,
-                active,
-            }
-        })
-        .collect())
-}
-
-#[tauri::command]
-pub fn set_active_whisper_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
-    let base_dir = whisper_models_base_dir(&app)?;
-    let normalized = model_id.trim();
-    let model_path = whisper_model_path(&base_dir, normalized);
-    if !model_path.is_file() {
-        return Err(format!(
-            "Whisper model '{}' is not installed. Download it first.",
-            normalized
-        ));
-    }
-
-    write_active_whisper_model_id(&app, normalized)?;
-
-    if stt_runtime::is_global_session_running() {
-        stt_runtime::switch_global_model(model_path)?;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-pub fn remove_whisper_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
-    let base_dir = whisper_models_base_dir(&app)?;
-    let normalized = model_id.trim();
-    let model_path = whisper_model_path(&base_dir, normalized);
-    if !model_path.is_file() {
-        return Err(format!("Whisper model '{}' is not installed.", normalized));
-    }
-
-    std::fs::remove_file(&model_path)
-        .map_err(|e| format!("Failed to remove Whisper model: {}", e))?;
-
-    if read_active_whisper_model_id(&app).as_deref() == Some(normalized) {
-        let remaining = resolve_installed_whisper_model_ids(&app);
-        if let Some(next_model) = remaining.first() {
-            write_active_whisper_model_id(&app, next_model)?;
-        } else {
-            clear_active_whisper_model_id(&app)?;
-        }
-    }
-
-    Ok(())
-}
 
 #[tauri::command]
 pub async fn list_vosk_runtime_versions() -> Result<Vec<vosk_installer::VoskRuntimeVersion>, String>
@@ -3963,26 +3319,6 @@ pub fn cancel_vosk_install() -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_stt_config(
-    app: &tauri::AppHandle,
-    request: &StartSttSessionRequest,
-) -> Result<(SttConfig, Option<SttDiagnostic>), String> {
-    let (resolved_model_path, startup_diagnostic) =
-        resolve_startup_whisper_model_path(app, request)?;
-    let model_path = resolved_model_path
-        .to_str()
-        .map(String::from)
-        .ok_or_else(|| "Whisper model path contains invalid UTF-8.".to_string())?;
-
-    Ok((
-        SttConfig {
-            model_path,
-            runtime_library_path: None,
-            ..SttConfig::default()
-        },
-        startup_diagnostic,
-    ))
-}
 
 fn app_state_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -4257,48 +3593,6 @@ pub struct VoskModelOption {
     pub default_baseline: bool,
 }
 
-#[derive(Clone, Serialize)]
-pub struct WhisperModelOption {
-    pub id: String,
-    pub name: String,
-    pub profile: String,
-    pub size_mb: u32,
-    pub download_url: String,
-    pub installed: bool,
-    pub active: bool,
-}
-
-struct WhisperModelCatalogEntry {
-    id: &'static str,
-    name: &'static str,
-    profile: &'static str,
-    size_mb: u32,
-    download_url: &'static str,
-}
-
-const WHISPER_MODEL_CATALOG: &[WhisperModelCatalogEntry] = &[
-    WhisperModelCatalogEntry {
-        id: "whisper-small",
-        name: "Whisper Small",
-        profile: "weak",
-        size_mb: 466,
-        download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-    },
-    WhisperModelCatalogEntry {
-        id: "whisper-medium",
-        name: "Whisper Medium",
-        profile: "medium",
-        size_mb: 1530,
-        download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-    },
-    WhisperModelCatalogEntry {
-        id: "whisper-large-v3",
-        name: "Whisper Large v3",
-        profile: "strong",
-        size_mb: 2890,
-        download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-    },
-];
 
 fn installed_model_ids(base_dir: &Path) -> Vec<String> {
     let mut models = std::fs::read_dir(base_dir)
@@ -4808,8 +4102,8 @@ pub fn switch_stt_model(app: tauri::AppHandle, model_id: String) -> Result<(), S
 
     write_active_model_id(&base_dir, normalized)?;
 
-    if stt_runtime::is_global_session_running() {
-        stt_runtime::switch_global_model(model_dir)?;
+    if vosk_stt_runtime::is_global_session_running() {
+        vosk_stt_runtime::switch_global_model(model_dir)?;
     }
 
     Ok(())
@@ -4819,20 +4113,27 @@ pub fn switch_stt_model(app: tauri::AppHandle, model_id: String) -> Result<(), S
 pub async fn preload_stt_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let app_clone = app.clone();
     let preload_handle = tauri::async_runtime::spawn_blocking(move || {
-        let base_dir = whisper_models_base_dir(&app_clone)?;
-        let normalized = model_id.trim();
-        let model_path = whisper_model_path(&base_dir, normalized);
-        if !model_path.is_file() {
+        let base_dir = models_base_dir(&app_clone)?;
+        let normalized = validate_model_id(&model_id)?;
+        let model_path = base_dir.join(normalized);
+        if !model_path.is_dir() {
             return Err(format!(
                 "Профиль '{}' не установлен. Сначала установите его.",
                 normalized
             ));
         }
 
-        if stt_runtime::is_global_session_running() {
-            stt_runtime::preload_global_model(model_path)?;
+        if vosk_stt_runtime::is_global_session_running() {
+            vosk_stt_runtime::preload_global_model(model_path)?;
         } else {
-            stt_runtime::warm_model_cache(model_path)?;
+            let runtime = vosk_runtime::probe_runtime(&app_clone);
+            let runtime_library_path = runtime
+                .library_path
+                .as_ref()
+                .filter(|_| runtime.available)
+                .map(PathBuf::from)
+                .ok_or_else(|| runtime.detail.clone())?;
+            vosk_stt_runtime::warm_model_cache(runtime_library_path, model_path)?;
         }
 
         Ok(())
@@ -4846,13 +4147,15 @@ pub async fn preload_stt_model(app: tauri::AppHandle, model_id: String) -> Resul
 #[tauri::command]
 pub fn remove_vosk_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let base_dir = models_base_dir(&app)?;
-    let target_dir = base_dir.join(model_id.trim());
+    let normalized = validate_model_id(&model_id)?;
+    let target_dir = base_dir.join(normalized);
     if !target_dir.is_dir() {
-        return Err(format!("Профиль '{}' не установлен.", model_id.trim()));
+        return Err(format!("Профиль '{}' не установлен.", normalized));
     }
+    let target_dir = canonical_existing_child_dir(&base_dir, &target_dir)?;
     std::fs::remove_dir_all(&target_dir).map_err(|e| format!("Failed to remove model: {}", e))?;
 
-    if read_active_model_id(&base_dir).as_deref() == Some(model_id.trim()) {
+    if read_active_model_id(&base_dir).as_deref() == Some(normalized) {
         let remaining = installed_model_ids(&base_dir);
         if let Some(next_model) = remaining.first() {
             write_active_model_id(&base_dir, next_model)?;
@@ -4872,90 +4175,6 @@ pub struct VoskModelDownloadProgress {
     pub phase: String, // "downloading" | "extracting"
 }
 
-#[derive(Clone, serde::Serialize)]
-pub struct WhisperModelDownloadProgress {
-    pub bytes_downloaded: u64,
-    pub content_length: Option<u64>,
-    pub percent: f32,
-    pub phase: String, // "downloading"
-}
-
-#[tauri::command]
-pub async fn download_whisper_model(
-    app: tauri::AppHandle,
-    url: String,
-    model_id: String,
-) -> Result<String, String> {
-    install_control::reset_cancel();
-    let client = reqwest::Client::builder()
-        .user_agent("ai-interview-desktop/0.1")
-        .connect_timeout(Duration::from_secs(NETWORK_CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(MODEL_DOWNLOAD_REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("Не удалось подготовить загрузку: {}", e))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download Whisper model: {}", e))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Whisper model download failed with status {}",
-            response.status()
-        ));
-    }
-
-    let total = response.content_length();
-    let base_dir = whisper_models_base_dir(&app)?;
-    let temp_path = base_dir.join(format!("{}.download", model_id.trim()));
-    let target_path = whisper_model_path(&base_dir, model_id.trim());
-    let mut file = std::fs::File::create(&temp_path)
-        .map_err(|e| format!("Failed to create Whisper model file: {}", e))?;
-
-    let mut downloaded = 0_u64;
-    let mut stream = response.bytes_stream();
-    while let Some(next_chunk) = stream.next().await {
-        if install_control::is_cancelled() {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err("Whisper installation cancelled by user.".to_string());
-        }
-        let chunk = next_chunk.map_err(|e| format!("Failed to read Whisper model chunk: {}", e))?;
-        file.write_all(&chunk)
-            .map_err(|e| format!("Failed to write Whisper model file: {}", e))?;
-        downloaded += chunk.len() as u64;
-        let percent = total
-            .map(|content_length| {
-                ((downloaded as f64 / content_length as f64) * 100.0).clamp(0.0, 100.0) as f32
-            })
-            .unwrap_or(0.0);
-        let _ = app.emit(
-            "whisper_model_download_progress",
-            WhisperModelDownloadProgress {
-                bytes_downloaded: downloaded,
-                content_length: total,
-                percent,
-                phase: "downloading".to_string(),
-            },
-        );
-    }
-
-    if target_path.exists() {
-        std::fs::remove_file(&target_path)
-            .map_err(|e| format!("Failed to replace Whisper model file: {}", e))?;
-    }
-    std::fs::rename(&temp_path, &target_path)
-        .map_err(|e| format!("Failed to finalize Whisper model file: {}", e))?;
-
-    if read_active_whisper_model_id(&app).is_none() {
-        let _ = write_active_whisper_model_id(&app, model_id.trim());
-    }
-
-    target_path
-        .to_str()
-        .ok_or_else(|| "Invalid Whisper model path".to_string())
-        .map(String::from)
-}
 
 /// Downloads a Vosk model zip from URL, extracts to app_data/models/vosk/<model_id>, emits progress.
 #[tauri::command]
@@ -5192,10 +4411,7 @@ fn install_vosk_model_archive(
     archive_size: Option<u64>,
     extracting_start_percent: f32,
 ) -> Result<String, String> {
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        return Err("Не выбран профиль распознавания.".to_string());
-    }
+    let model_id = validate_model_id(model_id)?;
     let progress_bytes = archive_size.unwrap_or(0);
     if emit_progress {
         emit_vosk_model_progress(
@@ -5466,166 +4682,32 @@ fn clear_active_model_id(base_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn whisper_models_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let models_dir = app_data.join("models").join("whisper");
-    std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
-    Ok(models_dir)
-}
 
-fn whisper_model_file_name(model_id: &str) -> Result<&'static str, String> {
-    match model_id.trim() {
-        "whisper-small" => Ok("ggml-small.bin"),
-        "whisper-medium" => Ok("ggml-medium.bin"),
-        "whisper-large-v3" => Ok("ggml-large-v3.bin"),
-        other => Err(format!("Unknown Whisper model '{}'", other)),
-    }
-}
-
-fn whisper_model_path(base_dir: &Path, model_id: &str) -> PathBuf {
-    let file_name = whisper_model_file_name(model_id).unwrap_or("model.bin");
-    base_dir.join(file_name)
-}
-
-fn active_whisper_model_marker_path(base_dir: &Path) -> PathBuf {
-    base_dir.join(ACTIVE_MODEL_FILE)
-}
-
-fn read_active_whisper_model_id(app: &tauri::AppHandle) -> Option<String> {
-    let base_dir = whisper_models_base_dir(app).ok()?;
-    std::fs::read_to_string(active_whisper_model_marker_path(&base_dir))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn write_active_whisper_model_id(app: &tauri::AppHandle, model_id: &str) -> Result<(), String> {
-    let base_dir = whisper_models_base_dir(app)?;
-    std::fs::write(active_whisper_model_marker_path(&base_dir), model_id)
-        .map_err(|e| format!("Failed to set active Whisper model: {}", e))
-}
-
-fn clear_active_whisper_model_id(app: &tauri::AppHandle) -> Result<(), String> {
-    let base_dir = whisper_models_base_dir(app)?;
-    let marker = active_whisper_model_marker_path(&base_dir);
-    if marker.exists() {
-        std::fs::remove_file(marker)
-            .map_err(|e| format!("Failed to clear active Whisper model: {}", e))?;
-    }
-    Ok(())
-}
-
-fn resolve_installed_whisper_model_ids(app: &tauri::AppHandle) -> Vec<String> {
-    let Ok(base_dir) = whisper_models_base_dir(app) else {
-        return Vec::new();
-    };
-
-    WHISPER_MODEL_CATALOG
-        .iter()
-        .filter(|entry| whisper_model_path(&base_dir, entry.id).is_file())
-        .map(|entry| entry.id.to_string())
-        .collect()
-}
-
-fn resolve_stt_model_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let base_dir = whisper_models_base_dir(app).ok()?;
-
-    if let Some(active_model_id) = read_active_whisper_model_id(app) {
-        let active_path = whisper_model_path(&base_dir, active_model_id.trim());
-        if active_path.is_file() {
-            return Some(active_path);
-        }
-    }
-
-    resolve_installed_whisper_model_ids(app)
-        .into_iter()
-        .find_map(|model_id| {
-            let path = whisper_model_path(&base_dir, &model_id);
-            if path.is_file() {
-                Some(path)
-            } else {
-                None
-            }
-        })
-}
-
-fn infer_whisper_model_id_from_path(path: &Path) -> Option<&'static str> {
-    let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if file_name.contains("small") {
-        Some("whisper-small")
-    } else if file_name.contains("medium") {
-        Some("whisper-medium")
-    } else if file_name.contains("large") {
-        Some("whisper-large-v3")
-    } else {
-        None
-    }
-}
-
-fn whisper_model_display_name(model_id: &str) -> &'static str {
-    match model_id {
-        "whisper-small" => "Whisper Small",
-        "whisper-medium" => "Whisper Medium",
-        "whisper-large-v3" => "Whisper Large v3",
-        _ => "Whisper model",
-    }
-}
-
-fn resolve_startup_whisper_model_path(
-    app: &tauri::AppHandle,
-    _request: &StartSttSessionRequest,
-) -> Result<(PathBuf, Option<SttDiagnostic>), String> {
-    let default_path = resolve_stt_model_path(app)
-        .ok_or_else(|| "Whisper model is not installed. Download a profile first.".to_string())?;
-
-    #[cfg(not(target_os = "windows"))]
+fn validate_model_id(model_id: &str) -> Result<&str, String> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
     {
-        return Ok((default_path, None));
+        return Err(format!("Некорректный идентификатор модели: '{}'", model_id));
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        let active_model_id = read_active_whisper_model_id(app)
-            .or_else(|| infer_whisper_model_id_from_path(&default_path).map(str::to_string));
-
-        if active_model_id.as_deref() != Some("whisper-large-v3") {
-            return Ok((default_path, None));
-        }
-
-        let base_dir = whisper_models_base_dir(app)?;
-        for fallback_id in ["whisper-small", "whisper-medium"] {
-            let fallback_path = whisper_model_path(&base_dir, fallback_id);
-            if fallback_path.is_file() {
-                if fallback_path != default_path {
-                    let message = format!(
-                        "Enabled {} for stable live transcription. Whisper Large can lag heavily with simultaneous microphone and system-audio capture on CPU.",
-                        whisper_model_display_name(fallback_id)
-                    );
-                    return Ok((
-                        fallback_path,
-                        Some(SttDiagnostic {
-                            code: "model_fallback".to_string(),
-                            level: "warn".to_string(),
-                            message,
-                            source: None,
-                        }),
-                    ));
-                }
-                return Ok((default_path, None));
-            }
-        }
-
-        let warning = SttDiagnostic {
-            code: "model_realtime_warning".to_string(),
-            level: "warn".to_string(),
-            message:
-                "The selected speech profile is heavy, so live text can appear with longer delays."
-                    .to_string(),
-            source: None,
-        };
-        Ok((default_path, Some(warning)))
-    }
+    Ok(trimmed)
 }
+
+fn canonical_existing_child_dir(base_dir: &Path, target_dir: &Path) -> Result<PathBuf, String> {
+    let canonical_base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate models directory: {}", e))?;
+    let canonical_target = target_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate model directory: {}", e))?;
+    if !canonical_target.starts_with(&canonical_base) || canonical_target == canonical_base {
+        return Err("Путь модели находится вне каталога моделей.".to_string());
+    }
+    Ok(canonical_target)
+}
+
 
 fn normalize_extracted_model_layout(extract_dir: &Path) -> Result<(), String> {
     let mut root_dirs = Vec::new();
@@ -5661,15 +4743,61 @@ fn cleanup_selected_models(
     model_ids: &[String],
     keep_model_id: &str,
 ) -> Result<(), String> {
-    for model_id in model_ids {
+    let keep_model_id = validate_model_id(keep_model_id)?;
+    let validated_model_ids = model_ids
+        .iter()
+        .map(|model_id| validate_model_id(model_id))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for model_id in validated_model_ids {
         if model_id == keep_model_id {
             continue;
         }
         let target_dir = models_dir.join(model_id);
         if target_dir.is_dir() {
+            let target_dir = canonical_existing_child_dir(models_dir, &target_dir)?;
             std::fs::remove_dir_all(&target_dir)
                 .map_err(|e| format!("Failed to remove old model '{}': {}", model_id, e))?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_path_security_tests {
+    use super::{cleanup_selected_models, validate_model_id};
+
+    #[test]
+    fn rejects_model_id_path_traversal() {
+        for model_id in ["../../etc", "../Documents", "nested/model", r"nested\model"] {
+            assert!(validate_model_id(model_id).is_err(), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn cleanup_rejects_traversal_before_touching_filesystem() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "ai-interview-model-security-{}",
+            std::process::id()
+        ));
+        let outside_dir = models_dir.with_extension("outside");
+        std::fs::create_dir_all(&models_dir).expect("create models test directory");
+        std::fs::create_dir_all(&outside_dir).expect("create outside test directory");
+        std::fs::write(outside_dir.join("keep.txt"), b"safe").expect("create sentinel");
+
+        let result = cleanup_selected_models(
+            &models_dir,
+            &[format!(
+                "../{}",
+                outside_dir.file_name().unwrap().to_string_lossy()
+            )],
+            "current-model",
+        );
+
+        assert!(result.is_err());
+        assert!(outside_dir.join("keep.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(models_dir);
+        let _ = std::fs::remove_dir_all(outside_dir);
+    }
 }

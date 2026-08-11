@@ -39,8 +39,9 @@ export async function submitDiagnosticTelemetry(entry: DiagnosticEntry): Promise
   }
 
   const licenseKey = useSettingsStore.getState().apiKey;
+  const knownSecrets = getKnownSecrets();
   const recentEntries = useDiagnosticsStore.getState().entries.slice(0, MAX_AUTO_REPORT_ENTRIES);
-  const report = buildRedactedDiagnosticsReport(recentEntries);
+  const report = buildRedactedDiagnosticsReport(recentEntries, knownSecrets);
 
   try {
     await submitTelemetryEvent({
@@ -48,9 +49,9 @@ export async function submitDiagnosticTelemetry(entry: DiagnosticEntry): Promise
       eventType: entry.scope,
       severity: entry.level as TelemetrySeverity,
       appVersion: __APP_VERSION__,
-      message: entry.message,
+      message: redactSecrets(entry.message, knownSecrets),
       payload: {
-        details: entry.details,
+        details: entry.details ? redactSecrets(entry.details, knownSecrets) : null,
         timestamp: entry.timestamp,
         report: report.slice(0, 20_000),
       },
@@ -103,11 +104,14 @@ export async function submitCriticalSupportReport(params: {
 
 export function buildSupportReport(title: string, extra?: string): string {
   const entries = useDiagnosticsStore.getState().entries.slice(0, MAX_AUTO_REPORT_ENTRIES);
+  const knownSecrets = getKnownSecrets();
   const report = [
-    `Контекст: ${sanitizeReportText(title)}`,
-    extra ? `Подробности: ${sanitizeReportText(extra)}` : null,
+    `Контекст: ${sanitizeReportText(redactSecrets(title, knownSecrets))}`,
+    extra
+      ? `Подробности: ${sanitizeReportText(redactSecrets(extra, knownSecrets))}`
+      : null,
     "",
-    buildRedactedDiagnosticsReport(entries),
+    buildRedactedDiagnosticsReport(entries, knownSecrets),
   ]
     .filter((line): line is string => line !== null)
     .join("\n")
@@ -116,8 +120,11 @@ export function buildSupportReport(title: string, extra?: string): string {
   return report;
 }
 
-export function buildRedactedDiagnosticsReport(entries: DiagnosticEntry[]): string {
-  return sanitizeReportText(redactSecrets(buildDiagnosticsReport(entries)));
+export function buildRedactedDiagnosticsReport(
+  entries: DiagnosticEntry[],
+  knownSecrets = getKnownSecrets(),
+): string {
+  return sanitizeReportText(redactSecrets(buildDiagnosticsReport(entries), knownSecrets));
 }
 
 function claimThrottle(key: string, windowMs: number): boolean {
@@ -143,10 +150,43 @@ function hashKey(value: string): string {
   return Math.abs(hash).toString(36);
 }
 
-function redactSecrets(value: string): string {
-  return value
+function getKnownSecrets(): string[] {
+  return [useSettingsStore.getState().apiKey];
+}
+
+export function redactSecrets(value: string, knownSecrets = getKnownSecrets()): string {
+  let redacted = value;
+  const normalizedSecrets = [...new Set(knownSecrets.map((secret) => secret.trim()))]
+    .filter((secret) => secret.length >= 8)
+    .sort((left, right) => right.length - left.length);
+
+  for (const secret of normalizedSecrets) {
+    redacted = redacted.split(secret).join("[секрет скрыт]");
+    const encodedSecret = encodeURIComponent(secret);
+    if (encodedSecret !== secret) {
+      redacted = redacted.split(encodedSecret).join("[секрет скрыт]");
+    }
+  }
+
+  return redacted
+    .replace(
+      /([?&](?:licenseKey|ticket)=)[^&\s"'<>]+/gi,
+      "$1[секрет скрыт]",
+    )
+    .replace(
+      /((?:Authorization\s*:\s*Bearer|X-License-Key\s*:)\s*)[^\s,}"']+/gi,
+      "$1[секрет скрыт]",
+    )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[секрет скрыт]")
-    .replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "[ключ скрыт]");
+    .replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, "[секрет скрыт]")
+    .replace(
+      /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+      "[секрет скрыт]",
+    )
+    .replace(
+      /\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/gi,
+      "[ключ скрыт]",
+    );
 }
 
 function sanitizeReportText(value: string): string {
@@ -158,8 +198,6 @@ function sanitizeReportText(value: string): string {
     .replace(/\bVosk\s+runtime\b/gi, "speech module")
     .replace(/\bVosk model\b/gi, "speech profile")
     .replace(/\bVosk\b/g, "speech")
-    .replace(/\bWhisper\b/g, "speech service")
-    .replace(/\bOpenAI\b/g, "service")
     .replace(/\bproxy\b/gi, "service")
     .replace(/\bruntime\b/gi, "module")
     .replace(/\bhelper\b/gi, "assistant");
